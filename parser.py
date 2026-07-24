@@ -669,9 +669,8 @@ async def safe_edit(call: CallbackQuery, text: str, markup=None) -> None:
 # ADMIN — /start и главное меню
 # ═══════════════════════════════════════════════════════════════
 
-@admin_router.message(Command("start"))
+@admin_router.message(Command("start"), F.from_user.id == ADMIN_ID)
 async def admin_cmd_start(message: Message):
-    if not is_admin(message.from_user.id): return
     await message.answer("<b>👑 phase.parser — Панель администратора</b>", reply_markup=kb_admin_main())
 
 @admin_router.callback_query(F.data == "admin_main")
@@ -699,12 +698,131 @@ async def admin_sources_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data == "admin_src_add")
 async def admin_src_add_cb(call: CallbackQuery):
     if not is_admin(call.from_user.id): return
-    _admin_pending[call.from_user.id] = "add_source"
+    await call.answer("Загружаю список чатов...")
+    await _show_chat_picker(call, selected=set())
+
+# Временное хранилище выбранных чатов: uid -> {chat_id: {title, username, link}}
+_src_picker: dict[int, dict] = {}
+
+async def _show_chat_picker(call: CallbackQuery, selected: set) -> None:
+    """Показывает список групп/супергрупп UserBot с чекбоксами."""
+    uid = call.from_user.id
+
+    # Получаем список диалогов через UserBot (только группы и супергруппы)
+    try:
+        chats = []
+        async for dialog in _userbot.iter_dialogs():
+            e = dialog.entity
+            # Пропускаем личные чаты, каналы (broadcast), боты
+            is_group = getattr(e, "megagroup", False) or getattr(e, "gigagroup", False)
+            is_chat  = e.__class__.__name__ == "Chat"
+            is_channel_broadcast = getattr(e, "broadcast", False)
+            if not (is_group or is_chat):
+                continue
+            if is_channel_broadcast:
+                continue
+            chats.append({
+                "id":       dialog.id,
+                "title":    dialog.name or str(dialog.id),
+                "username": getattr(e, "username", None),
+            })
+            if len(chats) >= 40:  # лимит чтобы не перегружать
+                break
+    except Exception as ex:
+        log.error(f"iter_dialogs: {ex}")
+        await safe_edit(call, f"❌ Ошибка загрузки чатов: {ex}", kb_back("admin_sources"))
+        return
+
+    # Уже добавленные источники — пропускаем
+    existing_ids = {s["chat_id"] for s in _db.get_sources(active_only=False)}
+
+    # Сохраняем список в picker-состоянии
+    if uid not in _src_picker:
+        _src_picker[uid] = {}
+    # Оставляем уже выбранные, добавляем все чаты как доступные
+    picker_data = {str(c["id"]): c for c in chats}
+
+    rows = []
+    for c in chats:
+        cid     = str(c["id"])
+        in_db   = int(c["id"]) in existing_ids
+        checked = cid in selected
+        icon    = "☑️" if checked else ("✅" if in_db else "◻️")
+        label   = f"{icon} {c['title'][:35]}" + (" (добавлен)" if in_db else "")
+        # Уже добавленные нельзя снова выбрать
+        cd      = f"src_pick_toggle:{cid}" if not in_db else "noop"
+        rows.append([(label, cd)])
+
+    if not rows:
+        await safe_edit(call,
+            "😕 <b>Групп не найдено</b>\n\n"
+            "UserBot не состоит ни в одной группе или супергруппе.\n"
+            "Добавьте UserBot в нужные группы и повторите.",
+            kb_back("admin_sources"))
+        return
+
+    selected_count = len(selected)
+    rows.append([(f"✅ Готово ({selected_count} выбрано)", "src_pick_done")])
+    rows.append([("◀️ Назад", "admin_sources")])
+
+    _src_picker[uid] = {"chats": picker_data, "selected": set(selected)}
     await safe_edit(call,
-        "📡 <b>Добавление источника</b>\n\n"
-        "Отправьте @username или ссылку на группу/канал.\n"
-        "<i>Пример: @montage_jobs</i>",
-        kb_back("admin_sources"))
+        f"<b>📡 Выберите источники</b>\n\n"
+        f"Нажмите на группу чтобы выбрать/снять. Когда закончите — нажмите <b>Готово</b>.\n"
+        f"<i>Личные чаты и каналы не отображаются.</i>",
+        mkb(rows))
+
+
+@admin_router.callback_query(F.data.startswith("src_pick_toggle:"))
+async def src_pick_toggle_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    uid  = call.from_user.id
+    cid  = call.data.split(":")[1]
+    if uid not in _src_picker:
+        await call.answer("Сессия устарела, начните заново"); return
+    selected = _src_picker[uid].get("selected", set())
+    if cid in selected:
+        selected.discard(cid)
+    else:
+        selected.add(cid)
+    _src_picker[uid]["selected"] = selected
+    await _show_chat_picker(call, selected)
+
+
+@admin_router.callback_query(F.data == "src_pick_done")
+async def src_pick_done_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    uid    = call.from_user.id
+    state  = _src_picker.pop(uid, None)
+    if not state or not state.get("selected"):
+        await call.answer("Ничего не выбрано"); return
+
+    chats    = state["chats"]
+    selected = state["selected"]
+    added    = 0
+    errors   = []
+
+    for cid in selected:
+        chat = chats.get(cid)
+        if not chat:
+            continue
+        try:
+            uname = chat.get("username")
+            link  = f"https://t.me/{uname}" if uname else None
+            ok    = _db.add_source(int(cid), chat["title"], uname, link)
+            if ok:
+                added += 1
+                log.info(f"Источник добавлен: {chat['title']} ({cid})")
+        except Exception as e:
+            errors.append(chat["title"])
+            log.error(f"Добавление источника {cid}: {e}")
+
+    result = f"✅ Добавлено источников: <b>{added}</b>"
+    if errors:
+        result += f"\n❌ Ошибки: {', '.join(errors)}"
+
+    await safe_edit(call, result, kb_back("admin_sources"))
+
 
 @admin_router.callback_query(F.data == "admin_src_check")
 async def admin_src_check_cb(call: CallbackQuery):
