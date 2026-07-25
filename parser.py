@@ -654,8 +654,19 @@ _admin_pending:  dict[int, str] = {}
 _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 
+from aiogram.filters import Filter as _Filter
+
+class _IsAdmin(_Filter):
+    async def __call__(self, event) -> bool:
+        u = getattr(event, "from_user", None)
+        return u is not None and u.id == ADMIN_ID
+
 admin_router  = Router()
 client_router = Router()
+
+# Все хэндлеры admin_router видят только сообщения от администратора
+admin_router.message.filter(_IsAdmin())
+admin_router.callback_query.filter(_IsAdmin())
 
 def is_admin(uid: int) -> bool: return uid == ADMIN_ID
 
@@ -669,14 +680,28 @@ async def safe_edit(call: CallbackQuery, text: str, markup=None) -> None:
 # ADMIN — /start и главное меню
 # ═══════════════════════════════════════════════════════════════
 
-@admin_router.message(Command("start"), F.from_user.id == ADMIN_ID)
+async def _admin_main_text() -> str:
+    ds_ok  = await check_deepseek_status()
+    ub_ok  = (_userbot is not None) and await _userbot.is_user_authorized()
+    srcs   = len(_db.get_sources()) if _db else 0
+    tok    = _db.get_tokens_today() if _db else {"tokens_in": 0, "tokens_out": 0}
+    ds_ico = "🟢" if ds_ok else "🔴"
+    ub_ico = "🟢" if ub_ok else "🔴"
+    return (
+        f"<b>👑 phase.parser</b>\n\n"
+        f"{ds_ico} DeepSeek: <b>{'онлайн' if ds_ok else 'недоступен'}</b>  "
+        f"↑<code>{tok['tokens_in']}</code> ↓<code>{tok['tokens_out']}</code>\n"
+        f"{ub_ico} UserBot: <b>{'авторизован' if ub_ok else 'не авторизован'}</b>\n"
+        f"📡 Источников: <b>{srcs}</b>"
+    )
+
+@admin_router.message(Command("start"))
 async def admin_cmd_start(message: Message):
-    await message.answer("<b>👑 phase.parser — Панель администратора</b>", reply_markup=kb_admin_main())
+    await message.answer(await _admin_main_text(), reply_markup=kb_admin_main())
 
 @admin_router.callback_query(F.data == "admin_main")
 async def admin_main_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    await safe_edit(call, "<b>👑 phase.parser — Панель администратора</b>", kb_admin_main())
+    await safe_edit(call, await _admin_main_text(), kb_admin_main())
 
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ИСТОЧНИКИ
@@ -684,7 +709,6 @@ async def admin_main_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_sources")
 async def admin_sources_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     sources = _db.get_sources(active_only=False)
     lines   = [f"{'✅' if s['active'] else '❌'} <b>{s['title']}</b> <code>{s['chat_id']}</code>" for s in sources]
     text    = "<b>📡 Источники</b>\n\n" + ("\n".join(lines) if lines else "<i>Нет источников</i>")
@@ -697,7 +721,6 @@ async def admin_sources_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_add")
 async def admin_src_add_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     uid = call.from_user.id
 
     # Если кэш уже есть — сразу показываем без загрузки
@@ -796,7 +819,6 @@ async def _draw_picker(call: CallbackQuery, uid: int) -> None:
 
 @admin_router.callback_query(F.data.startswith("src_pick_toggle:"))
 async def src_pick_toggle_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     await call.answer()
     uid = call.from_user.id
     cid = call.data.split(":")[1]
@@ -817,7 +839,6 @@ async def src_pick_toggle_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data == "src_pick_reload")
 async def src_pick_reload_cb(call: CallbackQuery):
     """Сбрасывает кэш и заново загружает список диалогов."""
-    if not is_admin(call.from_user.id): return
     uid = call.from_user.id
     _src_picker.pop(uid, None)
     await admin_src_add_cb(call)
@@ -825,7 +846,6 @@ async def src_pick_reload_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "src_pick_done")
 async def src_pick_done_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     uid   = call.from_user.id
     state = _src_picker.pop(uid, None)
 
@@ -867,7 +887,6 @@ async def src_pick_done_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_check")
 async def admin_src_check_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     await call.answer("Проверяю...")
     sources    = _db.get_sources()
     not_joined = []
@@ -884,7 +903,6 @@ async def admin_src_check_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_join_all")
 async def admin_src_join_all_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     sources = _db.get_sources(); joined = 0
     for s in sources:
         try:
@@ -895,7 +913,6 @@ async def admin_src_join_all_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_manage")
 async def admin_src_manage_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     sources = _db.get_sources(active_only=False)
     if not sources: await call.answer("Нет источников"); return
     rows = []
@@ -908,19 +925,16 @@ async def admin_src_manage_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_src_toggle:"))
 async def admin_src_toggle_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _db.toggle_source(int(call.data.split(":")[1]))
     await admin_src_manage_cb(call)
 
 @admin_router.callback_query(F.data.startswith("admin_src_del:"))
 async def admin_src_del_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _db.delete_source(int(call.data.split(":")[1]))
     await call.answer("Удалено"); await admin_src_manage_cb(call)
 
 @admin_router.callback_query(F.data == "admin_src_export")
 async def admin_src_export_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     sources = _db.get_sources(active_only=False)
     lines   = [f"{'[ON]' if s['active'] else '[OFF]'} {s['title']} | {s['chat_id']} | {s.get('link','')}" for s in sources]
     await call.message.answer_document(
@@ -936,12 +950,10 @@ REPLIES_PER_PAGE = 8
 
 @admin_router.callback_query(F.data == "admin_replies")
 async def admin_replies_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     await _show_replies(call, 0)
 
 @admin_router.callback_query(F.data.startswith("admin_replies_page:"))
 async def admin_replies_page_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     await _show_replies(call, int(call.data.split(":")[1]))
 
 async def _show_replies(call: CallbackQuery, page: int) -> None:
@@ -965,7 +977,6 @@ async def _show_replies(call: CallbackQuery, page: int) -> None:
 
 @admin_router.callback_query(F.data.startswith("admin_reply_view:"))
 async def admin_reply_view_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     reply_id = int(call.data.split(":")[1])
     r        = _db.get_reply(reply_id)
     if not r: await call.answer("Не найден"); return
@@ -995,7 +1006,6 @@ async def noop_cb(call: CallbackQuery): await call.answer()
 
 @admin_router.callback_query(F.data == "admin_templates")
 async def admin_templates_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     templates = _db.get_templates()
     lines = [f"{'✅' if t['active'] else '❌'} <b>#{t['id']}</b> {t['name']}" for t in templates]
     rows  = [[("➕ Добавить шаблон", "admin_tmpl_add")]]
@@ -1007,7 +1017,6 @@ async def admin_templates_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_tmpl:"))
 async def admin_tmpl_detail_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     tid = int(call.data.split(":")[1]); t = _db.get_template(tid)
     if not t: await call.answer("Не найден"); return
     text = (
@@ -1029,7 +1038,6 @@ async def admin_tmpl_detail_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_tmpl_edit:"))
 async def admin_tmpl_edit_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _, tid, vnum = call.data.split(":")
     _admin_pending[call.from_user.id] = f"edit_template:{tid}:{vnum}"
     await safe_edit(call, f"✏️ Введите новый текст для <b>Варианта {vnum}</b> шаблона #{tid}:",
@@ -1037,18 +1045,15 @@ async def admin_tmpl_edit_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_tmpl_toggle:"))
 async def admin_tmpl_toggle_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _db.toggle_template(int(call.data.split(":")[1])); await admin_tmpl_detail_cb(call)
 
 @admin_router.callback_query(F.data.startswith("admin_tmpl_delete:"))
 async def admin_tmpl_delete_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     tid = int(call.data.split(":")[1]); _db.delete_template(tid)
     await call.answer(f"Шаблон #{tid} удалён"); await admin_templates_cb(call)
 
 @admin_router.callback_query(F.data.startswith("admin_tmpl_preview:"))
 async def admin_tmpl_preview_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     tid = int(call.data.split(":")[1]); t = _db.get_template(tid)
     if not t: return
     v = random.randint(1, 3)
@@ -1057,7 +1062,6 @@ async def admin_tmpl_preview_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_tmpl_add")
 async def admin_tmpl_add_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "add_template"
     await safe_edit(call,
         "➕ <b>Добавление шаблона</b>\n\n"
@@ -1071,7 +1075,6 @@ async def admin_tmpl_add_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_monitoring")
 async def admin_monitoring_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     kw_c = _db.get_keywords("common"); kw_a = _db.get_keywords("admin")
     bl_c = _db.get_blacklist("common"); bl_a = _db.get_blacklist("admin")
     text = (
@@ -1090,7 +1093,6 @@ async def admin_monitoring_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_kw")
 async def admin_kw_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     kw_c = _db.get_keywords("common"); kw_a = _db.get_keywords("admin")
     text = (
         f"<b>🔑 Ключевые слова</b>\n\n"
@@ -1106,13 +1108,11 @@ async def admin_kw_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_kw_add:"))
 async def admin_kw_add_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     ktype = call.data.split(":")[1]; _admin_pending[call.from_user.id] = f"add_kw:{ktype}"
     await safe_edit(call, f"➕ Введите ключевое слово (<i>{ktype}</i>):", kb_back("admin_kw"))
 
 @admin_router.callback_query(F.data.startswith("admin_kw_del:"))
 async def admin_kw_del_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     ktype = call.data.split(":")[1]; words = _db.get_keywords(ktype)
     if not words: await call.answer("Список пуст"); return
     rows = [[("❌ " + w, f"admin_kw_del_ok:{ktype}:{w}")] for w in words]
@@ -1120,13 +1120,11 @@ async def admin_kw_del_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_kw_del_ok:"))
 async def admin_kw_del_ok_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _, ktype, word = call.data.split(":", 2); _db.delete_keyword(word, ktype)
     await call.answer(f"Удалено: {word}"); await admin_kw_cb(call)
 
 @admin_router.callback_query(F.data == "admin_bl")
 async def admin_bl_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     bl_c = _db.get_blacklist("common"); bl_a = _db.get_blacklist("admin")
     text = (
         f"<b>🚫 Чёрный список</b>\n\n"
@@ -1142,13 +1140,11 @@ async def admin_bl_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_bl_add:"))
 async def admin_bl_add_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     btype = call.data.split(":")[1]; _admin_pending[call.from_user.id] = f"add_bl:{btype}"
     await safe_edit(call, f"➕ Введите стоп-слово (<i>{btype}</i>):", kb_back("admin_bl"))
 
 @admin_router.callback_query(F.data.startswith("admin_bl_del:"))
 async def admin_bl_del_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     btype = call.data.split(":")[1]; words = _db.get_blacklist(btype)
     if not words: await call.answer("Список пуст"); return
     rows = [[("❌ " + w, f"admin_bl_del_ok:{btype}:{w}")] for w in words]
@@ -1156,7 +1152,6 @@ async def admin_bl_del_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_bl_del_ok:"))
 async def admin_bl_del_ok_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _, btype, word = call.data.split(":", 2); _db.delete_from_blacklist(word, btype)
     await call.answer(f"Удалено: {word}"); await admin_bl_cb(call)
 
@@ -1166,7 +1161,6 @@ async def admin_bl_del_ok_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_deepseek")
 async def admin_deepseek_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     tok = _db.get_tokens_today(); rules = _db.get_ds_rules()
     text = (
         f"<b>🤖 DeepSeek</b>\n\n"
@@ -1183,20 +1177,17 @@ async def admin_deepseek_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_ds_prompt")
 async def admin_ds_prompt_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     prompt = _db.get_setting("ds_system_prompt")
     await safe_edit(call, f"<b>📋 Системный промпт:</b>\n\n<blockquote>{prompt}</blockquote>",
                     kb_back("admin_deepseek"))
 
 @admin_router.callback_query(F.data == "admin_ds_prompt_edit")
 async def admin_ds_prompt_edit_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "edit_ds_prompt"
     await safe_edit(call, "✏️ Введите новый системный промпт:", kb_back("admin_deepseek"))
 
 @admin_router.callback_query(F.data == "admin_ds_rules")
 async def admin_ds_rules_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     rules = _db.get_ds_rules()
     lines = [f"<b>{i+1}.</b> {r['value']}" for i, r in enumerate(rules)]
     text  = "<b>📏 Глобальные правила</b>\n\n" + ("\n".join(lines) if lines else "<i>Нет правил</i>")
@@ -1206,7 +1197,6 @@ async def admin_ds_rules_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_ds_rule_add")
 async def admin_ds_rule_add_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "add_ds_rule"
     await safe_edit(call,
         "➕ <b>Добавить правило DeepSeek</b>\n\n"
@@ -1218,7 +1208,6 @@ async def admin_ds_rule_add_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_ds_rule_del:"))
 async def admin_ds_rule_del_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     key = call.data.split(":", 1)[1]; _db.del_setting(key)
     await call.answer("Правило удалено"); await admin_ds_rules_cb(call)
 
@@ -1228,7 +1217,6 @@ async def admin_ds_rule_del_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_stats")
 async def admin_stats_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     s = _db.get_stats()
     text = (
         f"<b>📊 Статистика</b>\n\n"
@@ -1250,7 +1238,6 @@ async def admin_stats_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_clients")
 async def admin_clients_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     clients = _db.get_all_clients(); now = datetime.now().isoformat()
     lines   = []
     for c in clients[:20]:
@@ -1266,7 +1253,6 @@ async def admin_clients_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_give_sub")
 async def admin_give_sub_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "give_sub"
     await safe_edit(call,
         "➕ <b>Выдача подписки</b>\n\n"
@@ -1276,7 +1262,6 @@ async def admin_give_sub_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "broadcast"
     await safe_edit(call, "📤 <b>Рассылка клиентам</b>\n\nВведите текст (HTML):", kb_back("admin_clients"))
 
@@ -1286,7 +1271,6 @@ async def admin_broadcast_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_logs")
 async def admin_logs_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     today = datetime.now().strftime("%Y-%m-%d")
     yest  = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     markup = mkb([
@@ -1298,7 +1282,6 @@ async def admin_logs_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_logs_date:"))
 async def admin_logs_date_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     date = call.data.split(":")[1]; logs = _db.get_logs(date, limit=50)
     lines = [f"<code>{l['ts'][11:19]}</code> [{l['level'][:4]}] {l['message'][:80]}" for l in logs]
     text  = f"<b>📜 Логи за {date}</b> (последние {len(logs)}):\n\n" + ("\n".join(lines) if lines else "<i>Нет записей</i>")
@@ -1307,7 +1290,6 @@ async def admin_logs_date_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_logs_export:"))
 async def admin_logs_export_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     date = call.data.split(":")[1]
     await call.message.answer_document(
         document=BufferedInputFile(_db.export_logs(date), filename=f"logs_{date}.txt"),
@@ -1320,7 +1302,6 @@ async def admin_logs_export_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_settings")
 async def admin_settings_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     await safe_edit(call, "<b>⚙️ Настройки</b>", mkb([[("◀️ Назад", "admin_main")]]))
 
 # ═══════════════════════════════════════════════════════════════
@@ -1329,7 +1310,6 @@ async def admin_settings_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_error:"))
 async def admin_error_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     reply_id = call.data.split(":")[1]
     markup = mkb([
         [("🔑 Ключевые слова", f"admin_err_kw:{reply_id}"),
@@ -1341,25 +1321,21 @@ async def admin_error_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_err_kw:"))
 async def admin_err_kw_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "add_kw:common"
     await safe_edit(call, "🔑 Введите слово для добавления в ключевые слова:", kb_back("admin_kw"))
 
 @admin_router.callback_query(F.data.startswith("admin_err_bl:"))
 async def admin_err_bl_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "add_bl:common"
     await safe_edit(call, "🚫 Введите слово для чёрного списка:", kb_back("admin_bl"))
 
 @admin_router.callback_query(F.data.startswith("admin_err_ds:"))
 async def admin_err_ds_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     _admin_pending[call.from_user.id] = "add_ds_rule"
     await safe_edit(call, "🤖 Введите правило для DeepSeek:", kb_back("admin_deepseek"))
 
 @admin_router.callback_query(F.data.startswith("admin_delete_reply:"))
 async def admin_delete_reply_cb(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
     reply_id = int(call.data.split(":")[1]); reply = _db.get_reply(reply_id)
     if not reply: await call.answer("Не найден"); return
     num = f"{reply['template_id']}.{reply['variant_num']}"
@@ -1376,7 +1352,6 @@ async def admin_delete_reply_cb(call: CallbackQuery):
 
 @admin_router.message(F.text)
 async def admin_text_handler(message: Message):
-    if not is_admin(message.from_user.id): return
     uid    = message.from_user.id
     action = _admin_pending.pop(uid, None)
     if not action: return
