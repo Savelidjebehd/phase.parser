@@ -492,47 +492,77 @@ class Database:
 _DS_FAIL = DeepSeekResult(suitable=False, reason="Ошибка API", contact="")
 
 async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSeekResult:
+    if not DEEPSEEK_KEY:
+        log.error("DeepSeek: DEEPSEEK_API_KEY не задан в .env")
+        return _DS_FAIL
     rules = db.get_ds_rules()
     rules_block = ("ГЛОБАЛЬНЫЕ ПРАВИЛА:\n" + "\n".join(f"- {r['value']}" for r in rules) + "\n\n") if rules else ""
     system = (rules_block + db.get_setting("ds_system_prompt") + "\n\n"
-              'Верни JSON: {"suitable": bool, "reason": "макс 5 слов", "contact": "@username или пусто"}')
+              'Верни JSON без markdown: {"suitable": bool, "reason": "макс 5 слов", "contact": "@username или пусто"}')
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Автор: @{author_username}\n\nТекст:\n{text[:3000]}"},
+        ],
+        "max_tokens": 150,
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }
+    log.debug(f"DeepSeek запрос: url={DEEPSEEK_URL} model={DEEPSEEK_MODEL} key={DEEPSEEK_KEY[:8]}...")
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(DEEPSEEK_URL, json={
-                "model": DEEPSEEK_MODEL,
-                "messages": [{"role":"system","content":system},
-                             {"role":"user","content":f"Автор: @{author_username}\n\nТекст:\n{text[:3000]}"}],
-                "max_tokens": 120, "temperature": 0.0,
-                "response_format": {"type":"json_object"}},
-                headers={"Authorization":f"Bearer {DEEPSEEK_KEY}","Content-Type":"application/json"},
-                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with s.post(
+                DEEPSEEK_URL, json=payload,
+                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.text()
+                log.debug(f"DeepSeek ответ HTTP {resp.status}: {body[:300]}")
                 if resp.status != 200:
-                    log.error(f"DeepSeek {resp.status}"); db.stat_inc("ai_errors"); return _DS_FAIL
-                data = await resp.json()
+                    log.error(f"DeepSeek HTTP {resp.status}: {body[:300]}")
+                    db.stat_inc("ai_errors"); return _DS_FAIL
+                data = json.loads(body)
         usage = data.get("usage", {})
-        db.add_tokens(usage.get("prompt_tokens",0), usage.get("completion_tokens",0))
-        parsed   = json.loads(data["choices"][0]["message"]["content"])
+        db.add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        raw_content = data["choices"][0]["message"]["content"]
+        log.debug(f"DeepSeek content: {raw_content}")
+        parsed   = json.loads(raw_content)
         suitable = bool(parsed.get("suitable", False))
-        reason   = str(parsed.get("reason",""))[:60]
-        contact  = str(parsed.get("contact","")).strip()
-        if not contact or contact.lower() in ("null","none",""):
+        reason   = str(parsed.get("reason", ""))[:60]
+        contact  = str(parsed.get("contact", "")).strip()
+        if not contact or contact.lower() in ("null", "none", ""):
             contact = f"@{author_username}" if author_username else ""
         log.info(f"DeepSeek → suitable={suitable} reason='{reason}' contact='{contact}'")
         db.add_log("INFO", f"DS: suitable={suitable} reason={reason}")
         return DeepSeekResult(suitable=suitable, reason=reason, contact=contact)
+    except json.JSONDecodeError as e:
+        log.error(f"DeepSeek JSON ошибка: {e}")
+        db.stat_inc("ai_errors"); return _DS_FAIL
     except Exception as e:
-        log.error(f"DeepSeek: {e}"); db.stat_inc("ai_errors"); return _DS_FAIL
+        log.error(f"DeepSeek ошибка: {e}", exc_info=True)
+        db.stat_inc("ai_errors"); return _DS_FAIL
 
 async def check_deepseek_status() -> bool:
-    if not DEEPSEEK_KEY: return False
+    if not DEEPSEEK_KEY:
+        log.warning("DeepSeek: ключ не задан")
+        return False
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(DEEPSEEK_URL,
-                json={"model":DEEPSEEK_MODEL,"messages":[{"role":"user","content":"ok"}],"max_tokens":1},
-                headers={"Authorization":f"Bearer {DEEPSEEK_KEY}"},
-                timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                return resp.status == 200
-    except Exception: return False
+            async with s.post(
+                DEEPSEEK_URL,
+                json={"model": DEEPSEEK_MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1},
+                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                ok = resp.status == 200
+                if not ok:
+                    body = await resp.text()
+                    log.warning(f"DeepSeek status check: HTTP {resp.status} {body[:100]}")
+                return ok
+    except Exception as e:
+        log.warning(f"DeepSeek недоступен: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -578,10 +608,20 @@ def kb_back(dest: str = "admin_main") -> InlineKeyboardMarkup:
     return mkb([[("◀️ Назад", dest)]])
 
 def kb_admin_main() -> InlineKeyboardMarkup:
+    # Проверяем есть ли платежи на подтверждение
+    pending = 0
+    if _db:
+        try:
+            pending = _db._c().execute(
+                "SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
+        except Exception:
+            pass
+    client_label = f"👥 Клиент 🔴" if pending > 0 else "👥 Клиент"
     return mkb([
         [("♨️ Источники","admin_sources"), ("🗣 Отклики","admin_replies")],
         [("📈 Статистика","admin_stats"),   ("🖥️ Мониторинг","admin_monitoring")],
-        [("📜 Логи","admin_logs"),          ("⚙️ Настройки","admin_settings")],
+        [(client_label,"admin_clients"),   ("📜 Логи","admin_logs")],
+        [("⚙️ Настройки","admin_settings")],
     ])
 
 def kb_client_main() -> InlineKeyboardMarkup:
@@ -1211,6 +1251,137 @@ async def admin_ds_rule_add_cb(call: CallbackQuery):
         f"Введите новое правило:",
         kb_back("admin_deepseek"))
 
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — КЛИЕНТЫ
+# ═══════════════════════════════════════════════════════════════
+@admin_router.callback_query(F.data == "admin_clients")
+async def admin_clients_cb(call: CallbackQuery):
+    clients  = _db.get_all_clients()
+    pending_rows = _db._c().execute(
+        "SELECT p.*, c.tg_id, c.username FROM payments p "
+        "JOIN clients c ON p.client_id=c.id WHERE p.status='pending' ORDER BY p.id DESC"
+    ).fetchall()
+    pending = [dict(r) for r in pending_rows]
+    now     = datetime.now().isoformat()
+    active  = sum(1 for c in clients if (c.get("sub_until") or "") > now)
+    total   = len(clients)
+    lines   = [
+        f"👥 Всего клиентов: <b>{total}</b>",
+        f"💎 Активных подписок: <b>{active}</b>",
+    ]
+    if pending:
+        lines.append(f"🔴 Ожидают подтверждения: <b>{len(pending)}</b>")
+    rows = []
+    if pending:
+        rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
+    rows.append([("📋 Все клиенты", "admin_clients_list")])
+    rows.append([("➕ Выдать подписку", "admin_give_sub")])
+    rows.append([("📤 Рассылка", "admin_broadcast")])
+    rows.append([("◀️ Главное меню", "admin_main")])
+    await safe_edit(call, "\n".join(lines), mkb(rows))
+
+
+@admin_router.callback_query(F.data == "admin_pending_payments")
+async def admin_pending_payments_cb(call: CallbackQuery):
+    rows = _db._c().execute(
+        "SELECT p.*, c.tg_id, c.username FROM payments p "
+        "JOIN clients c ON p.client_id=c.id WHERE p.status='pending' ORDER BY p.id DESC"
+    ).fetchall()
+    pending = [dict(r) for r in rows]
+    if not pending:
+        await safe_edit(call, "✅ Нет ожидающих платежей", kb_back("admin_clients"))
+        return
+    btns = []
+    for p in pending:
+        uname = p.get("username") or str(p["tg_id"])
+        lbl   = f"@{uname} | {p['tariff']} | {p['amount']}₽ | {p['ticket']}"
+        btns.append([(lbl[:55], f"admin_pay_detail:{p['ticket']}")])
+    btns.append([("◀️ Назад", "admin_clients")])
+    await safe_edit(call, f"🔴 <b>Ожидают: {len(pending)}</b>", mkb(btns))
+
+
+@admin_router.callback_query(F.data.startswith("admin_pay_detail:"))
+async def admin_pay_detail_cb(call: CallbackQuery):
+    ticket = call.data.split(":", 1)[1]
+    p  = _db.get_payment_by_ticket(ticket)
+    if not p:
+        await call.answer("Тикет не найден"); return
+    cl = _db.get_client_by_id(p["client_id"])
+    if not cl:
+        await call.answer("Клиент не найден"); return
+    uname = cl.get("username") or str(cl["tg_id"])
+    lines = [
+        "💳 <b>Платёж</b>",
+        f"Тикет: <code>{ticket}</code>",
+        f"Клиент: @{uname} (<code>{cl['tg_id']}</code>)",
+        f"Тариф: <b>{p['tariff']}</b>",
+        f"Сумма: <b>{p['amount']}₽</b>",
+        f"Дней: <b>{p['days']}</b>",
+        f"Создан: {p['created_at'][:16]}",
+    ]
+    markup = mkb([
+        [("✅ Подтвердить", f"admin_confirm_pay:{ticket}"),
+         ("❌ Отклонить",   f"admin_reject_pay:{ticket}")],
+        [("◀️ Назад", "admin_pending_payments")],
+    ])
+    await safe_edit(call, "\n".join(lines), markup)
+
+
+@admin_router.callback_query(F.data.startswith("admin_reject_pay:"))
+async def admin_reject_pay_cb(call: CallbackQuery):
+    ticket = call.data.split(":", 1)[1]
+    _db._c().execute("UPDATE payments SET status='rejected' WHERE ticket=?", (ticket,))
+    _db._c().commit()
+    p = _db.get_payment_by_ticket(ticket)
+    if p:
+        cl = _db.get_client_by_id(p["client_id"])
+        if cl:
+            try:
+                await call.bot.send_message(
+                    cl["tg_id"],
+                    f"❌ Платёж <code>{ticket}</code> отклонён.\n"
+                    f"Если вы уже оплатили — обратитесь в поддержку.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=mkb([[("💬 Поддержка", f"tg://resolve?domain={SUPPORT_USERNAME}")]]),
+                )
+            except Exception:
+                pass
+    await call.answer("Отклонено")
+    await safe_edit(call, f"❌ Платёж <code>{ticket}</code> отклонён", kb_back("admin_clients"))
+
+
+@admin_router.callback_query(F.data == "admin_clients_list")
+async def admin_clients_list_cb(call: CallbackQuery):
+    clients = _db.get_all_clients()
+    now     = datetime.now().isoformat()
+    lines   = []
+    for c in clients[:30]:
+        icon  = "💎" if (c.get("sub_until") or "") > now else "👤"
+        until = fmt_date(c.get("sub_until"))
+        uname = c.get("username") or "—"
+        lines.append(f"{icon} <code>{c['tg_id']}</code> @{uname} до {until}")
+    text = f"<b>📋 Клиенты ({len(clients)})</b>\n\n" + ("\n".join(lines) if lines else "<i>Нет</i>")
+    await safe_edit(call, text, kb_back("admin_clients"))
+
+
+@admin_router.callback_query(F.data == "admin_give_sub")
+async def admin_give_sub_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "give_sub"
+    await safe_edit(call,
+        "➕ <b>Выдача подписки</b>\n\nВведите: <code>TG_ID количество_дней</code>\n"
+        "Пример: <code>123456789 30</code>",
+        kb_back("admin_clients"))
+
+
+@admin_router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "broadcast"
+    await safe_edit(call,
+        "📤 <b>Рассылка всем активным клиентам</b>\n\nВведите текст:",
+        kb_back("admin_clients"))
+
+
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ЛОГИ
 # ═══════════════════════════════════════════════════════════════
@@ -1509,6 +1680,38 @@ async def admin_text_handler(msg: Message):
                          kb_back("admin_deepseek"))
         return
 
+    # ── Выдача подписки ───────────────────────────────────────
+    if action == "give_sub":
+        parts = text.split()
+        if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+            await safe_answer(msg, "❌ Формат: <code>TG_ID дней</code>")
+            _admin_pending[uid] = "give_sub"; return
+        tg_id = int(parts[0]); days = int(parts[1])
+        cl    = _db.get_or_create_client(tg_id, None)
+        until = _db.extend_subscription(cl["id"], days)
+        await safe_answer(msg,
+            f"✅ Подписка выдана: <code>{tg_id}</code> до <b>{fmt_date(until.isoformat())}</b>",
+            kb_back("admin_clients"))
+        try:
+            await msg.bot.send_message(tg_id,
+                f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
+                parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
+        except Exception: pass
+        return
+
+    # ── Рассылка ──────────────────────────────────────────────
+    if action == "broadcast":
+        clients = _db.get_active_clients(); sent = 0
+        for cl in clients:
+            try:
+                await msg.bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
+                sent += 1; await asyncio.sleep(0.05)
+            except Exception as e: log.warning(f"Рассылка {cl['tg_id']}: {e}")
+        await safe_answer(msg,
+            f"✅ Рассылка завершена: <b>{sent}/{len(clients)}</b>",
+            kb_back("admin_clients"))
+        return
+
 
 async def _finish_userbot_auth(msg: Message) -> None:
     global _userbot
@@ -1665,7 +1868,7 @@ async def client_buy_cb(call: CallbackQuery):
 
 @client_router.callback_query(F.data.startswith("client_paid:"))
 async def client_paid_cb(call: CallbackQuery):
-    ticket = call.data.split(":")[1]
+    ticket = call.data.split(":", 1)[1]
     p      = _db.get_payment_by_ticket(ticket)
     if not p: await call.answer("Тикет не найден"); return
     text = (
@@ -1694,13 +1897,14 @@ async def client_paid_cb(call: CallbackQuery):
 # ── Подтверждение оплаты администратором ───────────────────────
 @admin_router.callback_query(F.data.startswith("admin_confirm_pay:"))
 async def admin_confirm_pay_cb(call: CallbackQuery):
-    ticket = call.data.split(":")[1]
+    ticket = call.data.split(":", 1)[1]
     p      = _db.confirm_payment(ticket)
     if not p: await call.answer("Тикет не найден"); return
     cl = _db.get_client_by_id(p["client_id"])
     if not cl: await call.answer("Клиент не найден"); return
     until = _db.extend_subscription(cl["id"], p["days"])
-    _db.set_subscription(cl["id"], until, is_payment=True)
+    _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
+    _db._c().commit()
     _db.stat_inc("subs_bought")
     await call.answer("✅ Подписка активирована")
     await safe_edit(call,
