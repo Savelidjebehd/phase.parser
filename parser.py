@@ -412,6 +412,8 @@ class Database:
     def confirm_payment(self, ticket: str) -> Optional[dict]:
         p = self.get_payment_by_ticket(ticket)
         if not p: return None
+        if p.get("status") == "confirmed":
+            return p
         self._c().execute("UPDATE payments SET status='confirmed' WHERE ticket=?", (ticket,))
         self._c().commit(); return p
 
@@ -543,10 +545,13 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         log.error(f"DeepSeek ошибка: {e}", exc_info=True)
         db.stat_inc("ai_errors"); return _DS_FAIL
 
-async def check_deepseek_status() -> bool:
+async def check_deepseek_status() -> str:
+    """
+    Возвращает: 'ok', 'no_key', 'wrong_model', 'error:<msg>'
+    """
     if not DEEPSEEK_KEY:
-        log.warning("DeepSeek: ключ не задан")
-        return False
+        log.warning("DeepSeek: DEEPSEEK_API_KEY не задан в .env")
+        return "no_key"
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -555,14 +560,28 @@ async def check_deepseek_status() -> bool:
                 headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                ok = resp.status == 200
-                if not ok:
-                    body = await resp.text()
-                    log.warning(f"DeepSeek status check: HTTP {resp.status} {body[:100]}")
-                return ok
+                body = await resp.text()
+                if resp.status == 200:
+                    log.info(f"DeepSeek OK: model={DEEPSEEK_MODEL}")
+                    return "ok"
+                # Разбираем ошибку
+                log.warning(f"DeepSeek HTTP {resp.status}: {body[:300]}")
+                try:
+                    err_data = json.loads(body)
+                    err_msg  = err_data.get("error", {}).get("message", body[:100])
+                except Exception:
+                    err_msg = body[:100]
+                if "model" in err_msg.lower() or "supported" in err_msg.lower():
+                    log.error(
+                        f"DeepSeek: неверное имя модели '{DEEPSEEK_MODEL}'\n"
+                        f"Сообщение от API: {err_msg}\n"
+                        f"Измени DEEPSEEK_MODEL в .env"
+                    )
+                    return f"wrong_model:{err_msg[:80]}"
+                return f"error:{err_msg[:80]}"
     except Exception as e:
         log.warning(f"DeepSeek недоступен: {e}")
-        return False
+        return f"error:{e}"
 
 # ═══════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -601,8 +620,17 @@ def fmt_date(iso: Optional[str]) -> str:
 # KEYBOARD BUILDER
 # ═══════════════════════════════════════════════════════════════
 def mkb(buttons: list[list[tuple[str,str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=cd) for t,cd in row] for row in buttons])
+    """Строит клавиатуру. Если cd начинается с 'http' или 'tg://' — url-кнопка."""
+    rows = []
+    for row in buttons:
+        btns = []
+        for t, cd in row:
+            if cd.startswith("http") or cd.startswith("tg://"):
+                btns.append(InlineKeyboardButton(text=t, url=cd))
+            else:
+                btns.append(InlineKeyboardButton(text=t, callback_data=cd))
+        rows.append(btns)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_back(dest: str = "admin_main") -> InlineKeyboardMarkup:
     return mkb([[("◀️ Назад", dest)]])
@@ -867,17 +895,29 @@ async def safe_answer(msg: Message, text: str, markup=None) -> None:
 # ADMIN — ГЛАВНОЕ МЕНЮ
 # ═══════════════════════════════════════════════════════════════
 async def _admin_main_text() -> str:
-    ds_ok  = await check_deepseek_status()
+    ds_status = await check_deepseek_status()
+    ds_ok  = ds_status == "ok"
     ub_ok  = _userbot is not None and await _userbot.is_user_authorized()
     ai_on  = _db.get_setting("ai_active","1") == "1"
     mon_on = _db.get_setting("monitoring_active","1") == "1"
     cb_on  = _db.get_setting("client_bot_active","1") == "1"
     srcs   = len(_db.get_sources())
     def ico(v): return "🟢" if v else "🔴"
+
+    # Детальный статус DeepSeek
+    if ds_status == "ok":
+        ds_label = "Активна"
+    elif ds_status == "no_key":
+        ds_label = "⚠️ Нет ключа API"
+    elif ds_status.startswith("wrong_model"):
+        ds_label = f"⚠️ Неверная модель ({DEEPSEEK_MODEL})"
+    else:
+        ds_label = "Недоступна"
+
     return (
         f"<b>phase.parser</b>\n\n"
         f"Статус бота: {ico(ub_ok)} {'Активен' if ub_ok else 'Не авторизован'}\n"
-        f"ИИ проверка: {ico(ds_ok and ai_on)} {'Активна' if ds_ok and ai_on else 'Недоступна'}\n"
+        f"ИИ проверка: {ico(ds_ok and ai_on)} {ds_label if not (ds_ok and ai_on) else 'Активна'}\n"
         f"Клиент бот: {ico(cb_on)} {'Активен' if cb_on else 'Выключен'}\n"
         f"📡 Источников: <b>{srcs}</b>"
     )
@@ -1209,9 +1249,17 @@ async def admin_bl_del_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data == "admin_deepseek")
 async def admin_deepseek_cb(call: CallbackQuery):
     tok    = _db.get_tokens_today()
-    ds_ok  = await check_deepseek_status()
+    ds_status = await check_deepseek_status()
+    ds_ok  = ds_status == "ok"
     rules  = _db.get_ds_rules()
-    status = "🟢 Активен" if ds_ok else "🔴 Недоступен"
+    if ds_status == "ok":
+        status = "🟢 Активен"
+    elif ds_status == "no_key":
+        status = "🔴 Нет ключа API"
+    elif ds_status.startswith("wrong_model"):
+        status = f"🔴 Неверная модель\nИзмени DEEPSEEK_MODEL в .env"
+    else:
+        status = f"🔴 Недоступен"
     text   = (
         f"<b>🤖 {DEEPSEEK_MODEL}</b>\n\n"
         f"Статус: {status}\n"
@@ -1343,7 +1391,7 @@ async def admin_reject_pay_cb(call: CallbackQuery):
                     f"❌ Платёж <code>{ticket}</code> отклонён.\n"
                     f"Если вы уже оплатили — обратитесь в поддержку.",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=mkb([[("💬 Поддержка", f"tg://resolve?domain={SUPPORT_USERNAME}")]]),
+                    reply_markup=mkb([[("💬 Поддержка", f"https://t.me/{SUPPORT_USERNAME}")]]),
                 )
             except Exception:
                 pass
@@ -1878,7 +1926,7 @@ async def client_paid_cb(call: CallbackQuery):
         f"Тикет: <code>{ticket}</code>"
     )
     markup = mkb([
-        [(f"💬 Поддержка", f"tg://resolve?domain={SUPPORT_USERNAME}")],
+        [(f"💬 Поддержка", f"https://t.me/{SUPPORT_USERNAME}")],
         [("◀️ Главное меню","client_main")],
     ])
     await safe_edit(call, text, markup)
@@ -1898,28 +1946,52 @@ async def client_paid_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data.startswith("admin_confirm_pay:"))
 async def admin_confirm_pay_cb(call: CallbackQuery):
     ticket = call.data.split(":", 1)[1]
-    p      = _db.confirm_payment(ticket)
-    if not p: await call.answer("Тикет не найден"); return
+    log.info(f"Подтверждение оплаты: {ticket}")
+
+    p = _db.get_payment_by_ticket(ticket)
+    if not p:
+        await call.answer("❌ Тикет не найден", show_alert=True); return
     cl = _db.get_client_by_id(p["client_id"])
-    if not cl: await call.answer("Клиент не найден"); return
-    until = _db.extend_subscription(cl["id"], p["days"])
-    _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
-    _db._c().commit()
-    _db.stat_inc("subs_bought")
-    await call.answer("✅ Подписка активирована")
-    await safe_edit(call,
+    if not cl:
+        await call.answer("❌ Клиент не найден", show_alert=True); return
+
+    already = p.get("status") == "confirmed"
+    if not already:
+        _db.confirm_payment(ticket)
+        until = _db.extend_subscription(cl["id"], p["days"])
+        _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
+        _db._c().commit()
+        _db.stat_inc("subs_bought")
+        log.info(f"Оплата OK: {ticket} клиент={cl['tg_id']}")
+    else:
+        raw = cl.get("sub_until") or datetime.now().isoformat()
+        until = datetime.fromisoformat(raw)
+
+    until_fmt = fmt_date(until.isoformat())
+    text = (
         f"✅ <b>Оплата подтверждена</b>\n\n"
         f"Тикет: <code>{ticket}</code>\n"
-        f"Клиент: {cl['tg_id']}\n"
-        f"Подписка до: <b>{fmt_date(until.isoformat())}</b>",
-        None)
-    # Уведомить клиента
+        f"Клиент: <code>{cl['tg_id']}</code> @{cl.get('username') or '—'}\n"
+        f"Тариф: <b>{p['tariff']}</b> ({p['days']} дн.)\n"
+        f"Подписка до: <b>{until_fmt}</b>"
+    )
+    await call.answer("✅ Готово")
     try:
-        await call.bot.send_message(cl["tg_id"],
-            f"✅ <b>Оплата подтверждена!</b>\n\nПодписка активна до: <b>{fmt_date(until.isoformat())}</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_client_main())
-    except Exception as e: log.error(f"Уведомление клиента: {e}")
+        await call.message.edit_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
+    except Exception:
+        await call.message.answer(text, parse_mode=ParseMode.HTML,
+            reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
+
+    if not already:
+        try:
+            await call.bot.send_message(cl["tg_id"],
+                f"✅ <b>Оплата подтверждена!</b>\n\n"
+                f"Подписка активна до: <b>{until_fmt}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_client_main())
+        except Exception as e:
+            log.error(f"Уведомление клиента: {e}")
 
 # ── Настройки клиента ──────────────────────────────────────────
 async def _show_client_settings(msg_or_call, cl: dict) -> None:
@@ -2151,8 +2223,12 @@ async def main() -> None:
         _register_userbot(_userbot, _pipeline)
 
     # Проверка DS
-    ds_ok = await check_deepseek_status()
-    log.info(f"DeepSeek: {'✅' if ds_ok else '❌'}")
+    ds_status = await check_deepseek_status()
+    ds_ok = ds_status == "ok"
+    if not ds_ok:
+        log.warning(f"DeepSeek не готов: {ds_status}")
+    else:
+        log.info("DeepSeek: ✅")
 
     # Команды бота
     try: await _set_bot_commands(bot)
@@ -2164,7 +2240,7 @@ async def main() -> None:
         await bot.send_message(ADMIN_ID,
             f"🚀 <b>phase.parser запущен</b>\n\n"
             f"UserBot:  {'✅' if ub_ok else '❌ требуется авторизация'}\n"
-            f"DeepSeek: {'✅' if ds_ok else '❌ проверьте ключ API'}\n\n"
+            f"DeepSeek: {'✅' if ds_ok else f'❌ {ds_status}'}\n\n"
             f"/start — открыть панель управления")
     except Exception as e: log.warning(f"Стартовое сообщение: {e}")
 

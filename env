@@ -1,18 +1,15 @@
-# ── Telegram Bot ──────────────────────────────────────────────
-BOT_TOKEN=8729193907:AAFn1D41mUgFIIa_pmcUdN37llLSGOwcMg4
-
-# ── Telegram UserBot (Telethon) ───────────────────────────────
-API_ID=20533422
+ADMIN_ID=7605695437
 API_HASH=744e04f35f8aae6803294a5f3989c35b
+API_ID=20533422
+DATA_DIR=/app/data
+DB_PATH=parser.db
+DEEPSEEK_API_KEY=sk-23840a85bfc34f0296fa07c6bd084d0e
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_URL=https://api.deepseek.com/v1/chat/completions
+FREE_DAYS=3
+PAYMENT_BANK=Озон банк
+PAYMENT_PHONE=+79132696007
+REF_DAYS=3
 STRING_SESSION=1ApWapzMBuyO32ev999_ykwUEd7on1SsqssJ97Ds4iRyJGzXKeaun6ZNxa-ElT6Buf4BWaTKr60pzjhb4g2woPjeKbs9aNYNoACcgLMMJjZiaxCvi43mxJjjmyeqh0g89jO9dBVkgKrAd1tC0lbP1dmWI652ouztQoQ2Kh-ngq23SFlinngiZZNnuie2Ps6ZwW2sbdK-4jIT9wSZXdLst9L_9Q4_PD8rpjzOLFggBtuxwM6MmBpK7pTZ9gTqO9guG5IaToRATBt3n6rlLM-q-VDMnmrnjsQ_ywioin8t7Ir1gZ2pXVy2wRUGt2NYfiKMwF25Pmk6EsFn4mqJJUH1MHcCfAkRRql0=
 
-# ── Администратор ─────────────────────────────────────────────
-ADMIN_ID=7605695437
-
-# ── DeepSeek API ──────────────────────────────────────────────
-DEEPSEEK_API_KEY=sk-7071b06036164e46a1b94a46d223735e
-DEEPSEEK_URL=https://api.deepseek.com/v1/chat/completions
-DEEPSEEK_MODEL=deepseek-chat
-
-# ── База данных ───────────────────────────────────────────────
-DB_PATH=parser.db
+SUPPORT_USERNAME=savelimontaj
