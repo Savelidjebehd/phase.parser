@@ -2074,53 +2074,69 @@ async def client_paid_cb(call: CallbackQuery):
 # ── Подтверждение оплаты администратором ───────────────────────
 @admin_router.callback_query(F.data.startswith("admin_confirm_pay:"))
 async def admin_confirm_pay_cb(call: CallbackQuery):
+    # Отвечаем ПЕРВЫМ ДЕЛОМ — иначе Telegram видит таймаут (3 сек)
+    await call.answer("⏳ Обрабатываю...")
     ticket = call.data.split(":", 1)[1]
     log.info(f"Подтверждение оплаты: {ticket}")
-
-    p = _db.get_payment_by_ticket(ticket)
-    if not p:
-        await call.answer("❌ Тикет не найден", show_alert=True); return
-    cl = _db.get_client_by_id(p["client_id"])
-    if not cl:
-        await call.answer("❌ Клиент не найден", show_alert=True); return
-
-    already = p.get("status") == "confirmed"
-    if not already:
-        _db.confirm_payment(ticket)
-        until = _db.extend_subscription(cl["id"], p["days"])
-        _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
-        _db._c().commit()
-        _db.stat_inc("subs_bought")
-        log.info(f"Оплата OK: {ticket} клиент={cl['tg_id']}")
-    else:
-        raw = cl.get("sub_until") or datetime.now().isoformat()
-        until = datetime.fromisoformat(raw)
-
-    until_fmt = fmt_date(until.isoformat())
-    text = (
-        f"✅ <b>Оплата подтверждена</b>\n\n"
-        f"Тикет: <code>{ticket}</code>\n"
-        f"Клиент: <code>{cl['tg_id']}</code> @{cl.get('username') or '—'}\n"
-        f"Тариф: <b>{p['tariff']}</b> ({p['days']} дн.)\n"
-        f"Подписка до: <b>{until_fmt}</b>"
-    )
-    await call.answer("✅ Готово")
     try:
-        await call.message.edit_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
-    except Exception:
-        await call.message.answer(text, parse_mode=ParseMode.HTML,
-            reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
-
-    if not already:
+        p = _db.get_payment_by_ticket(ticket)
+        if not p:
+            log.warning(f"Тикет не найден: {ticket}")
+            await call.message.answer("❌ Тикет не найден")
+            return
+        cl = _db.get_client_by_id(p["client_id"])
+        if not cl:
+            log.warning(f"Клиент не найден: {ticket}")
+            await call.message.answer("❌ Клиент не найден")
+            return
+        log.info(f"Платёж: status={p['status']} days={p['days']} client={cl['tg_id']}")
+        already = p.get("status") == "confirmed"
+        if not already:
+            _db.confirm_payment(ticket)
+            until = _db.extend_subscription(cl["id"], p["days"])
+            _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
+            _db._c().commit()
+            _db.stat_inc("subs_bought")
+            log.info(f"Оплата OK: {ticket} клиент={cl['tg_id']} до={until}")
+        else:
+            raw   = cl.get("sub_until") or datetime.now().isoformat()
+            until = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+            log.info(f"Уже подтверждён: {ticket}")
+        until_iso = until.isoformat() if hasattr(until, "isoformat") else str(until)
+        until_fmt = fmt_date(until_iso)
+        text = (
+            f"✅ <b>Оплата подтверждена</b>\n\n"
+            f"Тикет: <code>{ticket}</code>\n"
+            f"Клиент: <code>{cl['tg_id']}</code> @{cl.get('username') or '—'}\n"
+            f"Тариф: <b>{p['tariff']}</b> ({p['days']} дн.)\n"
+            f"Подписка до: <b>{until_fmt}</b>"
+        )
         try:
-            await call.bot.send_message(cl["tg_id"],
-                f"✅ <b>Оплата подтверждена!</b>\n\n"
-                f"Подписка активна до: <b>{until_fmt}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_client_main())
-        except Exception as e:
-            log.error(f"Уведомление клиента: {e}")
+            await call.message.edit_text(
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
+        except Exception as edit_err:
+            log.warning(f"edit_text: {edit_err}")
+            await call.message.answer(
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=mkb([[("◀️ К клиентам", "admin_clients")]]))
+        if not already:
+            try:
+                await call.bot.send_message(
+                    cl["tg_id"],
+                    f"✅ <b>Оплата подтверждена!</b>\n\n"
+                    f"Подписка активна до: <b>{until_fmt}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_client_main())
+                log.info(f"Клиент {cl['tg_id']} уведомлён")
+            except Exception as e:
+                log.error(f"Уведомление клиента {cl['tg_id']}: {e}")
+    except Exception as e:
+        log.error(f"admin_confirm_pay_cb: {e}", exc_info=True)
+        try:
+            await call.message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 # ── Настройки клиента ──────────────────────────────────────────
 async def _show_client_settings(msg_or_call, cl: dict) -> None:
