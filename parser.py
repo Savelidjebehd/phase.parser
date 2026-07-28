@@ -39,7 +39,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DB_PATH        = os.getenv("DB_PATH", "parser.db")
+DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
@@ -945,13 +945,142 @@ async def admin_sources_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_add")
 async def admin_src_add_cb(call: CallbackQuery):
-    _admin_pending[call.from_user.id] = "add_source_links"
+    uid = call.from_user.id
+    # Если кэш уже есть — сразу рисуем без перезагрузки
+    if uid in _src_picker and _src_picker[uid].get("chats"):
+        await _draw_src_picker(call, uid)
+        return
+    await safe_edit(call, "⏳ <b>Загружаю список чатов...</b>", None)
+    try:
+        chats = []
+        async for dialog in _userbot.iter_dialogs(limit=300):
+            e = dialog.entity
+            cls = e.__class__.__name__
+            # Только группы и супергруппы — без каналов и личных чатов
+            is_supergroup = getattr(e, "megagroup", False) or getattr(e, "gigagroup", False)
+            is_basic_chat = cls == "Chat"
+            is_broadcast  = getattr(e, "broadcast", False)
+            is_user       = cls == "User"
+            if is_user or is_broadcast:
+                continue
+            if not (is_supergroup or is_basic_chat):
+                continue
+            chats.append({
+                "id":       str(dialog.id),
+                "title":    dialog.name or str(dialog.id),
+                "username": getattr(e, "username", None),
+            })
+            if len(chats) >= 60:
+                break
+    except Exception as ex:
+        log.error(f"iter_dialogs: {ex}")
+        await safe_edit(call, f"❌ Ошибка загрузки: <code>{ex}</code>", kb_back("admin_sources"))
+        return
+
+    if not chats:
+        await safe_edit(call,
+            "😕 <b>Групп не найдено</b>\n\nUserBot не состоит ни в одной группе.",
+            kb_back("admin_sources"))
+        return
+
+    _src_picker[uid] = {"chats": {c["id"]: c for c in chats}, "selected": set()}
+    await _draw_src_picker(call, uid)
+
+
+async def _draw_src_picker(call: CallbackQuery, uid: int) -> None:
+    state = _src_picker.get(uid)
+    if not state:
+        await safe_edit(call, "❌ Сессия устарела. Нажмите «Добавить» снова.", kb_back("admin_sources"))
+        return
+
+    chats    = state["chats"]
+    selected = state["selected"]
+    existing = {str(s["chat_id"]) for s in _db.get_sources(active_only=False)}
+
+    rows = []
+    for cid, c in chats.items():
+        in_db   = cid in existing
+        checked = cid in selected
+        if in_db:
+            icon = "✅"
+            cd   = "noop"
+        elif checked:
+            icon = "☑️"
+            cd   = f"src_pick:{cid}"
+        else:
+            icon = "  "
+            cd   = f"src_pick:{cid}"
+        rows.append([(f"{icon} {c['title'][:38]}", cd)])
+
+    rows.append([(f"✔️ Готово ({len(selected)} выбрано)", "src_pick_done")])
+    rows.append([("🔄 Обновить список", "src_pick_reload"), ("◀️ Назад", "admin_sources")])
+
     await safe_edit(call,
-        "📡 <b>Добавление источников</b>\n\n"
-        "Отправьте ссылки на чаты/группы — каждую с новой строки:\n\n"
-        "<i>Пример:\nhttps://t.me/montage_jobs\n@video_orders</i>\n\n"
-        "⚠️ <b>Убедитесь что вы вступили в чат/группу</b> ⚠️",
-        kb_back("admin_sources"))
+        f"<b>📡 Добавьте источники:</b>\n\n"
+        f"☑️ — выбрано  |  ✅ — уже добавлен\n"
+        f"Выбрано: <b>{len(selected)}</b>",
+        mkb(rows))
+
+
+@admin_router.callback_query(F.data.startswith("src_pick:"))
+async def src_pick_cb(call: CallbackQuery):
+    await call.answer()
+    uid = call.from_user.id
+    cid = call.data.split(":", 1)[1]
+    if uid not in _src_picker:
+        await safe_edit(call, "❌ Сессия устарела. Начните заново.", kb_back("admin_sources"))
+        return
+    selected = _src_picker[uid]["selected"]
+    if cid in selected:
+        selected.discard(cid)
+    else:
+        selected.add(cid)
+    await _draw_src_picker(call, uid)
+
+
+@admin_router.callback_query(F.data == "src_pick_reload")
+async def src_pick_reload_cb(call: CallbackQuery):
+    _src_picker.pop(call.from_user.id, None)
+    await admin_src_add_cb(call)
+
+
+@admin_router.callback_query(F.data == "src_pick_done")
+async def src_pick_done_cb(call: CallbackQuery):
+    uid   = call.from_user.id
+    state = _src_picker.pop(uid, None)
+    if not state or not state["selected"]:
+        await call.answer("Ничего не выбрано", show_alert=True)
+        return
+
+    chats    = state["chats"]
+    selected = state["selected"]
+    added = 0; errors = []
+
+    for cid in selected:
+        c = chats.get(cid)
+        if not c: continue
+        try:
+            uname = c.get("username")
+            link  = f"https://t.me/{uname}" if uname else None
+            ok    = _db.add_source(int(cid), c["title"], uname, link)
+            if ok:
+                added += 1
+                log.info(f"Источник добавлен: {c['title']} ({cid})")
+        except Exception as e:
+            errors.append(c["title"][:20])
+            log.error(f"add_source {cid}: {e}")
+
+    result = f"✅ Добавлено источников: <b>{added}</b>"
+    if errors:
+        result += f"\n❌ Ошибки: {', '.join(errors)}"
+
+    # Редактируем и через 2 сек переходим в главное меню
+    try:
+        await call.message.edit_text(result, parse_mode="HTML")
+    except Exception:
+        pass
+    await asyncio.sleep(2)
+    await admin_sources_cb(call)
 
 @admin_router.callback_query(F.data == "admin_src_list")
 async def admin_src_list_cb(call: CallbackQuery):
@@ -2116,7 +2245,13 @@ def _register_userbot(userbot: TelegramClient, pipeline: VacancyPipeline) -> Non
             cid  = event.chat_id
             if cid not in ids and abs(cid) not in ids: return
             await pipeline.enqueue(event)
-        except Exception as e: log.error(f"UserBot: {e}", exc_info=True)
+        except Exception as e:
+            err_str = str(e)
+            # TypeNotFoundError — Telethon устарел, игнорируем конкретное сообщение
+            if "TypeNotFoundError" in type(e).__name__ or "Constructor ID" in err_str:
+                log.warning(f"UserBot: неизвестный тип TL-объекта (обновите Telethon): {err_str[:100]}")
+                return
+            log.error(f"UserBot: {e}", exc_info=True)
     log.info("UserBot: обработчик зарегистрирован")
 
 async def _init_userbot(bot: Bot) -> TelegramClient:
@@ -2245,12 +2380,39 @@ async def main() -> None:
     except Exception as e: log.warning(f"Стартовое сообщение: {e}")
 
     log.info("Запуск задач...")
+    async def _safe_userbot_run():
+        """Перезапускает userbot при TypeNotFoundError вместо падения."""
+        while True:
+            try:
+                await _userbot.run_until_disconnected()
+                break  # нормальное завершение
+            except Exception as e:
+                if "TypeNotFoundError" in type(e).__name__ or "Constructor ID" in str(e):
+                    log.warning(
+                        "UserBot: TypeNotFoundError — Telegram обновил протокол.\n"
+                        "Обновите Telethon: pip install telethon==1.44.0\n"
+                        f"Детали: {str(e)[:200]}"
+                    )
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            "⚠️ <b>UserBot: ошибка протокола</b>\n\n"
+                            "Telegram обновил протокол, Telethon устарел.\n"
+                            "Обновите: <code>pip install telethon==1.44.0</code>\n"
+                            "затем перезапустите бот.",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)  # пауза перед переподключением
+                else:
+                    raise
+
     await asyncio.gather(
         dp.start_polling(bot, allowed_updates=["message","callback_query"]),
         _pipeline.run_worker(),
         _periodic_cleanup(),
         _check_expired_subs(bot),
-        _userbot.run_until_disconnected(),
+        _safe_userbot_run(),
     )
 
 if __name__ == "__main__":
