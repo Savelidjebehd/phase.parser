@@ -277,6 +277,10 @@ class Database:
         row = self._c().execute("SELECT * FROM clients WHERE tg_id=?", (tg_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_client_by_id(self, client_id: int) -> Optional[dict]:
+        row = self._c().execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+        return dict(row) if row else None
+
     def get_all_clients(self) -> list[dict]:
         return [dict(r) for r in self._c().execute("SELECT * FROM clients ORDER BY id DESC").fetchall()]
 

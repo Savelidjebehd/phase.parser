@@ -1,0 +1,8 @@
+# Никогда не коммитим в GitHub
+.env
+data/
+*.log
+*.session
+__pycache__/
+*.pyc
+.DS_Store
