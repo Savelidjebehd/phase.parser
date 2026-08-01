@@ -145,6 +145,13 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT (datetime('now')),
                 level TEXT NOT NULL, message TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS blocked_senders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER UNIQUE NOT NULL,
+                sender_username TEXT,
+                reason TEXT,
+                blocked_until TEXT,
+                added_at TEXT DEFAULT (datetime('now')));
             CREATE TABLE IF NOT EXISTS stats_daily (
                 date TEXT PRIMARY KEY, vacancies_found INTEGER DEFAULT 0,
                 vacancies_failed INTEGER DEFAULT 0, replies_sent INTEGER DEFAULT 0,
@@ -492,6 +499,37 @@ class Database:
         self._c().execute("DELETE FROM logs WHERE ts<?", (cutoff,))
         self._c().execute("DELETE FROM vacancies WHERE suitable=0 AND created_at<?", (cutoff,))
         self._c().commit(); log.info("Авто-очистка выполнена")
+
+    def clear_logs(self) -> None:
+        self._c().execute("DELETE FROM logs")
+        self._c().commit(); log.info("Логи очищены вручную")
+
+    def is_sender_blocked(self, sender_id: int) -> bool:
+        row = self._c().execute(
+            "SELECT blocked_until FROM blocked_senders WHERE sender_id=?", (sender_id,)
+        ).fetchone()
+        if not row: return False
+        if row["blocked_until"]:
+            return datetime.now().isoformat() < row["blocked_until"]
+        return True
+
+    def block_sender(self, sender_id: int, username: str, reason: str, until: str) -> None:
+        self._c().execute(
+            "INSERT OR REPLACE INTO blocked_senders(sender_id,sender_username,reason,blocked_until) VALUES(?,?,?,?)",
+            (sender_id, username, reason, until)); self._c().commit()
+
+    def get_blocked_senders(self) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT * FROM blocked_senders ORDER BY added_at DESC").fetchall()]
+
+    def delete_ds_rules(self) -> None:
+        self._c().execute("DELETE FROM settings WHERE key LIKE 'ds_rule_%'")
+        self._c().commit()
+
+    def get_client_payments(self, client_id: int) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT * FROM payments WHERE client_id=? ORDER BY created_at DESC", (client_id,)
+        ).fetchall()]
 # ═══════════════════════════════════════════════════════════════
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
@@ -658,7 +696,8 @@ def kb_admin_main() -> InlineKeyboardMarkup:
 
 def kb_client_main() -> InlineKeyboardMarkup:
     return mkb([
-        [("👤 Профиль","client_profile"), ("💳 Тарифы","client_tariffs")],
+        [("💳 Реферальная программа","client_referral")],
+        [("💳 Тарифы","client_tariffs")],
         [("⚙️ Настройки","client_settings")],
     ])
 
@@ -699,6 +738,17 @@ class VacancyPipeline:
 
             log.info(f"📥 [{source_title}] @{username}")
             self.db.add_log("INFO", f"Получено: {message_link} @{username}")
+
+            # Фильтр заблокированных отправителей
+            if sender_id and self.db.is_sender_blocked(sender_id):
+                log.debug(f"⛔ Заблокированный отправитель: {sender_id}")
+                return
+
+            # Фильтр: сообщение из 1 слова — невалидная вакансия
+            word_count = len(text.split())
+            if word_count < 2:
+                log.debug(f"⛔ Слишком короткое сообщение ({word_count} сл.): пропуск")
+                return
 
             # Ключевые слова
             kw_common = self.db.get_keywords("common")
@@ -787,9 +837,11 @@ class VacancyPipeline:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
                 hidden   = hide_contact(vacancy.text, ds.contact)
-                msg_text = (f"<b>Новая вакансия</b>\n<i>{vacancy.source_title}</i>\n\n"
-                            f"{hidden}\n\n"
-                            f"<i>🕐 {vacancy.timestamp.strftime('%d.%m.%Y %H:%M')}</i>")
+                msg_text = (
+                    f"📢 <b>Новая вакансия</b>\n\n"
+                    f"{hidden}\n\n"
+                    f"🕐 <i>{vacancy.timestamp.strftime('%d.%m.%Y %H:%M')}</i>"
+                )
                 markup = mkb([[("👁 Показать контакты", f"show_contact:{vid}:{cl_id}")]])
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -811,15 +863,16 @@ class VacancyPipeline:
 
     async def _notify_admin_reply(self, vacancy: Vacancy, ds: DeepSeekResult,
                                    tmpl: dict, variant_num: int, reply_id: int) -> None:
+        if self.db.get_setting("notify_reply","1") != "1":
+            return
         num   = f"#{tmpl['id']}.{variant_num}"
         short = vacancy.text[:600]
-        # Определяем contact_id для ссылки
         contact = ds.contact
         if contact.startswith("@"):
             client_link = f"https://t.me/{contact.lstrip('@')}"
         else:
             client_link = f"tg://user?id={vacancy.author_id}"
-
+        safe_uname = vacancy.author_username or ""
         text = (
             f"✅ <b>Новый отклик! #{num}</b>\n\n"
             f"<blockquote expandable>{short}</blockquote>\n\n"
@@ -830,6 +883,7 @@ class VacancyPipeline:
         markup = mkb([
             [("⚠️ Ошибка", f"admin_error:{reply_id}"),
              ("🗑 Удалить", f"admin_del_reply:{reply_id}")],
+            [("🚫 Заблокировать отправителя", f"admin_block_sender:{vacancy.author_id}:{vacancy.author_username or ''}")],
         ])
         try:
             await self.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -1536,14 +1590,64 @@ async def admin_reject_pay_cb(call: CallbackQuery):
 async def admin_clients_list_cb(call: CallbackQuery):
     clients = _db.get_all_clients()
     now     = datetime.now().isoformat()
-    lines   = []
+    rows    = []
     for c in clients[:30]:
         icon  = "💎" if (c.get("sub_until") or "") > now else "👤"
-        until = fmt_date(c.get("sub_until"))
-        uname = c.get("username") or "—"
-        lines.append(f"{icon} <code>{c['tg_id']}</code> @{uname} до {until}")
-    text = f"<b>📋 Клиенты ({len(clients)})</b>\n\n" + ("\n".join(lines) if lines else "<i>Нет</i>")
-    await safe_edit(call, text, kb_back("admin_clients"))
+        uname = c.get("username")
+        label = f"@{uname}" if uname else f"id:{c['tg_id']}"
+        rows.append([(f"{icon} {label}", f"admin_client_detail:{c['id']}")])
+    rows.append([("◀️ Назад","admin_clients")])
+    await safe_edit(call, f"<b>📋 Клиенты ({len(clients)})</b>", mkb(rows))
+
+@admin_router.callback_query(F.data.startswith("admin_client_detail:"))
+async def admin_client_detail_cb(call: CallbackQuery):
+    client_id = int(call.data.split(":")[1])
+    c = _db.get_client_by_id(client_id)
+    if not c: await call.answer("Не найден"); return
+    now    = datetime.now().isoformat()
+    active = (c.get("sub_until") or "") > now
+    icon   = "💎" if active else "👤"
+    uname  = c.get("username") or ""
+    until  = fmt_date(c.get("sub_until"))
+    display_name = f"@{uname}" if uname else f"<code>{c['tg_id']}</code>"
+
+    # История пополнений
+    payments = _db.get_client_payments(client_id)
+    hist_lines = [f"{p['created_at'][:10]} {p['tariff']} {p['amount']}₽" for p in payments]
+    hist_block = "<blockquote>" + "\n".join(hist_lines) + "</blockquote>" if hist_lines else "<i>нет</i>"
+
+    text = (
+        f"{icon} <b>📋 Клиент</b> {display_name}\n"
+        f"ID: <code>{c['tg_id']}</code>\n\n"
+        f"Тариф: {until}\n\n"
+        f"История пополнений:\n{hist_block}"
+    )
+    markup = mkb([
+        [("➕ Выдать подписку", f"admin_give_sub_client:{client_id}"),
+         ("🚫 Заблокировать",  f"admin_block_client:{client_id}:{c['tg_id']}:unknown")],
+        [("◀️ Назад","admin_clients_list")],
+    ])
+    await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data.startswith("admin_give_sub_client:"))
+async def admin_give_sub_client_cb(call: CallbackQuery):
+    client_id = call.data.split(":")[1]
+    _admin_pending[call.from_user.id] = f"give_sub_id:{client_id}"
+    await safe_edit(call,
+        "➕ Введите количество дней:",
+        kb_back(f"admin_client_detail:{client_id}"))
+
+@admin_router.callback_query(F.data.startswith("admin_block_client:"))
+async def admin_block_client_cb(call: CallbackQuery):
+    parts     = call.data.split(":")
+    client_id = parts[1]; tg_id = parts[2]; uname = parts[3] if len(parts) > 3 else ""
+    display   = f"@{uname}" if uname and uname != "unknown" else f"ID: <code>{tg_id}</code>"
+    markup    = mkb([
+        [("✅ Да, заблокировать", f"admin_block_confirm:{tg_id}:{uname}"),
+         ("❌ Нет",               f"admin_client_detail:{client_id}")],
+    ])
+    await safe_edit(call,
+        f"🚫 <b>Заблокировать?</b>\n\n{display}", markup)
 
 
 @admin_router.callback_query(F.data == "admin_give_sub")
@@ -1591,16 +1695,56 @@ async def admin_logs_export_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 @admin_router.callback_query(F.data == "admin_settings")
 async def admin_settings_cb(call: CallbackQuery):
-    ai_on  = _db.get_setting("ai_active","1") == "1"
-    mon_on = _db.get_setting("monitoring_active","1") == "1"
-    cb_on  = _db.get_setting("client_bot_active","1") == "1"
+    ai_on       = _db.get_setting("ai_active","1") == "1"
+    mon_on      = _db.get_setting("monitoring_active","1") == "1"
+    cb_on       = _db.get_setting("client_bot_active","1") == "1"
+    ntf_reply   = _db.get_setting("notify_reply","1") == "1"
+    ntf_reject  = _db.get_setting("notify_rejected","1") == "1"
     markup = mkb([
         [(f"🤖 ИИ {'включено' if ai_on else 'выключено'}", "admin_settings_toggle:ai_active")],
         [(f"🖥️ Мониторинг {'включен' if mon_on else 'выключен'}", "admin_settings_toggle:monitoring_active")],
         [(f"👥 Клиент бот {'включен' if cb_on else 'выключен'}", "admin_settings_toggle:client_bot_active")],
+        [("📣 Оповещения", "admin_notifications")],
+        [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, "<b>⚙️ Настройки</b>", markup)
+
+@admin_router.callback_query(F.data == "admin_notifications")
+async def admin_notifications_cb(call: CallbackQuery):
+    ntf_reply  = _db.get_setting("notify_reply","1") == "1"
+    ntf_reject = _db.get_setting("notify_rejected","1") == "1"
+    markup = mkb([
+        [(f"{'✅' if ntf_reply else '❌'} Отклик отправлен", "admin_settings_toggle:notify_reply")],
+        [(f"{'✅' if ntf_reject else '❌'} Не прошло проверку", "admin_settings_toggle:notify_rejected")],
+        [("◀️ Назад", "admin_settings")],
+    ])
+    await safe_edit(call,
+        "<b>📣 Оповещения</b>\n\nВыберите какие уведомления получать:",
+        markup)
+
+
+@admin_router.callback_query(F.data == "admin_clear_logs")
+async def admin_clear_logs_cb(call: CallbackQuery):
+    await safe_edit(call, "Вы уверены что хотите очистить все логи?",
+        mkb([[("✅ Да, очистить","admin_clear_logs_confirm"),("❌ Нет","admin_settings")]]))
+
+@admin_router.callback_query(F.data == "admin_clear_logs_confirm")
+async def admin_clear_logs_confirm_cb(call: CallbackQuery):
+    _db.clear_logs()
+    await call.answer("✅ Логи очищены")
+    await admin_settings_cb(call)
+
+@admin_router.callback_query(F.data == "admin_clear_ds_rules")
+async def admin_clear_ds_rules_cb(call: CallbackQuery):
+    await safe_edit(call, "Удалить все глобальные правила DeepSeek?",
+        mkb([[("✅ Да","admin_clear_ds_rules_confirm"),("❌ Нет","admin_settings")]]))
+
+@admin_router.callback_query(F.data == "admin_clear_ds_rules_confirm")
+async def admin_clear_ds_rules_confirm_cb(call: CallbackQuery):
+    _db.delete_ds_rules()
+    await call.answer("✅ Правила удалены")
+    await admin_settings_cb(call)
 
 @admin_router.callback_query(F.data.startswith("admin_settings_toggle:"))
 async def admin_settings_toggle_cb(call: CallbackQuery):
@@ -1621,6 +1765,39 @@ async def admin_settings_confirm_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ОШИБКИ В ОТКЛИКЕ / УДАЛЕНИЕ
 # ═══════════════════════════════════════════════════════════════
+
+@admin_router.callback_query(F.data.startswith("admin_block_sender:"))
+async def admin_block_sender_cb(call: CallbackQuery):
+    parts        = call.data.split(":", 2)
+    sender_id    = int(parts[1])
+    sender_uname = parts[2] if len(parts) > 2 else ""
+    # Показываем кто это — username или просто ID
+    display = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"ID: <code>{sender_id}</code>"
+    markup = mkb([
+        [("✅ Да, заблокировать", f"admin_block_confirm:{sender_id}:{sender_uname}"),
+         ("❌ Нет",               "admin_main")],
+    ])
+    await safe_edit(call,
+        f"🚫 <b>Заблокировать отправителя?</b>\n\n{display}",
+        markup)
+
+@admin_router.callback_query(F.data.startswith("admin_block_confirm:"))
+async def admin_block_confirm_cb(call: CallbackQuery):
+    parts        = call.data.split(":", 2)
+    sender_id    = int(parts[1])
+    sender_uname = parts[2] if len(parts) > 2 else ""
+    display      = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"id:{sender_id}"
+    _db.block_sender(sender_id, sender_uname, "Заблокирован администратором", None)
+    log.info(f"Отправитель заблокирован: {sender_id} {display}")
+    # Уведомляем пользователя если он клиент
+    try:
+        await call.bot.send_message(sender_id,
+            "Извините, но вы заблокированы в нашем сервисе.")
+    except Exception: pass
+    await safe_edit(call,
+        f"✅ <b>Заблокирован</b>\n\n{display}",
+        kb_back("admin_main"))
+
 @admin_router.callback_query(F.data.startswith("admin_error:"))
 async def admin_error_reply_cb(call: CallbackQuery):
     reply_id = call.data.split(":")[1]
@@ -1861,7 +2038,7 @@ async def admin_text_handler(msg: Message):
                          kb_back("admin_deepseek"))
         return
 
-    # ── Выдача подписки ───────────────────────────────────────
+    # ── Выдача подписки по TG_ID ─────────────────────────────
     if action == "give_sub":
         parts = text.split()
         if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
@@ -1879,6 +2056,29 @@ async def admin_text_handler(msg: Message):
                 parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
         except Exception: pass
         return
+
+    # ── Выдача подписки по client_id (из карточки клиента) ──
+    if action and action.startswith("give_sub_id:"):
+        client_id = int(action.split(":")[1])
+        days = int(text.strip()) if text.strip().isdigit() else 0
+        if days <= 0:
+            await safe_answer(msg, "❌ Введите количество дней (число)")
+            _admin_pending[uid] = action; return
+        cl    = _db.get_client_by_id(client_id)
+        if not cl:
+            await safe_answer(msg, "❌ Клиент не найден"); return
+        until = _db.extend_subscription(client_id, days)
+        await safe_answer(msg,
+            f"✅ Подписка выдана до <b>{fmt_date(until.isoformat())}</b>",
+            kb_back(f"admin_client_detail:{client_id}"))
+        try:
+            await msg.bot.send_message(cl["tg_id"],
+                f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
+                parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
+        except Exception: pass
+        return
+
+    # Блокировка теперь через кнопку admin_block_confirm — ввод текста не нужен
 
     # ── Рассылка ──────────────────────────────────────────────
     if action == "broadcast":
@@ -1932,11 +2132,28 @@ async def admin_src_recheck_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 
 def _client_main_text(cl: dict, is_new: bool = False) -> str:
-    sub = fmt_date(cl.get("sub_until"))
+    sub   = fmt_date(cl.get("sub_until"))
     bonus = "\n<b>Тебе начислено +3 бесплатных дня</b>" if is_new else ""
+    # Вакансий за сегодня
+    today = datetime.now().strftime("%Y-%m-%d")
+    vac_today = 0
+    try:
+        row = _db._c().execute(
+            "SELECT SUM(vacancies_found) FROM stats_daily WHERE date=?", (today,)
+        ).fetchone()
+        vac_today = row[0] or 0
+    except Exception:
+        pass
+    stop_words = []
+    try:
+        stop_words = _db.get_client_stopwords(cl["id"])
+    except Exception:
+        pass
     return (
-        f"Это <b>phase.parser</b>👔{bonus}\n\n"
-        f"Подписка активна до: {sub}"
+        f"Вы используете <b>phase.parser</b>👔{bonus}\n\n"
+        f"Вакансий за сегодня: <b>{vac_today}</b>\n"
+        f"Ваши стоп слова: <b>{len(stop_words)}</b>\n\n"
+        f"📅 Срок действия подписки: {sub}"
     )
 
 @client_router.message(Command("start"))
@@ -1987,17 +2204,49 @@ async def client_cmd_pay(msg: Message):
 async def client_profile_cb(call: CallbackQuery):
     uid = call.from_user.id; uname = call.from_user.username
     cl  = _db.get_or_create_client(uid, uname)
-    sub = fmt_date(cl.get("sub_until"))
-    ref_link = f"https://t.me/{(await call.bot.get_me()).username}?start=ref{uid}"
+    await client_referral_cb(call)
+
+@client_router.callback_query(F.data == "client_referral")
+async def client_referral_cb(call: CallbackQuery):
+    uid = call.from_user.id; uname = call.from_user.username
+    cl  = _db.get_or_create_client(uid, uname)
+    bot_me   = await call.bot.get_me()
+    ref_link = f"https://t.me/{bot_me.username}?start=ref{uid}"
     invited  = _db._c().execute("SELECT COUNT(*) FROM clients WHERE ref_by=?", (cl["id"],)).fetchone()[0]
     text = (
-        f"Вы используете <b>phase.parser</b>👔\n\n"
-        f"Подписка активна до: {sub}\n\n"
-        f"Реферальная ссылка:\n<code>{ref_link}</code>\n"
-        f"<b>+{REF_DAYS} дня</b> вам и <b>+{REF_DAYS} дня</b> ему\n"
-        f"Приглашено: {invited}"
+        f"Реферальная программа <b>phase.parser</b>\n\n"
+        f"🔗 <b>Ваша ссылка:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"<b>+{REF_DAYS} дня</b> вам и <b>+{REF_DAYS} дней</b> ему\n"
+        f"Дни засчитываются при покупке любого тарифа рефералом\n\n"
+        f"Приглашено: <b>{invited}</b>"
     )
-    await safe_edit(call, text, mkb([[("◀️ Главное меню","client_main")]]))
+    markup = mkb([
+        [("👥 Пригласить друга", f"client_invite_friend:{uid}")],
+        [("◀️ Главное меню","client_main")],
+    ])
+    await safe_edit(call, text, markup)
+
+@client_router.callback_query(F.data.startswith("client_invite_friend:"))
+async def client_invite_friend_cb(call: CallbackQuery):
+    ref_uid  = call.data.split(":")[1]
+    bot_me   = await call.bot.get_me()
+    ref_link = f"https://t.me/{bot_me.username}?start=ref{ref_uid}"
+    share_text = (
+        f"Привет. Получай клиентов с помощью phase.parser\n\n"
+        f"{ref_link}\n\n"
+        f"20+ вакансий для монтажа в день"
+    )
+    # Открываем меню пересылки через share URL
+    share_url = f"https://t.me/share/url?url={ref_link}&text=Привет.+Получай+клиентов+с+помощью+phase.parser"
+    markup = mkb([
+        [("📤 Поделиться ссылкой", share_url)],
+        [("◀️ Назад", "client_referral")],
+    ])
+    await safe_edit(call,
+        f"Отправьте другу эту ссылку:\n\n<code>{ref_link}</code>\n\n"
+        f"<i>Или нажмите кнопку ниже чтобы открыть меню пересылки</i>",
+        markup)
 
 # ── Тарифы ─────────────────────────────────────────────────────
 async def _tariffs_text(cl: dict) -> str:
@@ -2222,6 +2471,9 @@ async def show_contact_cb(call: CallbackQuery):
         uname    = contact.lstrip("@")
         client_link = f"https://t.me/{uname}"
         new_text += f"\n\n<a href='{client_link}'>💬 Написать клиенту</a>"
+    elif contact and contact.lstrip("-").isdigit():
+        # Контакт — числовой ID (нет username)
+        new_text += f"\n\n<a href='tg://user?id={contact}'>💬 Написать клиенту</a>"
 
     try:
         await call.message.edit_text(new_text, parse_mode=ParseMode.HTML)
