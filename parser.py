@@ -177,8 +177,11 @@ class Database:
         self._c().commit()
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
             "ds_system_prompt",
-            "Ты фильтр вакансий для видеомонтажёра/дизайнера. "
-            "Определи является ли текст вакансией/заказом для исполнителя. "
+            "Ты фильтр вакансий для видеомонтажёра. "
+            "Определи, является ли текст вакансией/заказом именно на монтаж видео для исполнителя-монтажёра. "
+            "Не считай подходящими вакансии на другие роли (дизайнер, оператор, видеограф, сценарист, SMM, "
+            "копирайтер, контент-менеджер и т.п.), даже если они упомянуты рядом — главной задачей вакансии "
+            "должен быть именно монтаж видео. "
             "ВАЖНО: найди контакт для связи — это @username или телефон после слов 'писать', 'пишите', 'контакт', 'обращаться'. "
             "Это НЕ контакт: ссылки на портфолио, референсы, примеры работ. "
             "Если контакт не найден — верни username автора. "
@@ -594,6 +597,11 @@ async def check_deepseek_status() -> str:
 # ═══════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════
+def norm_yo(s: str) -> str:
+    """Приводит 'ё'→'е' (и 'Ё'→'Е'), чтобы сравнение ключевых слов/чёрного
+    списка с текстом сообщения не зависело от того, как автор написал букву."""
+    return s.replace("ё", "е").replace("Ё", "Е")
+
 def extract_text(message) -> str:
     caption = message.text or message.message or ""
     if message.media is None: return caption
@@ -719,10 +727,10 @@ class VacancyPipeline:
                 log.debug(f"⛔ Слишком короткое сообщение ({word_count} сл.): пропуск")
                 return
 
-            # Ключевые слова
+            # Ключевые слова (сравнение без разницы «ё»/«е»)
             kw_common = self.db.get_keywords("common")
-            text_low  = text.lower()
-            found_kw  = [kw for kw in kw_common if kw in text_low]
+            text_low  = norm_yo(text.lower())
+            found_kw  = [kw for kw in kw_common if norm_yo(kw.lower()) in text_low]
             if not found_kw: return
             log.info(f"✅ КС: {found_kw}"); self.db.add_log("INFO", f"КС: {found_kw}")
 
@@ -730,8 +738,8 @@ class VacancyPipeline:
             if self.db.is_duplicate(text):
                 log.info("🔁 Дубликат"); self.db.add_log("INFO", "🔁 Дубликат (уже была такая вакансия)"); return
 
-            # Чёрный список
-            found_bl = [w for w in self.db.get_blacklist("common") if w in text_low]
+            # Чёрный список (тоже без разницы «ё»/«е»)
+            found_bl = [w for w in self.db.get_blacklist("common") if norm_yo(w.lower()) in text_low]
             if found_bl:
                 log.info(f"⛔ ЧС: {found_bl}")
                 self.db.add_log("INFO", f"⛔ Отсеяно чёрным списком: {found_bl}")
@@ -776,9 +784,9 @@ class VacancyPipeline:
         for cl in clients:
             try:
                 cl_id = cl["id"]
-                text_low = vacancy.text.lower()
+                text_low = norm_yo(vacancy.text.lower())
                 stop_words = self.db.get_client_stopwords(cl_id)
-                hit = [w for w in stop_words if w in text_low]
+                hit = [w for w in stop_words if norm_yo(w.lower()) in text_low]
                 if hit:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
