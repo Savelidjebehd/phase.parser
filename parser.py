@@ -50,7 +50,8 @@ SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
-REF_DAYS         = int(os.getenv("REF_DAYS", "3"))
+REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус купившему рефералу
+REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
 
 # Цены: до первой оплаты (скидка) / после
 PRICES = {
@@ -661,7 +662,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
 
 def kb_client_main() -> InlineKeyboardMarkup:
     return mkb([
-        [("💳 Реферальная программа","client_referral")],
+        [("👥 Реферальная программа","client_referral")],
         [("💳 Тарифы","client_tariffs")],
         [("⚙️ Настройки","client_settings")],
     ])
@@ -709,6 +710,7 @@ class VacancyPipeline:
             # Фильтр заблокированных отправителей
             if sender_id and self.db.is_sender_blocked(sender_id):
                 log.debug(f"⛔ Заблокированный отправитель: {sender_id}")
+                self.db.add_log("INFO", f"⛔ Отправитель в блоке: {sender_id}")
                 return
 
             # Фильтр: сообщение из 1 слова — невалидная вакансия
@@ -726,12 +728,14 @@ class VacancyPipeline:
 
             # Дубликат
             if self.db.is_duplicate(text):
-                log.info("🔁 Дубликат"); return
+                log.info("🔁 Дубликат"); self.db.add_log("INFO", "🔁 Дубликат (уже была такая вакансия)"); return
 
             # Чёрный список
             found_bl = [w for w in self.db.get_blacklist("common") if w in text_low]
             if found_bl:
-                log.info(f"⛔ ЧС: {found_bl}"); return
+                log.info(f"⛔ ЧС: {found_bl}")
+                self.db.add_log("INFO", f"⛔ Отсеяно чёрным списком: {found_bl}")
+                return
 
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
@@ -1473,10 +1477,10 @@ async def admin_reject_pay_cb(call: CallbackQuery):
             try:
                 await call.bot.send_message(
                     cl["tg_id"],
-                    f"❌ Платёж <code>{ticket}</code> отклонён.\n"
-                    f"Если вы уже оплатили — обратитесь в поддержку.",
+                    f"❌ Платёж <code>{ticket}</code> не подтверждён.\n\n"
+                    f"Проверьте перевод и отправьте чек аккаунт-менеджеру: @{SUPPORT_USERNAME}",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=mkb([[("💬 Поддержка", f"https://t.me/{SUPPORT_USERNAME}")]]),
+                    reply_markup=mkb([[("💬 Аккаунт-менеджер", f"https://t.me/{SUPPORT_USERNAME}")]]),
                 )
             except Exception:
                 pass
@@ -2051,20 +2055,16 @@ async def client_start(msg: Message):
         until = _db.extend_subscription(cl["id"], FREE_DAYS)
         cl    = _db.get_client_by_tg(uid)
 
-        # Реферал
+        # Реферал — только запоминаем, кто кого пригласил.
+        # Дни начисляются позже, только когда приглашённый купит любой тариф (см. admin_confirm_pay_cb).
         args = msg.text.split() if msg.text else []
         if len(args) > 1 and args[1].startswith("ref"):
             try:
                 ref_tg_id = int(args[1][3:])
                 ref_cl    = _db.get_client_by_tg(ref_tg_id)
                 if ref_cl and ref_cl["id"] != cl["id"]:
-                    _db.extend_subscription(ref_cl["id"], REF_DAYS)
                     _db._c().execute("UPDATE clients SET ref_by=? WHERE id=?", (ref_cl["id"], cl["id"]))
                     _db._c().commit()
-                    await msg.bot.send_message(ref_tg_id,
-                        f"🎉 По вашей ссылке зарегистрировался новый пользователь!\n"
-                        f"Вам начислено <b>+{REF_DAYS} дня</b> к подписке.",
-                        parse_mode=ParseMode.HTML)
             except Exception as e: log.warning(f"Реферал: {e}")
 
     await msg.answer(_client_main_text(cl, is_new), reply_markup=kb_client_main())
@@ -2099,8 +2099,8 @@ async def client_referral_cb(call: CallbackQuery):
         f"Реферальная программа <b>phase.parser</b>\n\n"
         f"🔗 <b>Ваша ссылка:</b>\n"
         f"<code>{ref_link}</code>\n\n"
-        f"<b>+{REF_DAYS} дня</b> вам и <b>+{REF_DAYS} дней</b> ему\n"
-        f"Дни засчитываются при покупке любого тарифа рефералом\n\n"
+        f"<b>Вам +{REF_BONUS_DAYS} дней</b>, другу <b>+{REF_DAYS} дней</b>\n"
+        f"Дни начисляются, когда приглашённый оплатит первый любой тариф\n\n"
         f"Приглашено: <b>{invited}</b>"
     )
     markup = mkb([
@@ -2223,7 +2223,10 @@ async def client_paid_cb(call: CallbackQuery):
             f"Клиент: @{call.from_user.username or call.from_user.id}\n"
             f"Тариф: {p['tariff']} | Сумма: <b>{p['amount']}₽</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=mkb([[("✅ Подтвердить", f"admin_confirm_pay:{ticket}")]]))
+            reply_markup=mkb([
+                [("✅ Подтвердить", f"admin_confirm_pay:{ticket}"),
+                 ("❌ Отклонить",   f"admin_reject_pay:{ticket}")],
+            ]))
     except Exception as e: log.error(f"Уведомление об оплате: {e}")
 
 # ── Подтверждение оплаты администратором ───────────────────────
@@ -2247,12 +2250,36 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
         log.info(f"Платёж: status={p['status']} days={p['days']} client={cl['tg_id']}")
         already = p.get("status") == "confirmed"
         if not already:
+            was_first_payment = not bool(cl.get("first_payment"))
             _db.confirm_payment(ticket)
             until = _db.extend_subscription(cl["id"], p["days"])
             _db._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (cl["id"],))
             _db._c().commit()
             _db.stat_inc("subs_bought")
             log.info(f"Оплата OK: {ticket} клиент={cl['tg_id']} до={until}")
+
+            # ── Реферальные бонусы: только за ПЕРВУЮ покупку приглашённого ──
+            if was_first_payment and cl.get("ref_by"):
+                try:
+                    ref_cl = _db.get_client_by_id(cl["ref_by"])
+                    if ref_cl:
+                        _db.extend_subscription(cl["id"], REF_DAYS)          # купившему рефералу
+                        ref_until = _db.extend_subscription(ref_cl["id"], REF_BONUS_DAYS)  # пригласившему
+                        until = _db.get_client_by_id(cl["id"])["sub_until"]  # обновили выше — берём актуальную дату
+                        try:
+                            await call.bot.send_message(cl["tg_id"],
+                                f"🎁 Вам начислено <b>+{REF_DAYS} дн.</b> к подписке — бонус за переход по реферальной ссылке!",
+                                parse_mode=ParseMode.HTML)
+                        except Exception as e: log.warning(f"Уведомление рефералу: {e}")
+                        try:
+                            await call.bot.send_message(ref_cl["tg_id"],
+                                f"🎉 Ваш реферал купил подписку!\n"
+                                f"Вам начислено <b>+{REF_BONUS_DAYS} дн.</b> к подписке (до {fmt_date(ref_until.isoformat() if hasattr(ref_until,'isoformat') else str(ref_until))}).",
+                                parse_mode=ParseMode.HTML)
+                        except Exception as e: log.warning(f"Уведомление пригласившему: {e}")
+                except Exception as e:
+                    log.error(f"Реферальный бонус: {e}")
+                    await notify_admin_error(call.bot, "Реферальный бонус", e)
         else:
             raw   = cl.get("sub_until") or datetime.now().isoformat()
             until = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
