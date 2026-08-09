@@ -18,16 +18,22 @@ from aiogram.filters import Command, Filter
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, Message, BotCommand, BotCommandScopeChat,
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import (
     PhoneCodeExpiredError, PhoneCodeInvalidError,
     PasswordHashInvalidError, SessionPasswordNeededError,
+    UserAlreadyParticipantError, InviteHashExpiredError, InviteHashInvalidError,
+    ChannelsTooMuchError, FloodWaitError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.types import (
+    MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
+)
 
 # ── Конфигурация ──────────────────────────────────────────────
 load_dotenv()
@@ -63,6 +69,16 @@ def setup_logging() -> logging.Logger:
     fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); logger.addHandler(fh)
     return logger
 log = setup_logging()
+
+async def notify_admin_error(bot: Optional["Bot"], context: str, err: Exception) -> None:
+    """Дублирует критическую ошибку в админ-бот (в дополнение к логам в файл)."""
+    if bot is None:
+        return
+    try:
+        text = f"🐞 <b>Ошибка: {context}</b>\n\n<code>{str(err)[:800]}</code>"
+        await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML)
+    except Exception as notify_err:
+        log.error(f"notify_admin_error не смог отправить сообщение: {notify_err}")
 
 # ── Dataclasses ───────────────────────────────────────────────
 @dataclass
@@ -234,39 +250,6 @@ class Database:
         self._c().execute("DELETE FROM blacklist WHERE word=? AND type=?", (word, btype))
         self._c().commit()
 
-    # ── Шаблоны ───────────────────────────────────────────────
-    def get_templates(self, active_only: bool = False) -> list[dict]:
-        q = "SELECT * FROM templates" + (" WHERE active=1" if active_only else "") + " ORDER BY id"
-        return [dict(r) for r in self._c().execute(q).fetchall()]
-
-    def get_template(self, tid: int) -> Optional[dict]:
-        row = self._c().execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
-        return dict(row) if row else None
-
-    def get_active_template(self) -> Optional[dict]:
-        row = self._c().execute("SELECT * FROM templates WHERE active=1 ORDER BY id LIMIT 1").fetchone()
-        return dict(row) if row else None
-
-    def create_empty_template(self) -> int:
-        name = f"Шаблон #{self._c().execute('SELECT COUNT(*)+1 FROM templates').fetchone()[0]}"
-        cur = self._c().execute(
-            "INSERT INTO templates(name,variant1,variant2,variant3) VALUES(?,?,?,?)", (name,"","",""))
-        self._c().commit(); return cur.lastrowid or 0
-
-    def update_template_variant(self, tid: int, vnum: int, text: str) -> None:
-        self._c().execute(f"UPDATE templates SET variant{vnum}=? WHERE id=?", (text, tid))
-        self._c().commit()
-
-    def toggle_template(self, tid: int) -> None:
-        self._c().execute("UPDATE templates SET active=1-active WHERE id=?", (tid,)); self._c().commit()
-
-    def delete_template(self, tid: int) -> None:
-        self._c().execute("DELETE FROM templates WHERE id=?", (tid,)); self._c().commit()
-
-    def set_active_template(self, tid: int) -> None:
-        self._c().execute("UPDATE templates SET active=0")
-        self._c().execute("UPDATE templates SET active=1 WHERE id=?", (tid,)); self._c().commit()
-
     # ── Клиенты ───────────────────────────────────────────────
     def get_or_create_client(self, tg_id: int, username: Optional[str]) -> dict:
         row = self._c().execute("SELECT * FROM clients WHERE tg_id=?", (tg_id,)).fetchone()
@@ -374,33 +357,11 @@ class Database:
         row = self._c().execute("SELECT * FROM vacancies WHERE id=?", (vid,)).fetchone()
         return dict(row) if row else None
 
-    # ── Отклики ───────────────────────────────────────────────
-    def save_reply(self, vacancy_id: int, template_id: int, variant_num: int,
-                   text_sent: str, tg_msg_id: Optional[int] = None) -> int:
-        cur = self._c().execute(
-            "INSERT INTO replies(vacancy_id,template_id,variant_num,text_sent,tg_message_id) VALUES(?,?,?,?,?)",
-            (vacancy_id, template_id, variant_num, text_sent, tg_msg_id))
-        self._c().commit(); return cur.lastrowid or 0
-
-    def mark_reply_deleted(self, reply_id: int) -> None:
-        self._c().execute("UPDATE replies SET deleted=1 WHERE id=?", (reply_id,)); self._c().commit()
-
-    def get_reply(self, reply_id: int) -> Optional[dict]:
-        row = self._c().execute(
-            "SELECT r.*,v.message_link,v.source_title,v.ds_contact,v.ds_contact_id,"
-            "v.text as vacancy_text,v.author_id,v.author_username "
-            "FROM replies r JOIN vacancies v ON r.vacancy_id=v.id WHERE r.id=?",
-            (reply_id,)).fetchone()
-        return dict(row) if row else None
-
-    def get_replies(self, limit: int = 8, offset: int = 0) -> list[dict]:
-        return [dict(r) for r in self._c().execute(
-            "SELECT r.*,v.message_link,v.source_title,v.ds_contact,v.text as vacancy_text "
-            "FROM replies r JOIN vacancies v ON r.vacancy_id=v.id "
-            "ORDER BY r.id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()]
-
-    def count_replies(self) -> int:
-        return self._c().execute("SELECT COUNT(*) FROM replies").fetchone()[0]
+    def get_recent_vacancies(self, limit: int = 8, offset: int = 0, suitable_only: bool = True) -> list[dict]:
+        q = "SELECT * FROM vacancies"
+        if suitable_only: q += " WHERE suitable=1"
+        q += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        return [dict(r) for r in self._c().execute(q, (limit, offset)).fetchall()]
 
     def save_delivery(self, vacancy_id: int, client_id: int, msg_id: Optional[int],
                       skipped: bool = False, reason: str = "") -> None:
@@ -582,10 +543,14 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         return DeepSeekResult(suitable=suitable, reason=reason, contact=contact)
     except json.JSONDecodeError as e:
         log.error(f"DeepSeek JSON ошибка: {e}")
-        db.stat_inc("ai_errors"); return _DS_FAIL
+        db.stat_inc("ai_errors")
+        if _pipeline: await notify_admin_error(_pipeline.bot, "DeepSeek JSON", e)
+        return _DS_FAIL
     except Exception as e:
         log.error(f"DeepSeek ошибка: {e}", exc_info=True)
-        db.stat_inc("ai_errors"); return _DS_FAIL
+        db.stat_inc("ai_errors")
+        if _pipeline: await notify_admin_error(_pipeline.bot, "DeepSeek", e)
+        return _DS_FAIL
 
 async def check_deepseek_status() -> str:
     """
@@ -688,7 +653,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
             pass
     client_label = f"👥 Клиент 🔴" if pending > 0 else "👥 Клиент"
     return mkb([
-        [("♨️ Источники","admin_sources"), ("🗣 Отклики","admin_replies")],
+        [("♨️ Источники","admin_sources"), ("📋 Вакансии","admin_replies")],
         [("📈 Статистика","admin_stats"),   ("🖥️ Мониторинг","admin_monitoring")],
         [(client_label,"admin_clients"),   ("📜 Логи","admin_logs")],
         [("⚙️ Настройки","admin_settings")],
@@ -719,7 +684,9 @@ class VacancyPipeline:
                 event = await self.queue.get()
                 await self._process(event)
                 self.queue.task_done()
-            except Exception as e: log.error(f"Воркер: {e}", exc_info=True)
+            except Exception as e:
+                log.error(f"Воркер: {e}", exc_info=True)
+                await notify_admin_error(self.bot, "run_worker", e)
 
     async def _process(self, event) -> None:
         try:
@@ -790,37 +757,12 @@ class VacancyPipeline:
             await self._handle_suitable(vacancy, ds, vid)
         except Exception as e:
             log.error(f"_process: {e}", exc_info=True)
+            await notify_admin_error(self.bot, "_process", e)
 
     async def _handle_suitable(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
-        tmpl = self.db.get_active_template()
-        if not tmpl:
-            await self._notify_admin_no_template(vacancy)
-            await self._broadcast(vacancy, ds, vid); return
-
-        variants = [v for v in [tmpl.get("variant1",""), tmpl.get("variant2",""), tmpl.get("variant3","")] if v.strip()]
-        if not variants:
-            await self._notify_admin_no_template(vacancy)
-            await self._broadcast(vacancy, ds, vid); return
-
-        variant_num = random.randint(1, len(variants))
-        reply_text  = variants[variant_num - 1]
-
-        delay = random.randint(5, 15)
-        log.info(f"⏳ {delay}с до отклика"); await asyncio.sleep(delay)
-
-        sent_msg_id = None
-        if ds.contact and ds.contact.startswith("@"):
-            try:
-                sent = await self.userbot.send_message(ds.contact, reply_text)
-                sent_msg_id = sent.id
-                log.info(f"📤 Отклик → {ds.contact}")
-                self.db.add_log("INFO", f"Отклик: {ds.contact}")
-                self.db.stat_inc("replies_sent")
-            except Exception as e:
-                log.error(f"Отклик: {e}"); self.db.add_log("ERROR", f"Отклик: {e}")
-
-        reply_id = self.db.save_reply(vid, tmpl["id"], variant_num, reply_text, sent_msg_id)
-        await self._notify_admin_reply(vacancy, ds, tmpl, variant_num, reply_id)
+        """Вакансия прошла проверку: авто-отклик больше не отправляется —
+        только уведомление админу и рассылка клиентам."""
+        await self._notify_admin_new_vacancy(vacancy, ds, vid)
         await self._broadcast(vacancy, ds, vid)
 
     async def _broadcast(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
@@ -861,33 +803,31 @@ class VacancyPipeline:
             except Exception as e:
                 log.error(f"Рассылка {cl.get('tg_id')}: {e}")
 
-    async def _notify_admin_reply(self, vacancy: Vacancy, ds: DeepSeekResult,
-                                   tmpl: dict, variant_num: int, reply_id: int) -> None:
+    async def _notify_admin_new_vacancy(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
+        """Уведомляет админа о новой подходящей вакансии (без авто-отклика)."""
         if self.db.get_setting("notify_reply","1") != "1":
             return
-        num   = f"#{tmpl['id']}.{variant_num}"
         short = vacancy.text[:600]
-        contact = ds.contact
+        contact = ds.contact or ""
         if contact.startswith("@"):
             client_link = f"https://t.me/{contact.lstrip('@')}"
         else:
             client_link = f"tg://user?id={vacancy.author_id}"
-        safe_uname = vacancy.author_username or ""
         text = (
-            f"✅ <b>Новый отклик! #{num}</b>\n\n"
+            f"✅ <b>Новая вакансия</b>\n\n"
             f"<blockquote expandable>{short}</blockquote>\n\n"
-            f"Отклик: <code>{num}</code>\n"
             f"<a href='{vacancy.message_link}'>Сообщение</a> | "
-            f"<a href='{client_link}'>Клиент</a>"
+            f"<a href='{client_link}'>Автор</a>"
         )
         markup = mkb([
-            [("⚠️ Ошибка", f"admin_error:{reply_id}"),
-             ("🗑 Удалить", f"admin_del_reply:{reply_id}")],
+            [("⚠️ Ошибка", f"admin_error_vac:{vid}")],
             [("🚫 Заблокировать отправителя", f"admin_block_sender:{vacancy.author_id}:{vacancy.author_username or ''}")],
         ])
         try:
             await self.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except Exception as e: log.error(f"notify_reply: {e}")
+        except Exception as e:
+            log.error(f"notify_new_vacancy: {e}")
+            await notify_admin_error(self.bot, "notify_new_vacancy", e)
 
     async def _notify_admin_rejected(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
         contact = ds.contact
@@ -906,14 +846,9 @@ class VacancyPipeline:
         ])
         try:
             await self.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except Exception as e: log.error(f"notify_rejected: {e}")
-
-    async def _notify_admin_no_template(self, vacancy: Vacancy) -> None:
-        try:
-            await self.bot.send_message(ADMIN_ID,
-                f"⚠️ <b>Нет активного шаблона!</b>\n<a href='{vacancy.message_link}'>К вакансии</a>",
-                parse_mode=ParseMode.HTML)
-        except Exception as e: log.error(f"notify_no_tmpl: {e}")
+        except Exception as e:
+            log.error(f"notify_rejected: {e}")
+            await notify_admin_error(self.bot, "notify_rejected", e)
 # ═══════════════════════════════════════════════════════════════
 # ГЛОБАЛЬНОЕ СОСТОЯНИЕ
 # ═══════════════════════════════════════════════════════════════
@@ -924,7 +859,6 @@ _admin_pending:  dict[int, str] = {}
 _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
-_tmpl_wizard: dict[int, dict] = {}  # uid -> {tid, step}
 
 admin_router  = Router()
 client_router = Router()
@@ -996,10 +930,23 @@ async def admin_sources_cb(call: CallbackQuery):
     srcs  = _db.get_sources(active_only=False)
     text  = f"<b>♨️ Источники</b>\n\nВсего источников: <b>{len(srcs)}</b>"
     markup = mkb([
-        [("➕ Добавить","admin_src_add"), ("📋 Все источники","admin_src_list")],
+        [("➕ Добавить из чатов","admin_src_add"), ("🔗 По ссылке","admin_src_add_link")],
+        [("📋 Все источники","admin_src_list")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data == "admin_src_add_link")
+async def admin_src_add_link_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "add_source_links"
+    await safe_edit(call,
+        "🔗 <b>Добавление по ссылке</b>\n\n"
+        "Пришлите ссылки на чаты/каналы, каждую с новой строки.\n\n"
+        "Поддерживаются:\n"
+        "• Публичные: <code>https://t.me/username</code> или <code>@username</code>\n"
+        "• Приватные (по инвайту): <code>https://t.me/+AbCdEfGh</code>\n\n"
+        "<i>Для приватных групп юзербот автоматически вступит по ссылке.</i>",
+        kb_back("admin_sources"))
 
 @admin_router.callback_query(F.data == "admin_src_add")
 async def admin_src_add_cb(call: CallbackQuery):
@@ -1187,95 +1134,47 @@ async def admin_src_del_cb(call: CallbackQuery):
     await call.answer("Удалено"); await admin_src_manage_cb(call)
 
 # ═══════════════════════════════════════════════════════════════
-# ADMIN — ОТКЛИКИ / ШАБЛОНЫ
+# ADMIN — ВАКАНСИИ (авто-отклик убран, только просмотр найденного)
 # ═══════════════════════════════════════════════════════════════
 @admin_router.callback_query(F.data == "admin_replies")
-async def admin_replies_cb(call: CallbackQuery):
-    templates = _db.get_templates()
-    active    = _db.get_active_template()
-    act_id    = active["id"] if active else None
-    rows      = []
-    for t in templates:
-        star = "★ " if t["id"] == act_id else ""
-        rows.append([(f"{star}#{t['id']} {t['name']}", f"admin_tmpl:{t['id']}")])
-    rows.append([("➕ Добавить","admin_tmpl_add_start")])
+async def admin_vacancies_cb(call: CallbackQuery):
+    await _show_vacancies_page(call, 0)
+
+@admin_router.callback_query(F.data.startswith("admin_vac_page:"))
+async def admin_vac_page_cb(call: CallbackQuery):
+    await _show_vacancies_page(call, int(call.data.split(":")[1]))
+
+async def _show_vacancies_page(call: CallbackQuery, page: int) -> None:
+    limit  = 8
+    items  = _db.get_recent_vacancies(limit=limit, offset=page * limit, suitable_only=True)
+    rows   = []
+    for v in items:
+        title = (v["text"] or "")[:40].replace("\n", " ")
+        rows.append([(f"#{v['id']} {title}", f"admin_vac_view:{v['id']}")])
+    nav = []
+    if page > 0: nav.append(("◀️", f"admin_vac_page:{page-1}"))
+    if len(items) == limit: nav.append(("▶️", f"admin_vac_page:{page+1}"))
+    if nav: rows.append(nav)
     rows.append([("◀️ Главное меню","admin_main")])
-    act_name = f"#{active['id']} {active['name']}" if active else "нет"
-    await safe_edit(call,
-        f"<b>🗣 Отклики</b>\n\nАктивный шаблон: <b>{act_name}</b>",
-        mkb(rows))
+    text = "<b>📋 Найденные вакансии</b>" if items else "<b>📋 Найденные вакансии</b>\n\n<i>Пока пусто</i>"
+    await safe_edit(call, text, mkb(rows))
 
-@admin_router.callback_query(F.data.startswith("admin_tmpl:"))
-async def admin_tmpl_cb(call: CallbackQuery):
-    tid = int(call.data.split(":")[1]); t = _db.get_template(tid)
-    if not t: await call.answer("Не найден"); return
-    await _show_tmpl_variant(call, t, 1)
-
-async def _show_tmpl_variant(call: CallbackQuery, t: dict, vnum: int) -> None:
-    tid = t["id"]
-    text_v = t.get(f"variant{vnum}","") or "<i>пусто</i>"
-    text = f"<b>#{tid} {t['name']}</b>\n\n<b>Вариант {vnum}</b>\n{text_v}"
-    # Кнопки для переключения вариантов
-    var_row = []
-    for v in [1,2,3]:
-        lbl = f"[{v}]" if v == vnum else str(v)
-        var_row.append((lbl, f"admin_tmpl_var:{tid}:{v}"))
+@admin_router.callback_query(F.data.startswith("admin_vac_view:"))
+async def admin_vac_view_cb(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    v   = _db.get_vacancy(vid)
+    if not v: await call.answer("Не найдена"); return
+    text = (
+        f"<blockquote expandable>{v['text'][:900]}</blockquote>\n\n"
+        f"Контакт: <code>{v.get('ds_contact') or '—'}</code>\n"
+        f"<a href='{v.get('message_link') or '#'}'>Сообщение</a>"
+    )
     markup = mkb([
-        var_row,
-        [("👁 Предпросмотр",f"admin_tmpl_preview:{tid}:{vnum}"),
-         ("✏️ Изменить",    f"admin_tmpl_edit_menu:{tid}")],
-        [("🗑 Удалить шаблон",f"admin_tmpl_delete:{tid}")],
+        [("⚠️ Ошибка", f"admin_error_vac:{vid}")],
+        [("🚫 Заблокировать отправителя", f"admin_block_sender:{v.get('author_id',0)}:{v.get('author_username') or ''}")],
         [("◀️ Назад","admin_replies")],
     ])
     await safe_edit(call, text, markup)
-
-@admin_router.callback_query(F.data.startswith("admin_tmpl_var:"))
-async def admin_tmpl_var_cb(call: CallbackQuery):
-    _, tid, vnum = call.data.split(":"); t = _db.get_template(int(tid))
-    if not t: return
-    await _show_tmpl_variant(call, t, int(vnum))
-
-@admin_router.callback_query(F.data.startswith("admin_tmpl_preview:"))
-async def admin_tmpl_preview_cb(call: CallbackQuery):
-    _, tid, vnum = call.data.split(":"); t = _db.get_template(int(tid))
-    if not t: return
-    text_v = t.get(f"variant{vnum}","") or "Вариант пуст"
-    await call.message.answer(text_v, parse_mode=ParseMode.HTML,
-                              reply_markup=mkb([[("◀️ Назад","admin_replies")]]))
-    await call.answer()
-
-@admin_router.callback_query(F.data.startswith("admin_tmpl_edit_menu:"))
-async def admin_tmpl_edit_menu_cb(call: CallbackQuery):
-    tid = call.data.split(":")[1]
-    markup = mkb([
-        [("1","admin_tmpl_edit:"+tid+":1"),
-         ("2","admin_tmpl_edit:"+tid+":2"),
-         ("3","admin_tmpl_edit:"+tid+":3")],
-        [("◀️ Назад",f"admin_tmpl:{tid}")],
-    ])
-    await safe_edit(call, "Какой вариант вы хотите изменить?", markup)
-
-@admin_router.callback_query(F.data.startswith("admin_tmpl_edit:"))
-async def admin_tmpl_edit_cb(call: CallbackQuery):
-    _, tid, vnum = call.data.split(":")
-    _admin_pending[call.from_user.id] = f"edit_variant:{tid}:{vnum}"
-    await safe_edit(call, f"✏️ Пришлите текст отклика для <b>Варианта {vnum}</b>:",
-                    kb_back(f"admin_tmpl:{tid}"))
-
-@admin_router.callback_query(F.data.startswith("admin_tmpl_delete:"))
-async def admin_tmpl_delete_cb(call: CallbackQuery):
-    tid = int(call.data.split(":")[1]); _db.delete_template(tid)
-    await call.answer(f"Шаблон #{tid} удалён"); await admin_replies_cb(call)
-
-# Wizard добавления шаблона (вариант 1 → 2 → 3)
-@admin_router.callback_query(F.data == "admin_tmpl_add_start")
-async def admin_tmpl_add_start_cb(call: CallbackQuery):
-    tid = _db.create_empty_template()
-    _tmpl_wizard[call.from_user.id] = {"tid": tid, "step": 1}
-    _admin_pending[call.from_user.id] = "tmpl_wizard"
-    await safe_edit(call,
-        f"<b>Добавьте отклик для Шаблона #{tid}</b>\n\n<b>Вариант 1</b>\n\nПришлите текст:",
-        mkb([[("◀️ Назад","admin_replies")]]))
 
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — СТАТИСТИКА
@@ -1295,7 +1194,6 @@ async def _show_stats(call: CallbackQuery, period: str) -> None:
         f"<b>📈 Статистика — {labels.get(period,'?')}</b>\n\n"
         f"Найдено вакансий: <b>{s['vacancies_found']}</b>\n"
         f"Не прошло проверку: <b>{s['vacancies_failed']}</b>\n"
-        f"Написано откликов: <b>{s['replies_sent']}</b>\n"
         f"Ошибки ИИ: <b>{s['ai_errors']}</b>\n"
         f"Куплено подписок: <b>{s['subs_bought']}</b>\n\n"
         f"👥 Клиентов: <b>{s['clients']}</b>\n"
@@ -1798,16 +1696,6 @@ async def admin_block_confirm_cb(call: CallbackQuery):
         f"✅ <b>Заблокирован</b>\n\n{display}",
         kb_back("admin_main"))
 
-@admin_router.callback_query(F.data.startswith("admin_error:"))
-async def admin_error_reply_cb(call: CallbackQuery):
-    reply_id = call.data.split(":")[1]
-    markup   = mkb([
-        [("🔑 Ключевые слова",f"admin_err_kw:{reply_id}"),
-         ("🚫 Чёрный список",  f"admin_err_bl:{reply_id}")],
-        [("🤖 ИИ",             f"admin_err_ds:{reply_id}")],
-    ])
-    await safe_edit(call, "⚠️ <b>Выберите категорию ошибки:</b>", markup)
-
 @admin_router.callback_query(F.data.startswith("admin_error_vac:"))
 async def admin_error_vac_cb(call: CallbackQuery):
     vid    = call.data.split(":")[1]
@@ -1832,17 +1720,6 @@ async def admin_err_bl_cb(call: CallbackQuery):
 async def admin_err_ds_cb(call: CallbackQuery):
     _admin_pending[call.from_user.id] = "add_ds_rule"
     await safe_edit(call, "🤖 Введите правило для DeepSeek:", kb_back("admin_deepseek"))
-
-@admin_router.callback_query(F.data.startswith("admin_del_reply:"))
-async def admin_del_reply_cb(call: CallbackQuery):
-    reply_id = int(call.data.split(":")[1]); reply = _db.get_reply(reply_id)
-    if not reply: await call.answer("Не найден"); return
-    num = f"{reply['template_id']}.{reply['variant_num']}"
-    if reply.get("tg_message_id") and reply.get("ds_contact"):
-        try: await _userbot.delete_messages(reply["ds_contact"], [reply["tg_message_id"]])
-        except Exception as e: log.warning(f"Удаление: {e}")
-    _db.mark_reply_deleted(reply_id)
-    await safe_edit(call, f"🗑 <b>Удалено! #<code>{num}</code></b>", None)
 
 @admin_router.callback_query(F.data.startswith("admin_manual_approve:"))
 async def admin_manual_approve_cb(call: CallbackQuery):
@@ -1922,13 +1799,36 @@ async def admin_text_handler(msg: Message):
     if action == "add_source_links":
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         added = []; not_joined = []
-        await safe_answer(msg, "⏳ <b>Проверка подписки...</b>")
-        for raw in lines:
-            raw = raw.replace("https://t.me/","").lstrip("@").strip()
+        await safe_answer(msg, "⏳ <b>Проверка/подключение...</b>")
+        for raw_orig in lines:
+            raw = raw_orig.replace("https://t.me/","").replace("http://t.me/","").strip()
             try:
-                entity  = await _userbot.get_entity(raw)
+                # ── Приватная группа по инвайт-ссылке (+hash или joinchat/hash) ──
+                if raw.startswith("+") or raw.startswith("joinchat/"):
+                    invite_hash = raw[1:] if raw.startswith("+") else raw.split("joinchat/",1)[1]
+                    invite_hash = invite_hash.strip("/")
+                    try:
+                        updates = await _userbot(ImportChatInviteRequest(invite_hash))
+                        entity  = updates.chats[0]
+                    except UserAlreadyParticipantError:
+                        check = await _userbot(CheckChatInviteRequest(invite_hash))
+                        if isinstance(check, ChatInviteAlready):
+                            entity = check.chat
+                        else:
+                            raise
+                    chat_id = entity.id
+                    title   = getattr(entity, "title", raw_orig)
+                    uname   = getattr(entity, "username", None)
+                    link    = f"https://t.me/{uname}" if uname else raw_orig
+                    _db.add_source(chat_id, title, uname, link)
+                    added.append(title)
+                    continue
+
+                # ── Публичный чат/канал по username ──
+                uname_raw = raw.lstrip("@").strip()
+                entity  = await _userbot.get_entity(uname_raw)
                 chat_id = entity.id
-                title   = getattr(entity,"title",raw)
+                title   = getattr(entity,"title",uname_raw)
                 uname   = getattr(entity,"username",None)
                 link    = f"https://t.me/{uname}" if uname else None
                 # Проверяем подписку
@@ -1937,10 +1837,19 @@ async def admin_text_handler(msg: Message):
                     _db.add_source(chat_id, title, uname, link)
                     added.append(title)
                 except Exception:
-                    not_joined.append((raw, link or f"https://t.me/{raw}"))
+                    not_joined.append((title, link or f"https://t.me/{uname_raw}"))
+            except (InviteHashExpiredError, InviteHashInvalidError) as e:
+                not_joined.append((raw_orig, raw_orig))
+                log.warning(f"Инвайт-ссылка недействительна {raw_orig}: {e}")
+            except ChannelsTooMuchError:
+                not_joined.append((raw_orig, raw_orig))
+                log.error("UserBot состоит в максимальном числе групп/каналов — Telegram не даёт вступить в новые")
+            except FloodWaitError as e:
+                not_joined.append((raw_orig, raw_orig))
+                log.warning(f"FloodWait при добавлении {raw_orig}: подождите {e.seconds}с")
             except Exception as e:
-                not_joined.append((raw, raw))
-                log.warning(f"get_entity {raw}: {e}")
+                not_joined.append((raw_orig, raw_orig))
+                log.warning(f"Добавление источника {raw_orig}: {e}")
 
         if not_joined:
             links_text = "\n".join(f"<a href='{lnk}'>{nm}</a>" for nm,lnk in not_joined)
@@ -1957,33 +1866,6 @@ async def admin_text_handler(msg: Message):
             await safe_answer(msg,
                 f"✔ <b>{len(added)} источников добавлено</b>",
                 kb_back("admin_sources"))
-        return
-
-    # ── Шаблоны: wizard ───────────────────────────────────────
-    if action == "tmpl_wizard":
-        wiz = _tmpl_wizard.get(uid)
-        if not wiz:
-            await safe_answer(msg, "❌ Сессия истекла", kb_back("admin_replies")); return
-        tid  = wiz["tid"]; step = wiz["step"]
-        _db.update_template_variant(tid, step, text)
-        if step < 3:
-            wiz["step"] = step + 1
-            _admin_pending[uid] = "tmpl_wizard"
-            await safe_answer(msg,
-                f"<b>Добавьте отклик для Шаблона #{tid}</b>\n\n<b>Вариант {step+1}</b>\n\nПришлите текст:",
-                mkb([[("◀️ Назад",f"admin_tmpl:{tid}")]]))
-        else:
-            _tmpl_wizard.pop(uid, None)
-            await safe_answer(msg,
-                f"✅ Шаблон <b>#{tid}</b> добавлен!",
-                kb_back("admin_replies"))
-        return
-
-    # ── Редактирование варианта шаблона ───────────────────────
-    if action.startswith("edit_variant:"):
-        _, tid, vnum = action.split(":")
-        _db.update_template_variant(int(tid), int(vnum), text)
-        await safe_answer(msg, f"✅ Вариант {vnum} обновлён", kb_back(f"admin_tmpl:{tid}"))
         return
 
     # ── Ключевые слова ────────────────────────────────────────
@@ -2229,24 +2111,44 @@ async def client_referral_cb(call: CallbackQuery):
 
 @client_router.callback_query(F.data.startswith("client_invite_friend:"))
 async def client_invite_friend_cb(call: CallbackQuery):
-    ref_uid  = call.data.split(":")[1]
-    bot_me   = await call.bot.get_me()
-    ref_link = f"https://t.me/{bot_me.username}?start=ref{ref_uid}"
-    share_text = (
-        f"Привет. Получай клиентов с помощью phase.parser\n\n"
-        f"{ref_link}\n\n"
-        f"20+ вакансий для монтажа в день"
-    )
-    # Открываем меню пересылки через share URL
-    share_url = f"https://t.me/share/url?url={ref_link}&text=Привет.+Получай+клиентов+с+помощью+phase.parser"
-    markup = mkb([
-        [("📤 Поделиться ссылкой", share_url)],
-        [("◀️ Назад", "client_referral")],
-    ])
+    ref_uid = call.data.split(":")[1]
+    # Кнопка switch_inline_query открывает системный выбор чата (как «Переслать»),
+    # а после выбора чата бот вставит готовую карточку через инлайн-режим —
+    # ровно то же поведение, что и у кнопки «Пригласить друзей» в других ботах.
+    share_btn = InlineKeyboardButton(text="📤 Поделиться карточкой",
+                                     switch_inline_query=f"ref{ref_uid}")
+    back_btn  = InlineKeyboardButton(text="◀️ Назад", callback_data="client_referral")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[share_btn], [back_btn]])
+    ref_link = f"https://t.me/{(await call.bot.get_me()).username}?start=ref{ref_uid}"
     await safe_edit(call,
-        f"Отправьте другу эту ссылку:\n\n<code>{ref_link}</code>\n\n"
-        f"<i>Или нажмите кнопку ниже чтобы открыть меню пересылки</i>",
+        f"Нажмите кнопку ниже, выберите чат или друга — карточка с приглашением "
+        f"отправится автоматически.\n\n"
+        f"Или перешлите ссылку вручную:\n<code>{ref_link}</code>",
         markup)
+
+# ── Инлайн-режим: карточка приглашения (нужно включить /setinline у @BotFather) ──
+@client_router.inline_query(F.query.startswith("ref"))
+async def client_invite_inline_query(iq: InlineQuery):
+    ref_uid = iq.query[len("ref"):].strip()
+    if not ref_uid.isdigit():
+        await iq.answer([], cache_time=1); return
+    bot_me   = await iq.bot.get_me()
+    ref_link = f"https://t.me/{bot_me.username}?start=ref{ref_uid}"
+    text = (
+        f"Привет. Получай клиентов с помощью <b>phase.parser</b>\n\n"
+        f"{ref_link}\n\n"
+        f"20+ вакансий для монтажа в день. Работает быстро и стабильно."
+    )
+    result = InlineQueryResultArticle(
+        id=f"invite_{ref_uid}",
+        title="Пригласить в phase.parser",
+        description="Отправить карточку с приглашением",
+        thumbnail_url="https://telegram.org/img/t_logo.png",
+        input_message_content=InputTextMessageContent(
+            message_text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=False),
+        reply_markup=mkb([[("🤝 Подключиться", ref_link)]]),
+    )
+    await iq.answer([result], cache_time=30, is_personal=True)
 
 # ── Тарифы ─────────────────────────────────────────────────────
 async def _tariffs_text(cl: dict) -> str:
@@ -2463,17 +2365,28 @@ async def show_contact_cb(call: CallbackQuery):
 
     vacancy = _db.get_vacancy(vid)
     if not vacancy: await call.answer("Не найдена"); return
-    contact    = vacancy.get("ds_contact","")
-    old_text   = call.message.html_text or call.message.text or ""
-    new_text   = old_text.replace("—", contact) if contact else old_text
+    contact      = vacancy.get("ds_contact","")
+    message_link = vacancy.get("message_link","")
+    old_text     = call.message.html_text or call.message.text or ""
+    new_text     = old_text.replace("—", contact) if contact else old_text
 
     if contact.startswith("@"):
-        uname    = contact.lstrip("@")
+        uname       = contact.lstrip("@")
         client_link = f"https://t.me/{uname}"
         new_text += f"\n\n<a href='{client_link}'>💬 Написать клиенту</a>"
     elif contact and contact.lstrip("-").isdigit():
-        # Контакт — числовой ID (нет username)
-        new_text += f"\n\n<a href='tg://user?id={contact}'>💬 Написать клиенту</a>"
+        # Контакт — числовой ID (нет username): tg://user?id= открывается только
+        # в десктоп-версии Telegram, поэтому даём и пометку, и ссылку на сообщение
+        new_text += (
+            f"\n\n<a href='tg://user?id={contact}'>💬 Написать клиенту</a>"
+            f"\n<i>⚠️ Ссылка откроется только в десктоп-версии Telegram</i>"
+        )
+        if message_link:
+            new_text += f"\n<a href='{message_link}'>🔗 Перейти к сообщению</a>"
+    elif message_link:
+        # Юзернейм/ID не определён — даём ссылку на оригинальное сообщение,
+        # там контакт можно найти вручную (по профилю автора поста)
+        new_text += f"\n\n<i>⚠️ Контакт не определён автоматически</i>\n<a href='{message_link}'>🔗 Перейти к сообщению</a>"
 
     try:
         await call.message.edit_text(new_text, parse_mode=ParseMode.HTML)
@@ -2524,6 +2437,7 @@ def _register_userbot(userbot: TelegramClient, pipeline: VacancyPipeline) -> Non
                 log.warning(f"UserBot: неизвестный тип TL-объекта (обновите Telethon): {err_str[:100]}")
                 return
             log.error(f"UserBot: {e}", exc_info=True)
+            await notify_admin_error(pipeline.bot, "UserBot handler", e)
     log.info("UserBot: обработчик зарегистрирован")
 
 async def _init_userbot(bot: Bot) -> TelegramClient:
@@ -2680,7 +2594,7 @@ async def main() -> None:
                     raise
 
     await asyncio.gather(
-        dp.start_polling(bot, allowed_updates=["message","callback_query"]),
+        dp.start_polling(bot, allowed_updates=["message","callback_query","inline_query"]),
         _pipeline.run_worker(),
         _periodic_cleanup(),
         _check_expired_subs(bot),
