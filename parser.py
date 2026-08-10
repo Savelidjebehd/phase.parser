@@ -701,13 +701,19 @@ class VacancyPipeline:
         try:
             if self.db.get_setting("monitoring_active","1") != "1": return
             msg    = event.message
-            chat   = await event.get_chat()
-            sender = await event.get_sender()
+            try:
+                chat = await event.get_chat()
+            except Exception:
+                chat = None
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
             chat_id      = event.chat_id
             message_id   = msg.id
             source_title = getattr(chat,"title",None) or str(chat_id)
             username     = getattr(sender,"username",None) or ""
-            sender_id    = getattr(sender,"id",0) or 0
+            sender_id    = getattr(sender,"id",0) or event.sender_id or 0
             message_link = make_msg_link(event, chat)
             text         = extract_text(msg)
             if not text.strip(): return
@@ -791,12 +797,11 @@ class VacancyPipeline:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
                 hidden   = hide_contact(vacancy.text, ds.contact)
-                msg_text = (
-                    f"📢 <b>Новая вакансия</b>\n\n"
-                    f"{hidden}\n\n"
-                    f"🕐 <i>{vacancy.timestamp.strftime('%d.%m.%Y %H:%M')}</i>"
-                )
-                markup = mkb([[("👁 Показать контакты", f"show_contact:{vid}:{cl_id}")]])
+                msg_text = f"📢 <b>Новая вакансия</b>\n\n{hidden}"
+                markup = mkb([
+                    [("👁 Показать контакты", f"show_contact:{vid}:{cl_id}")],
+                    [("🔗 Перейти к сообщению", vacancy.message_link)],
+                ])
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -2424,7 +2429,8 @@ async def show_contact_cb(call: CallbackQuery):
         new_text += f"\n\n<i>⚠️ Контакт не определён автоматически</i>\n<a href='{message_link}'>🔗 Перейти к сообщению</a>"
 
     try:
-        await call.message.edit_text(new_text, parse_mode=ParseMode.HTML)
+        markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
+        await call.message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except TelegramBadRequest: pass
     await call.answer("✅ Контакты открыты")
 
