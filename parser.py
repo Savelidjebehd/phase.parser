@@ -3,7 +3,7 @@ phase.parser — агрегатор публичных вакансий из Tel
 Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 """
 from __future__ import annotations
-import asyncio, io, json, logging, os, random, re, sqlite3, time
+import asyncio, html, io, json, logging, os, random, re, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
@@ -49,6 +49,9 @@ DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
+CRYPTO_WALLET    = os.getenv("CRYPTO_WALLET", "")            # адрес USDT-кошелька
+CRYPTO_NETWORK   = os.getenv("CRYPTO_NETWORK", "TRC20")       # сеть (TRC20/BEP20/TON и т.п.)
+CRYPTO_RATE_BUFFER = float(os.getenv("CRYPTO_RATE_BUFFER", "1.5"))  # % запаса на случай расхождения курса с BingX
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
 REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус купившему рефералу
 REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
@@ -59,6 +62,30 @@ PRICES = {
     "month":  {"label": "1 мес.",  "days": 30,  "sale": 424,  "full": 499},
     "3month": {"label": "3 мес.",  "days": 90,  "sale": 1019, "full": 1119},
 }
+
+# Мягкие корни-слова (слишком общие сами по себе, ловят случайный чат) —
+# засчитываются как совпадение по ключевым словам, ТОЛЬКО если в тексте
+# рядом есть слово-триггер запроса (нужен/ищу/требуется и т.п.), неважно
+# на каком расстоянии друг от друга. Так вакансия "нужен эдитор для канала"
+# и "ищу того кто сделает мувик" ловятся, а болтовня "я с эдитами не связан" — нет.
+# Это только НАЧАЛЬНЫЕ значения для первого запуска — дальше оба списка
+# редактируются через админ-бота (🔑 Ключевые слова → Мягкие корни / Триггеры),
+# как обычные ключевые слова.
+SOFT_ROOT_SEED = ["эдит", "мувик"]
+REQUEST_TRIGGER_SEED = [
+    "нужен", "нужна", "нужны", "нужно",
+    "ищу", "ищем",
+    "требуется", "требуются",
+    "кто сможет", "кто сделает", "кто может", "кто готов",
+    "в команду", "на постоянку", "на проект",
+]
+
+KW_CATEGORY_LABELS = {
+    "common": "Общий", "admin": "Мои",
+    "soft_root": "Мягкие корни", "trigger": "Триггеры запроса",
+}
+def kw_cat_label(cat: str) -> str:
+    return KW_CATEGORY_LABELS.get(cat, cat)
 
 # ── Логирование ───────────────────────────────────────────────
 def setup_logging() -> logging.Logger:
@@ -174,6 +201,23 @@ class Database:
                 vacancies_failed INTEGER DEFAULT 0, replies_sent INTEGER DEFAULT 0,
                 ai_errors INTEGER DEFAULT 0, subs_bought INTEGER DEFAULT 0);
         """)
+        self._c().commit()
+        # Миграция: добавляем поля для крипто-оплаты в уже существующую БД
+        for col_sql in (
+            "ALTER TABLE payments ADD COLUMN method TEXT NOT NULL DEFAULT 'rub'",
+            "ALTER TABLE payments ADD COLUMN crypto_amount REAL",
+            "ALTER TABLE payments ADD COLUMN crypto_rate REAL",
+        ):
+            try: self._c().execute(col_sql)
+            except sqlite3.OperationalError: pass  # колонка уже есть
+        self._c().commit()
+        # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
+        if not self._c().execute("SELECT 1 FROM keywords WHERE type='soft_root' LIMIT 1").fetchone():
+            for w in SOFT_ROOT_SEED:
+                self._c().execute("INSERT OR IGNORE INTO keywords(word,type) VALUES(?,?)", (w, "soft_root"))
+        if not self._c().execute("SELECT 1 FROM keywords WHERE type='trigger' LIMIT 1").fetchone():
+            for w in REQUEST_TRIGGER_SEED:
+                self._c().execute("INSERT OR IGNORE INTO keywords(word,type) VALUES(?,?)", (w, "trigger"))
         self._c().commit()
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
             "ds_system_prompt",
@@ -375,11 +419,15 @@ class Database:
         self._c().commit()
 
     # ── Платежи ───────────────────────────────────────────────
-    def create_payment(self, client_id: int, tariff: str, amount: int, days: int) -> str:
+    def create_payment(self, client_id: int, tariff: str, amount: int, days: int,
+                       method: str = "rub", crypto_amount: Optional[float] = None,
+                       crypto_rate: Optional[float] = None) -> str:
         ticket = f"PAY-{int(time.time())}"
         self._c().execute(
-            "INSERT INTO payments(client_id,tariff,amount,days,ticket) VALUES(?,?,?,?,?)",
-            (client_id, tariff, amount, days, ticket)); self._c().commit(); return ticket
+            "INSERT INTO payments(client_id,tariff,amount,days,ticket,method,crypto_amount,crypto_rate) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (client_id, tariff, amount, days, ticket, method, crypto_amount, crypto_rate))
+        self._c().commit(); return ticket
 
     def get_payment_by_ticket(self, ticket: str) -> Optional[dict]:
         row = self._c().execute("SELECT * FROM payments WHERE ticket=?", (ticket,)).fetchone()
@@ -495,6 +543,44 @@ class Database:
         return [dict(r) for r in self._c().execute(
             "SELECT * FROM payments WHERE client_id=? ORDER BY created_at DESC", (client_id,)
         ).fetchall()]
+# ═══════════════════════════════════════════════════════════════
+# КУРС USDT/RUB (для крипто-оплаты)
+# ═══════════════════════════════════════════════════════════════
+_rate_cache: dict = {"value": None, "ts": 0.0}
+RATE_CACHE_TTL = 90  # секунд — не долбим API на каждый клик, но курс остаётся свежим
+
+async def get_usdt_rub_rate() -> Optional[float]:
+    """Курс USDT→RUB с P2P-рынка (продажа USDT за рубли).
+    Источник — публичный API Binance P2P: цены на P2P синхронизированы между
+    биржами (мейкеры арбитражат), поэтому курс близок к тому, что покажет BingX P2P.
+    К курсу применяется небольшой запас (CRYPTO_RATE_BUFFER, по умолчанию 1.5%)
+    вниз, чтобы не потерять на реальном выводе через BingX P2P.
+    Результат кэшируется на RATE_CACHE_TTL секунд."""
+    now = time.time()
+    if _rate_cache["value"] and (now - _rate_cache["ts"]) < RATE_CACHE_TTL:
+        return _rate_cache["value"]
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+                json={"asset": "USDT", "fiat": "RUB", "tradeType": "SELL",
+                      "page": 1, "rows": 10, "payTypes": [], "publisherType": None},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+        prices = [float(row["adv"]["price"]) for row in data.get("data", [])]
+        if not prices:
+            raise ValueError("Пустой ответ от Binance P2P")
+        # Берём среднее по топ-5 объявлений (устойчивее к разовым выбросам)
+        market_rate = sum(prices[:5]) / len(prices[:5])
+        rate = round(market_rate * (1 - CRYPTO_RATE_BUFFER / 100), 2)
+        _rate_cache["value"] = rate; _rate_cache["ts"] = now
+        return rate
+    except Exception as e:
+        log.error(f"get_usdt_rub_rate: {e}")
+        if _pipeline: await notify_admin_error(_pipeline.bot, "get_usdt_rub_rate", e)
+        return _rate_cache["value"]  # отдаём последний известный курс, если API недоступен
+
 # ═══════════════════════════════════════════════════════════════
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
@@ -614,11 +700,13 @@ def extract_text(message) -> str:
     return f"{marker}\n\nПодпись:\n{caption}" if caption else marker
 
 def hide_contact(text: str, contact: str) -> str:
-    if not contact: return text
-    result = re.sub(re.escape(contact), "—", text, flags=re.IGNORECASE)
-    if contact.startswith("@"):
-        result = re.sub(r"@" + re.escape(contact[1:]), "—", result, flags=re.IGNORECASE)
-    return result
+    """Заменяет контакт на «—» и экранирует текст под HTML parse_mode —
+    иначе символы вроде '<' в тексте вакансии ломают отправку сообщения."""
+    if contact:
+        text = re.sub(re.escape(contact), "—", text, flags=re.IGNORECASE)
+        if contact.startswith("@"):
+            text = re.sub(r"@" + re.escape(contact[1:]), "—", text, flags=re.IGNORECASE)
+    return html.escape(text)
 
 def make_msg_link(event, chat) -> str:
     uname = getattr(chat, "username", None); mid = event.message.id
@@ -737,6 +825,18 @@ class VacancyPipeline:
             kw_common = self.db.get_keywords("common")
             text_low  = norm_yo(text.lower())
             found_kw  = [kw for kw in kw_common if norm_yo(kw.lower()) in text_low]
+
+            # Мягкие корни (эдит/мувик и т.п.) — засчитываются, только если
+            # в тексте есть ещё и слово-триггер запроса. Оба списка редактируются
+            # через админ-бота (🔑 Ключевые слова → Мягкие корни / Триггеры).
+            if not found_kw:
+                soft_roots = self.db.get_keywords("soft_root")
+                triggers   = self.db.get_keywords("trigger")
+                found_root    = [r for r in soft_roots if norm_yo(r.lower()) in text_low]
+                found_trigger = [t for t in triggers if norm_yo(t.lower()) in text_low]
+                if found_root and found_trigger:
+                    found_kw = [f"{found_trigger[0]}+{found_root[0]}"]
+
             if not found_kw: return
             log.info(f"✅ КС: {found_kw}"); self.db.add_log("INFO", f"КС: {found_kw}")
 
@@ -824,7 +924,7 @@ class VacancyPipeline:
         """Уведомляет админа о новой подходящей вакансии (без авто-отклика)."""
         if self.db.get_setting("notify_reply","1") != "1":
             return
-        short = vacancy.text[:600]
+        short = html.escape(vacancy.text[:600])
         contact = ds.contact or ""
         if contact.startswith("@"):
             client_link = f"https://t.me/{contact.lstrip('@')}"
@@ -849,7 +949,7 @@ class VacancyPipeline:
     async def _notify_admin_rejected(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
         contact = ds.contact
         client_link = f"https://t.me/{contact.lstrip('@')}" if contact.startswith("@") else f"tg://user?id={vacancy.author_id}"
-        short = vacancy.text[:600]
+        short = html.escape(vacancy.text[:600])
         text = (
             f"❌ <b>Не прошло проверку!</b>\n\n"
             f"<blockquote expandable>{short}</blockquote>\n\n"
@@ -1182,8 +1282,8 @@ async def admin_vac_view_cb(call: CallbackQuery):
     v   = _db.get_vacancy(vid)
     if not v: await call.answer("Не найдена"); return
     text = (
-        f"<blockquote expandable>{v['text'][:900]}</blockquote>\n\n"
-        f"Контакт: <code>{v.get('ds_contact') or '—'}</code>\n"
+        f"<blockquote expandable>{html.escape(v['text'][:900])}</blockquote>\n\n"
+        f"Контакт: <code>{html.escape(str(v.get('ds_contact') or '—'))}</code>\n"
         f"<a href='{v.get('message_link') or '#'}'>Сообщение</a>"
     )
     markup = mkb([
@@ -1207,10 +1307,12 @@ async def admin_stats_period_cb(call: CallbackQuery):
 async def _show_stats(call: CallbackQuery, period: str) -> None:
     labels = {"today":"Сегодня","week":"Неделя","month":"Месяц","year":"Год"}
     s = _db.get_stats(period)
+    total = s['vacancies_found'] + s['vacancies_failed']
     text = (
         f"<b>📈 Статистика — {labels.get(period,'?')}</b>\n\n"
         f"Найдено вакансий: <b>{s['vacancies_found']}</b>\n"
         f"Не прошло проверку: <b>{s['vacancies_failed']}</b>\n"
+        f"Всего вакансий: <b>{total}</b>\n"
         f"Ошибки ИИ: <b>{s['ai_errors']}</b>\n"
         f"Куплено подписок: <b>{s['subs_bought']}</b>\n\n"
         f"👥 Клиентов: <b>{s['clients']}</b>\n"
@@ -1249,15 +1351,21 @@ async def _kw_text_and_markup(category: str) -> tuple[str, InlineKeyboardMarkup]
          ("👁 Смотреть",f"admin_kw_view:{category}")],
         [("◀️ Назад","admin_kw")],
     ])
-    return f"<b>🔑 Ключевые слова — {'Общий' if category=='common' else 'Мои'}</b>\n\nКол-во: <b>{cnt}</b>", markup
+    return f"<b>🔑 Ключевые слова — {kw_cat_label(category)}</b>\n\nКол-во: <b>{cnt}</b>", markup
 
 @admin_router.callback_query(F.data == "admin_kw")
 async def admin_kw_cb(call: CallbackQuery):
     markup = mkb([
         [("Общий","admin_kw_cat:common"), ("Только себе","admin_kw_cat:admin")],
+        [("🧩 Мягкие корни","admin_kw_cat:soft_root"), ("⚡ Триггеры","admin_kw_cat:trigger")],
         [("◀️ Назад","admin_monitoring")],
     ])
-    await safe_edit(call, "<b>🔑 Ключевые слова</b>\n\nКуда хотите добавить ключевые слова?", markup)
+    await safe_edit(call,
+        "<b>🔑 Ключевые слова</b>\n\nКуда хотите добавить ключевые слова?\n\n"
+        "<i>«Мягкие корни» и «Триггеры» — особая пара: вакансия засчитывается, "
+        "если в тексте есть слово из одного списка И слово из другого (не обязательно рядом). "
+        "Годится для коротких общих слов вроде «эдит»/«мувик», которые опасно добавлять как обычное ключевое слово.</i>",
+        markup)
 
 @admin_router.callback_query(F.data.startswith("admin_kw_cat:"))
 async def admin_kw_cat_cb(call: CallbackQuery):
@@ -1270,7 +1378,7 @@ async def admin_kw_add_cb(call: CallbackQuery):
     cat = call.data.split(":")[1]
     _admin_pending[call.from_user.id] = f"add_kw:{cat}"
     await safe_edit(call,
-        f"<b>➕ Ключевые слова — {'Общий' if cat=='common' else 'Мои'}</b>\n\n"
+        f"<b>➕ Ключевые слова — {kw_cat_label(cat)}</b>\n\n"
         "Напишите ключевые слова через Enter:\n\n"
         "<i>Пример:\nМонтаж\nОплата\nMotion</i>",
         mkb([[("◀️ Назад",f"admin_kw_cat:{cat}")]]))
@@ -1292,7 +1400,7 @@ async def admin_kw_del_cb(call: CallbackQuery):
     cat = call.data.split(":")[1]
     _admin_pending[call.from_user.id] = f"del_kw:{cat}"
     await safe_edit(call,
-        f"<b>➖ Удалить ключевые слова — {'Общий' if cat=='common' else 'Мои'}</b>\n\n"
+        f"<b>➖ Удалить ключевые слова — {kw_cat_label(cat)}</b>\n\n"
         "Напишите слова через Enter:",
         mkb([[("◀️ Назад",f"admin_kw_cat:{cat}")]]))
 
@@ -2033,7 +2141,7 @@ async def admin_src_recheck_cb(call: CallbackQuery):
 def _client_main_text(cl: dict, is_new: bool = False) -> str:
     sub   = fmt_date(cl.get("sub_until"))
     bonus = "\n<b>Тебе начислено +3 бесплатных дня</b>" if is_new else ""
-    # Вакансий за сегодня
+    # Вакансий за сегодня — только те, что прошли проверку ИИ
     today = datetime.now().strftime("%Y-%m-%d")
     vac_today = 0
     try:
@@ -2196,7 +2304,7 @@ async def client_buy_cb(call: CallbackQuery):
     cl      = _db.get_or_create_client(uid, call.from_user.username)
     has_paid = bool(cl.get("first_payment"))
     amount  = p["full"] if has_paid else p["sale"]
-    ticket  = _db.create_payment(cl["id"], tariff, amount, p["days"])
+    ticket  = _db.create_payment(cl["id"], tariff, amount, p["days"], method="rub")
     fire    = "" if has_paid else "🔥"
     text    = (
         f"Тариф <b>{p['label']}</b>\n\n"
@@ -2204,6 +2312,41 @@ async def client_buy_cb(call: CallbackQuery):
         f"{PAYMENT_BANK}\n\n"
         f"К оплате: <b>{amount}₽</b>{fire}\n\n"
         f"⚠️ <b>После оплаты нажмите Оплатил(а)</b> ⚠️"
+    )
+    markup = mkb([
+        [("✅ Оплатил(а)", f"client_paid:{ticket}")],
+        [("💱 Оплатить в USDT", f"client_buy_crypto:{tariff}")],
+        [("◀️ Главное меню","client_main")],
+    ])
+    await safe_edit(call, text, markup)
+
+@client_router.callback_query(F.data.startswith("client_buy_crypto:"))
+async def client_buy_crypto_cb(call: CallbackQuery):
+    uid    = call.from_user.id
+    tariff = call.data.split(":")[1]
+    p      = PRICES.get(tariff)
+    if not p: await call.answer("Неверный тариф"); return
+    if not CRYPTO_WALLET:
+        await call.answer("Оплата в USDT временно недоступна", show_alert=True); return
+    cl       = _db.get_or_create_client(uid, call.from_user.username)
+    has_paid = bool(cl.get("first_payment"))
+    amount   = p["full"] if has_paid else p["sale"]
+    rate     = await get_usdt_rub_rate()
+    if not rate:
+        await call.answer("Не удалось получить курс, попробуйте ещё раз через минуту", show_alert=True)
+        return
+    usdt_amount = round(amount / rate, 2)
+    ticket = _db.create_payment(cl["id"], tariff, amount, p["days"],
+                                method="usdt", crypto_amount=usdt_amount, crypto_rate=rate)
+    fire = "" if has_paid else "🔥"
+    text = (
+        f"Тариф <b>{p['label']}</b>\n\n"
+        f"Сеть: <b>{CRYPTO_NETWORK}</b>\n"
+        f"Адрес: <code>{CRYPTO_WALLET}</code>\n\n"
+        f"К оплате: <b>{usdt_amount} USDT</b>{fire}\n"
+        f"<i>(≈ {amount}₽ по курсу {rate}₽ за USDT)</i>\n\n"
+        f"⚠️ <b>Отправьте точную сумму, после оплаты нажмите Оплатил(а)</b> ⚠️\n"
+        f"<i>Курс актуален короткое время — если не успели, вернитесь на этот экран заново, чтобы обновить сумму</i>"
     )
     markup = mkb([
         [("✅ Оплатил(а)", f"client_paid:{ticket}")],
@@ -2229,12 +2372,18 @@ async def client_paid_cb(call: CallbackQuery):
     await safe_edit(call, text, markup)
     # Уведомление админу
     cl = _db.get_client_by_tg(call.from_user.id)
+    if p.get("method") == "usdt":
+        pay_line = (f"Тариф: {p['tariff']} | Сумма: <b>{p['crypto_amount']} USDT</b> "
+                    f"(курс {p['crypto_rate']}₽, ≈{p['amount']}₽)\n"
+                    f"Сеть: {CRYPTO_NETWORK} | Кошелёк: <code>{CRYPTO_WALLET}</code>")
+    else:
+        pay_line = f"Тариф: {p['tariff']} | Сумма: <b>{p['amount']}₽</b>"
     try:
         await call.bot.send_message(ADMIN_ID,
             f"💳 <b>Новый платёж!</b>\n\n"
             f"Тикет: <code>{ticket}</code>\n"
             f"Клиент: @{call.from_user.username or call.from_user.id}\n"
-            f"Тариф: {p['tariff']} | Сумма: <b>{p['amount']}₽</b>",
+            f"{pay_line}",
             parse_mode=ParseMode.HTML,
             reply_markup=mkb([
                 [("✅ Подтвердить", f"admin_confirm_pay:{ticket}"),
