@@ -48,6 +48,7 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
+PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "Савелий Сергеевич С.")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
 CRYPTO_WALLET    = os.getenv("CRYPTO_WALLET", "")            # адрес USDT-кошелька
 CRYPTO_NETWORK   = os.getenv("CRYPTO_NETWORK", "TRC20")       # сеть (TRC20/BEP20/TON и т.п.)
@@ -909,8 +910,17 @@ class VacancyPipeline:
                 contact = ds.contact or ""
                 if contact.startswith("@"):
                     author_line = f"\n\nАвтор: {html.escape(contact)}"
+                elif vacancy.author_id:
+                    # У автора нет юзернейма — tg://user?id= открывает профиль
+                    # напрямую, но работает ТОЛЬКО в десктопном приложении Telegram
+                    author_line = (
+                        f"\n\nАвтор: <a href='tg://user?id={vacancy.author_id}'>ссылка на ЛС</a> "
+                        f"(ID: {vacancy.author_id})\n"
+                        f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
+                        f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
+                    )
                 else:
-                    author_line = "\n\n⚠️ У автора нет юзернейма, перейдите к сообщению по кнопке ниже ⚠️"
+                    author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
                 msg_text = f"📢 <b>Новая вакансия</b>\n\n{html.escape(vacancy.text)}{author_line}"
                 markup = mkb([[("🔗 Перейти к сообщению", vacancy.message_link)]])
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
@@ -2498,13 +2508,13 @@ async def client_buy_cb(call: CallbackQuery):
     amount  = p["full"] if has_paid else p["sale"]
     ticket  = _db.create_payment(cl["id"], tariff, amount, p["days"], method="rub")
     fire    = "" if has_paid else "🔥"
-    uname_hint = f"@{call.from_user.username}" if call.from_user.username else f"id{uid}"
+    uname_hint = f"@{call.from_user.username}" if call.from_user.username else f"<code>{uid}</code>"
     text    = (
         f"Тариф <b>{p['label']}</b>\n\n"
-        f"<code>{PAYMENT_PHONE}</code>\n"
+        f"<code>{PAYMENT_PHONE}</code> | {PAYMENT_NAME}\n"
         f"{PAYMENT_BANK}\n"
         f"(укажите в комментарии {uname_hint})\n\n"
-        f"К оплате: <b>{amount}₽</b>{fire}\n\n"
+        f"К оплате: <b>{amount}₽</b>{fire}\n"
         f"⚠️ <b>После оплаты нажмите Оплатил(а)</b> ⚠️"
     )
     markup = mkb([
