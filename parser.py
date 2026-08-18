@@ -5,7 +5,7 @@ Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 from __future__ import annotations
 import asyncio, html, io, json, logging, os, random, re, sqlite3, time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
@@ -52,6 +52,7 @@ PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
 CRYPTO_WALLET    = os.getenv("CRYPTO_WALLET", "")            # адрес USDT-кошелька
 CRYPTO_NETWORK   = os.getenv("CRYPTO_NETWORK", "TRC20")       # сеть (TRC20/BEP20/TON и т.п.)
 CRYPTO_RATE_BUFFER = float(os.getenv("CRYPTO_RATE_BUFFER", "1.5"))  # % запаса на случай расхождения курса с BingX
+MSK = timezone(timedelta(hours=3))  # Москва — фикс. UTC+3, без перехода на летнее/зимнее
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
 REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус купившему рефералу
 REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
@@ -226,10 +227,28 @@ class Database:
             "Не считай подходящими вакансии на другие роли (дизайнер, оператор, видеограф, сценарист, SMM, "
             "копирайтер, контент-менеджер и т.п.), даже если они упомянуты рядом — главной задачей вакансии "
             "должен быть именно монтаж видео. "
+            "ВАЖНО: если текст написан от первого лица (монтирую, работал с..., сдаю в срок, ни разу не подвёл, "
+            "моё портфолио и т.п.) — это самореклама фрилансера, а не вакансия, ВСЕГДА suitable=false, даже если "
+            "где-то в тексте отдельно встречается слово 'нужен'/'вакансия'/'ищу' — авторы таких сообщений "
+            "иногда специально вставляют такие слова (в том числе как текст скрытой ссылки), чтобы обмануть "
+            "автоматические фильтры. Оценивай текст целиком по смыслу, а не по наличию отдельных слов. "
             "ВАЖНО: найди контакт для связи — это @username или телефон после слов 'писать', 'пишите', 'контакт', 'обращаться'. "
             "Это НЕ контакт: ссылки на портфолио, референсы, примеры работ. "
             "Если контакт не найден — верни username автора. "
             "Верни JSON без markdown: {\"suitable\": bool, \"reason\": \"до 5 слов\", \"contact\": \"@username или пусто\"}"))
+        self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
+            "msg_reminder_24h",
+            "❗<b>Подписка истекает</b>❗\nОсталось 24 часа\n\n"
+            "Оплатите тариф сейчас чтобы не упустить новые вакансии!"))
+        self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
+            "broadcast_text",
+            "👋 <b>phase.parser</b>\n\nНапоминаем: у нас каждый день новые вакансии на монтаж видео!"))
+        for k, v in (
+            ("reminder_hours_before", "24"),
+            ("broadcast_enabled", "0"),
+            ("broadcast_time_msk", "10:00"),
+        ):
+            self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
                           ("monitoring_active", "1"))
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
@@ -857,7 +876,6 @@ class VacancyPipeline:
                               timestamp=datetime.now())
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
-            self.db.stat_inc("vacancies_found")
 
             # DeepSeek
             if self.db.get_setting("ai_active","1") != "1":
@@ -872,6 +890,7 @@ class VacancyPipeline:
                 log.info(f"❌ Не подходит: {ds.reason}")
                 await self._notify_admin_rejected(vacancy, ds, vid); return
 
+            self.db.stat_inc("vacancies_found")
             await self._handle_suitable(vacancy, ds, vid)
         except Exception as e:
             log.error(f"_process: {e}", exc_info=True)
@@ -905,18 +924,6 @@ class VacancyPipeline:
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
-
-                # Проверка истечения подписки — уведомить за 24ч
-                sub_until = cl.get("sub_until","")
-                if sub_until:
-                    remaining = datetime.fromisoformat(sub_until) - datetime.now()
-                    if timedelta(hours=0) < remaining <= timedelta(hours=24):
-                        await self.bot.send_message(
-                            cl["tg_id"],
-                            "❗<b>Подписка истекает</b>❗\nОсталось 24 часа\n\n"
-                            "Оплатите тариф сейчас чтобы не упустить новые вакансии!",
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=mkb([[("💳 Тарифы","client_tariffs")]]))
             except Exception as e:
                 log.error(f"Рассылка {cl.get('tg_id')}: {e}")
 
@@ -1272,9 +1279,66 @@ async def _show_vacancies_page(call: CallbackQuery, page: int) -> None:
     if page > 0: nav.append(("◀️", f"admin_vac_page:{page-1}"))
     if len(items) == limit: nav.append(("▶️", f"admin_vac_page:{page+1}"))
     if nav: rows.append(nav)
+    rows.append([("📤 Экспорт лога (файлом)","admin_vac_export")])
     rows.append([("◀️ Главное меню","admin_main")])
     text = "<b>📋 Найденные вакансии</b>" if items else "<b>📋 Найденные вакансии</b>\n\n<i>Пока пусто</i>"
     await safe_edit(call, text, mkb(rows))
+
+@admin_router.callback_query(F.data == "admin_vac_export")
+async def admin_vac_export_cb(call: CallbackQuery):
+    markup = mkb([
+        [("Сегодня","admin_vac_export_do:1"), ("3 дня","admin_vac_export_do:3")],
+        [("7 дней","admin_vac_export_do:7"), ("30 дней","admin_vac_export_do:30")],
+        [("Всё время","admin_vac_export_do:0")],
+        [("◀️ Назад","admin_replies")],
+    ])
+    await safe_edit(call,
+        "<b>📤 Экспорт лога вакансий</b>\n\n"
+        "Файл со ВСЕМИ вакансиями за период — и прошедшими проверку, и нет "
+        "(текст, причина, контакт). Удобно скидывать на разбор раз в пару дней.\n\n"
+        "За какой период?",
+        markup)
+
+@admin_router.callback_query(F.data.startswith("admin_vac_export_do:"))
+async def admin_vac_export_do_cb(call: CallbackQuery):
+    days = int(call.data.split(":")[1])
+    if days > 0:
+        since = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = _db._c().execute(
+            "SELECT * FROM vacancies WHERE created_at >= ? ORDER BY id", (since,)).fetchall()
+        period_label = f"{days}d"
+    else:
+        rows = _db._c().execute("SELECT * FROM vacancies ORDER BY id").fetchall()
+        period_label = "all"
+
+    if not rows:
+        await call.answer("За этот период вакансий нет", show_alert=True); return
+
+    lines = []
+    ok_count = fail_count = 0
+    for r in rows:
+        v = dict(r)
+        suitable = v.get("suitable")
+        if suitable == 1:
+            status = "✅ ПРОШЛА"; ok_count += 1
+        elif suitable == 0:
+            status = "❌ НЕ ПРОШЛА"; fail_count += 1
+        else:
+            status = "⏳ НЕ ОБРАБОТАНА"
+        lines.append(
+            f"=== #{v['id']} | {status} | {v.get('created_at','')} ===\n"
+            f"Источник: {v.get('source_title','')}\n"
+            f"Причина: {v.get('ds_reason','') or '—'}\n"
+            f"Контакт: {v.get('ds_contact','') or '—'}\n"
+            f"Ссылка: {v.get('message_link','') or '—'}\n"
+            f"Текст:\n{v.get('text','')}\n"
+        )
+    header = f"Экспорт вакансий phase.parser | период: {period_label} | всего: {len(rows)} (прошло: {ok_count}, не прошло: {fail_count})\n\n"
+    content = header + ("\n" + "-"*60 + "\n\n").join(lines)
+
+    file = BufferedInputFile(content.encode("utf-8"), filename=f"vacancies_{period_label}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+    await call.message.answer_document(file, caption=f"📤 {len(rows)} вакансий за период «{period_label}» (✅{ok_count} / ❌{fail_count})")
+    await call.answer()
 
 @admin_router.callback_query(F.data.startswith("admin_vac_view:"))
 async def admin_vac_view_cb(call: CallbackQuery):
@@ -1728,10 +1792,113 @@ async def admin_settings_cb(call: CallbackQuery):
         [(f"🖥️ Мониторинг {'включен' if mon_on else 'выключен'}", "admin_settings_toggle:monitoring_active")],
         [(f"👥 Клиент бот {'включен' if cb_on else 'выключен'}", "admin_settings_toggle:client_bot_active")],
         [("📣 Оповещения", "admin_notifications")],
+        [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
         [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, "<b>⚙️ Настройки</b>", markup)
+
+@admin_router.callback_query(F.data == "admin_broadcast_settings")
+async def admin_broadcast_settings_cb(call: CallbackQuery):
+    hours   = _db.get_setting("reminder_hours_before", "24")
+    b_on    = _db.get_setting("broadcast_enabled", "0") == "1"
+    b_time  = _db.get_setting("broadcast_time_msk", "10:00")
+    now_msk = datetime.now(MSK).strftime("%H:%M")
+    text = (
+        f"<b>📨 Настройки рассылок</b>\n\n"
+        f"⏰ Напоминание об окончании подписки: за <b>{hours} ч.</b> до конца\n\n"
+        f"📢 Общая рассылка по расписанию: {'✅ включена' if b_on else '❌ выключена'}\n"
+        f"Время отправки: <b>{b_time} МСК</b> (каждый день)\n\n"
+        f"<i>Сейчас в Москве: {now_msk}</i>"
+    )
+    markup = mkb([
+        [("⏰ Изменить период напоминания","admin_bc_edit_hours")],
+        [(f"📢 Рассылка: {'выключить' if b_on else 'включить'}","admin_bc_toggle")],
+        [("🕐 Изменить время рассылки (МСК)","admin_bc_edit_time")],
+        [("✉️ Текст напоминания","admin_msg_view:msg_reminder_24h"),
+         ("✉️ Текст рассылки","admin_msg_view:broadcast_text")],
+        [("◀️ Назад","admin_settings")],
+    ])
+    await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data == "admin_bc_toggle")
+async def admin_bc_toggle_cb(call: CallbackQuery):
+    cur = _db.get_setting("broadcast_enabled", "0")
+    _db.set_setting("broadcast_enabled", "0" if cur == "1" else "1")
+    await admin_broadcast_settings_cb(call)
+
+@admin_router.callback_query(F.data == "admin_bc_edit_hours")
+async def admin_bc_edit_hours_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "edit_reminder_hours"
+    await safe_edit(call,
+        "⏰ За сколько часов до окончания подписки слать напоминание?\n\nПришлите число, например <code>24</code> или <code>12</code>:",
+        kb_back("admin_broadcast_settings"))
+
+@admin_router.callback_query(F.data == "admin_bc_edit_time")
+async def admin_bc_edit_time_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "edit_broadcast_time"
+    await safe_edit(call,
+        "🕐 В какое время по Москве слать общую рассылку каждый день?\n\nФормат <code>ЧЧ:ММ</code>, например <code>10:00</code>:",
+        kb_back("admin_broadcast_settings"))
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — ТЕКСТЫ СООБЩЕНИЙ КЛИЕНТАМ (редактируемые + тест)
+# ═══════════════════════════════════════════════════════════════
+CLIENT_MSG_TEMPLATES = {
+    "msg_reminder_24h": {
+        "label": "⏰ Напоминание об окончании подписки",
+        "default": ("❗<b>Подписка истекает</b>❗\nОсталось 24 часа\n\n"
+                    "Оплатите тариф сейчас чтобы не упустить новые вакансии!"),
+    },
+    "broadcast_text": {
+        "label": "📨 Общая рассылка (по расписанию)",
+        "default": ("👋 <b>phase.parser</b>\n\nНапоминаем: у нас каждый день новые вакансии на монтаж видео!"),
+    },
+}
+
+@admin_router.callback_query(F.data == "admin_msg_texts")
+async def admin_msg_texts_cb(call: CallbackQuery):
+    rows = [[(v["label"], f"admin_msg_view:{k}")] for k, v in CLIENT_MSG_TEMPLATES.items()]
+    rows.append([("◀️ Назад","admin_settings")])
+    await safe_edit(call,
+        "<b>✉️ Тексты сообщений клиентам</b>\n\n"
+        "Всё, что бот шлёт клиентам автоматически (не разовые уведомления, "
+        "а повторяющиеся шаблоны) — можно посмотреть, изменить и протестировать (придёт вам в личку).",
+        mkb(rows))
+
+@admin_router.callback_query(F.data.startswith("admin_msg_view:"))
+async def admin_msg_view_cb(call: CallbackQuery):
+    key  = call.data.split(":")[1]
+    tpl  = CLIENT_MSG_TEMPLATES.get(key)
+    if not tpl: await call.answer("Не найден"); return
+    text = _db.get_setting(key, tpl["default"])
+    await safe_edit(call,
+        f"<b>{tpl['label']}</b>\n\n<blockquote>{html.escape(text)[:1000]}</blockquote>",
+        mkb([
+            [("✏️ Изменить", f"admin_msg_edit:{key}"), ("🧪 Тест себе", f"admin_msg_test:{key}")],
+            [("◀️ Назад","admin_msg_texts")],
+        ]))
+
+@admin_router.callback_query(F.data.startswith("admin_msg_edit:"))
+async def admin_msg_edit_cb(call: CallbackQuery):
+    key = call.data.split(":")[1]
+    _admin_pending[call.from_user.id] = f"edit_msg_text:{key}"
+    await safe_edit(call,
+        "✏️ Пришлите новый текст (поддерживается HTML-разметка Telegram: &lt;b&gt;, &lt;i&gt; и т.п.):",
+        kb_back(f"admin_msg_view:{key}"))
+
+@admin_router.callback_query(F.data.startswith("admin_msg_test:"))
+async def admin_msg_test_cb(call: CallbackQuery):
+    key = call.data.split(":")[1]
+    tpl = CLIENT_MSG_TEMPLATES.get(key)
+    if not tpl: await call.answer("Не найден"); return
+    text   = _db.get_setting(key, tpl["default"])
+    markup = mkb([[("💳 Тарифы","client_tariffs")]]) if key == "msg_reminder_24h" else None
+    try:
+        await call.bot.send_message(call.from_user.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await call.answer("✅ Отправлено вам в личку")
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
 
 @admin_router.callback_query(F.data == "admin_notifications")
 async def admin_notifications_cb(call: CallbackQuery):
@@ -1812,11 +1979,9 @@ async def admin_block_confirm_cb(call: CallbackQuery):
     display      = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"id:{sender_id}"
     _db.block_sender(sender_id, sender_uname, "Заблокирован администратором", None)
     log.info(f"Отправитель заблокирован: {sender_id} {display}")
-    # Уведомляем пользователя если он клиент
-    try:
-        await call.bot.send_message(sender_id,
-            "Извините, но вы заблокированы в нашем сервисе.")
-    except Exception: pass
+    # Никаких уведомлений блокируемому не шлём — он может дальше пользоваться
+    # клиент-ботом как обычно, просто его сообщения в отслеживаемых источниках
+    # больше не проверяются (фильтр в _process, is_sender_blocked).
     await safe_edit(call,
         f"✅ <b>Заблокирован</b>\n\n{display}",
         kb_back("admin_main"))
@@ -2035,6 +2200,41 @@ async def admin_text_handler(msg: Message):
     if action == "edit_ds_prompt":
         _db.set_setting("ds_system_prompt", text)
         await safe_answer(msg, "✅ Промт обновлён", kb_back("admin_deepseek"))
+        return
+
+    # ── Тексты сообщений клиентам ──────────────────────────────
+    if action.startswith("edit_msg_text:"):
+        key = action.split(":",1)[1]
+        _db.set_setting(key, text)
+        await safe_answer(msg, "✅ Текст обновлён", kb_back(f"admin_msg_view:{key}"))
+        return
+
+    # ── Период напоминания об окончании подписки ───────────────
+    if action == "edit_reminder_hours":
+        t = text.strip()
+        if not t.isdigit() or not (1 <= int(t) <= 168):
+            await safe_answer(msg, "❌ Введите число от 1 до 168 (часов)", kb_back("admin_broadcast_settings"))
+            return
+        _db.set_setting("reminder_hours_before", t)
+        await safe_answer(msg, f"✅ Теперь напоминание шлётся за {t} ч. до конца подписки",
+                          kb_back("admin_broadcast_settings"))
+        return
+
+    # ── Время общей рассылки (МСК) ──────────────────────────────
+    if action == "edit_broadcast_time":
+        t = text.strip()
+        try:
+            hh, mm = t.split(":")
+            hh, mm = int(hh), int(mm)
+            assert 0 <= hh <= 23 and 0 <= mm <= 59
+        except Exception:
+            await safe_answer(msg, "❌ Формат ЧЧ:ММ, например 10:00", kb_back("admin_broadcast_settings"))
+            return
+        _db.set_setting("broadcast_time_msk", f"{hh:02d}:{mm:02d}")
+        # Сбрасываем дедуп на сегодня — чтобы новое время могло сработать в тот же день
+        _db.set_setting("broadcast_last_sent", "")
+        await safe_answer(msg, f"✅ Рассылка теперь в {hh:02d}:{mm:02d} МСК",
+                          kb_back("admin_broadcast_settings"))
         return
 
     # ── Глобальное правило DeepSeek ───────────────────────────
@@ -2679,6 +2879,68 @@ async def _check_expired_subs(bot: Bot) -> None:
                 except Exception: pass
         except Exception as e: log.error(f"_check_expired_subs: {e}")
 
+async def _send_expiry_reminders(bot: Bot) -> None:
+    """Напоминание «подписка истекает» — раз в 30 минут проверяем, но
+    каждому клиенту шлём РОВНО ОДИН раз за текущий период подписки (иначе,
+    если вакансий за день много, клиента бы заваливало дублями напоминания —
+    была именно эта жалоба). За сколько часов до окончания слать — настраивается
+    (⚙️ Настройки → 📨 Рассылки)."""
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            hours_before = int(_db.get_setting("reminder_hours_before", "24") or "24")
+            now  = datetime.now()
+            soon = (now + timedelta(hours=hours_before)).isoformat()
+            rows = _db._c().execute(
+                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND sub_until <= ?",
+                (now.isoformat(), soon)).fetchall()
+            for row in rows:
+                cl = dict(row)
+                # Ключ дедупа привязан к конкретной дате окончания подписки —
+                # как только клиент продлит её, sub_until изменится и напоминание придёт снова
+                sent_key = f"reminder_sub_{cl['id']}_{cl['sub_until']}"
+                if _db.get_setting(sent_key, ""): continue
+                try:
+                    text = _db.get_setting("msg_reminder_24h", CLIENT_MSG_TEMPLATES["msg_reminder_24h"]["default"])
+                    await bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML,
+                                           reply_markup=mkb([[("💳 Тарифы","client_tariffs")]]))
+                    _db.set_setting(sent_key, "1")
+                except Exception: pass
+        except Exception as e: log.error(f"_send_expiry_reminders: {e}")
+
+async def _scheduled_broadcast(bot: Bot) -> None:
+    """Общая рассылка по расписанию — раз в день в заданное московское время
+    (⚙️ Настройки → 📨 Рассылки). Проверяем раз в минуту, шлём один раз в
+    сутки (дедуп по дате МСК)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if _db.get_setting("broadcast_enabled", "0") != "1": continue
+            now_msk    = datetime.now(MSK)
+            today_key  = now_msk.strftime("%Y-%m-%d")
+            if _db.get_setting("broadcast_last_sent", "") == today_key: continue
+            target_hm  = _db.get_setting("broadcast_time_msk", "10:00")
+            try:
+                th, tm = map(int, target_hm.split(":"))
+            except Exception:
+                th, tm = 10, 0
+            # Окно в минуту — проверка раз в 60с, так что точного совпадения достаточно
+            if not (now_msk.hour == th and now_msk.minute == tm): continue
+            text = _db.get_setting("broadcast_text", CLIENT_MSG_TEMPLATES["broadcast_text"]["default"])
+            clients = _db.get_active_clients()
+            sent_count = 0
+            for cl in clients:
+                try:
+                    await bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
+                    sent_count += 1
+                except Exception: pass
+            _db.set_setting("broadcast_last_sent", today_key)
+            log.info(f"📨 Плановая рассылка отправлена: {sent_count} клиентам")
+            _db.add_log("INFO", f"📨 Плановая рассылка: {sent_count} клиентам")
+        except Exception as e:
+            log.error(f"_scheduled_broadcast: {e}")
+            await notify_admin_error(bot, "_scheduled_broadcast", e)
+
 # ═══════════════════════════════════════════════════════════════
 # АВТО-ОЧИСТКА
 # ═══════════════════════════════════════════════════════════════
@@ -2788,6 +3050,8 @@ async def main() -> None:
         _pipeline.run_worker(),
         _periodic_cleanup(),
         _check_expired_subs(bot),
+        _send_expiry_reminders(bot),
+        _scheduled_broadcast(bot),
         _safe_userbot_run(),
     )
 
