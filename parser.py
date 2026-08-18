@@ -232,10 +232,7 @@ class Database:
             "где-то в тексте отдельно встречается слово 'нужен'/'вакансия'/'ищу' — авторы таких сообщений "
             "иногда специально вставляют такие слова (в том числе как текст скрытой ссылки), чтобы обмануть "
             "автоматические фильтры. Оценивай текст целиком по смыслу, а не по наличию отдельных слов. "
-            "ВАЖНО: найди контакт для связи — это @username или телефон после слов 'писать', 'пишите', 'контакт', 'обращаться'. "
-            "Это НЕ контакт: ссылки на портфолио, референсы, примеры работ. "
-            "Если контакт не найден — верни username автора. "
-            "Верни JSON без markdown: {\"suitable\": bool, \"reason\": \"до 5 слов\", \"contact\": \"@username или пусто\"}"))
+            "Верни JSON без markdown: {\"suitable\": bool, \"reason\": \"до 5 слов\"}"))
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
             "msg_reminder_24h",
             "❗<b>Подписка истекает</b>❗\nОсталось 24 часа\n\n"
@@ -612,7 +609,7 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
     rules = db.get_ds_rules()
     rules_block = ("ГЛОБАЛЬНЫЕ ПРАВИЛА:\n" + "\n".join(f"- {r['value']}" for r in rules) + "\n\n") if rules else ""
     system = (rules_block + db.get_setting("ds_system_prompt") + "\n\n"
-              'Верни JSON без markdown: {"suitable": bool, "reason": "макс 5 слов", "contact": "@username или пусто"}')
+              'Верни JSON без markdown: {"suitable": bool, "reason": "макс 5 слов"}')
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
@@ -644,9 +641,10 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         parsed   = json.loads(raw_content)
         suitable = bool(parsed.get("suitable", False))
         reason   = str(parsed.get("reason", ""))[:60]
-        contact  = str(parsed.get("contact", "")).strip()
-        if not contact or contact.lower() in ("null", "none", ""):
-            contact = f"@{author_username}" if author_username else ""
+        # Автор — ВСЕГДА тот, кто реально написал сообщение (кто его отправил в
+        # чат-источник), а не то, что ИИ мог бы найти в тексте по словам
+        # "писать"/"пишите"/"контакт" — такой текст легко подделать/ввести в заблуждение.
+        contact  = f"@{author_username}" if author_username else ""
         log.info(f"DeepSeek → suitable={suitable} reason='{reason}' contact='{contact}'")
         db.add_log("INFO", f"DS: suitable={suitable} reason={reason}")
         return DeepSeekResult(suitable=suitable, reason=reason, contact=contact)
@@ -717,15 +715,6 @@ def extract_text(message) -> str:
     elif isinstance(message.media, MessageMediaWebPage): return caption
     else: marker = "[file]"
     return f"{marker}\n\nПодпись:\n{caption}" if caption else marker
-
-def hide_contact(text: str, contact: str) -> str:
-    """Заменяет контакт на «—» и экранирует текст под HTML parse_mode —
-    иначе символы вроде '<' в тексте вакансии ломают отправку сообщения."""
-    if contact:
-        text = re.sub(re.escape(contact), "—", text, flags=re.IGNORECASE)
-        if contact.startswith("@"):
-            text = re.sub(r"@" + re.escape(contact[1:]), "—", text, flags=re.IGNORECASE)
-    return html.escape(text)
 
 def make_msg_link(event, chat) -> str:
     uname = getattr(chat, "username", None); mid = event.message.id
@@ -915,12 +904,15 @@ class VacancyPipeline:
                 if hit:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
-                hidden   = hide_contact(vacancy.text, ds.contact)
-                msg_text = f"📢 <b>Новая вакансия</b>\n\n{hidden}"
-                markup = mkb([
-                    [("👁 Показать контакты", f"show_contact:{vid}:{cl_id}")],
-                    [("🔗 Перейти к сообщению", vacancy.message_link)],
-                ])
+                # Подписка уже гарантирована (get_active_clients фильтрует по ней) —
+                # контакт можно показывать сразу, без отдельной кнопки-раскрытия
+                contact = ds.contact or ""
+                if contact.startswith("@"):
+                    author_line = f"\n\nАвтор: {html.escape(contact)}"
+                else:
+                    author_line = "\n\n⚠️ У автора нет юзернейма, перейдите к сообщению по кнопке ниже ⚠️"
+                msg_text = f"📢 <b>Новая вакансия</b>\n\n{html.escape(vacancy.text)}{author_line}"
+                markup = mkb([[("🔗 Перейти к сообщению", vacancy.message_link)]])
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -2730,58 +2722,35 @@ async def client_stopwords_cb(call: CallbackQuery):
     words = _db.get_client_stopwords(cl["id"])
     text  = (
         f"<b>🚫 Стоп-слова</b>\n\n"
-        f"Введите стоп-слова через Enter:\n\n"
-        f"<i>Пример:\nТестовое\nШтат\nБез оплаты</i>\n\n"
+        f"Вакансии с этими словами не будут вам приходить.\n\n"
         f"<b>Текущие ({len(words)}):</b>\n" +
         ("\n".join(f"<code>{w}</code>" for w in words) if words else "<i>нет</i>")
     )
-    _client_pending[call.from_user.id] = "add_stopwords"
-    markup = mkb([[("◀️ Главное меню","client_main")]])
+    markup = mkb([
+        [("➕ Добавить","client_stopwords_add"), ("➖ Удалить","client_stopwords_del")],
+        [("◀️ Главное меню","client_main")],
+    ])
     await safe_edit(call, text, markup)
 
-# ── Открыть контакты ───────────────────────────────────────────
-@client_router.callback_query(F.data.startswith("show_contact:"))
-async def show_contact_cb(call: CallbackQuery):
-    parts   = call.data.split(":")
-    vid     = int(parts[1])
-    uid     = call.from_user.id
+@client_router.callback_query(F.data == "client_stopwords_add")
+async def client_stopwords_add_cb(call: CallbackQuery):
+    _client_pending[call.from_user.id] = "add_stopwords"
+    await safe_edit(call,
+        "➕ <b>Добавить стоп-слова</b>\n\nВведите слова через Enter (каждое с новой строки):\n\n"
+        "<i>Пример:\nТестовое\nШтат\nБез оплаты</i>",
+        kb_back("client_stopwords"))
 
-    if not _db.is_subscribed(uid):
-        await safe_edit(call,
-            "❌ <b>Ваша подписка закончилась!</b>\n\nОплатите чтобы получать новые заказы",
-            mkb([[("💳 Тарифы","client_tariffs")]]))
-        return
-
-    vacancy = _db.get_vacancy(vid)
-    if not vacancy: await call.answer("Не найдена"); return
-    contact      = vacancy.get("ds_contact","")
-    message_link = vacancy.get("message_link","")
-    old_text     = call.message.html_text or call.message.text or ""
-    new_text     = old_text.replace("—", contact) if contact else old_text
-
-    if contact.startswith("@"):
-        uname       = contact.lstrip("@")
-        client_link = f"https://t.me/{uname}"
-        new_text += f"\n\n<a href='{client_link}'>💬 Написать клиенту</a>"
-    elif contact and contact.lstrip("-").isdigit():
-        # Контакт — числовой ID (нет username): tg://user?id= открывается только
-        # в десктоп-версии Telegram, поэтому даём и пометку, и ссылку на сообщение
-        new_text += (
-            f"\n\n<a href='tg://user?id={contact}'>💬 Написать клиенту</a>"
-            f"\n<i>⚠️ Ссылка откроется только в десктоп-версии Telegram</i>"
-        )
-        if message_link:
-            new_text += f"\n<a href='{message_link}'>🔗 Перейти к сообщению</a>"
-    elif message_link:
-        # Юзернейм/ID не определён — даём ссылку на оригинальное сообщение,
-        # там контакт можно найти вручную (по профилю автора поста)
-        new_text += f"\n\n<i>⚠️ Контакт не определён автоматически</i>\n<a href='{message_link}'>🔗 Перейти к сообщению</a>"
-
-    try:
-        markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
-        await call.message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    except TelegramBadRequest: pass
-    await call.answer("✅ Контакты открыты")
+@client_router.callback_query(F.data == "client_stopwords_del")
+async def client_stopwords_del_cb(call: CallbackQuery):
+    cl    = _db.get_or_create_client(call.from_user.id, call.from_user.username)
+    words = _db.get_client_stopwords(cl["id"])
+    if not words:
+        await call.answer("Список пуст"); return
+    _client_pending[call.from_user.id] = "del_stopwords"
+    await safe_edit(call,
+        "➖ <b>Удалить стоп-слова</b>\n\nВведите слова через Enter — как написаны в списке (можно скопировать оттуда):\n\n" +
+        "\n".join(f"<code>{w}</code>" for w in words),
+        kb_back("client_stopwords"))
 
 # ── Главное меню клиента ───────────────────────────────────────
 @client_router.callback_query(F.data == "client_main")
@@ -2803,7 +2772,15 @@ async def client_text_handler(msg: Message):
         _db.add_client_stopwords(cl["id"], words)
         await safe_answer(msg,
             f"✅ Стоп-слова добавлены: <b>{len(words)}</b>",
-            mkb([[("⚙️ Настройки","client_settings")]]))
+            mkb([[("🚫 К списку","client_stopwords")]]))
+        return
+
+    if action == "del_stopwords":
+        words = [w.strip() for w in msg.text.splitlines() if w.strip()]
+        _db.delete_client_stopwords(cl["id"], words)
+        await safe_answer(msg,
+            f"✅ Стоп-слова удалены: <b>{len(words)}</b>",
+            mkb([[("🚫 К списку","client_stopwords")]]))
         return
 
     await msg.answer(_client_main_text(cl), reply_markup=kb_client_main())
