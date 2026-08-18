@@ -2498,10 +2498,12 @@ async def client_buy_cb(call: CallbackQuery):
     amount  = p["full"] if has_paid else p["sale"]
     ticket  = _db.create_payment(cl["id"], tariff, amount, p["days"], method="rub")
     fire    = "" if has_paid else "🔥"
+    uname_hint = f"@{call.from_user.username}" if call.from_user.username else f"id{uid}"
     text    = (
         f"Тариф <b>{p['label']}</b>\n\n"
         f"<code>{PAYMENT_PHONE}</code>\n"
-        f"{PAYMENT_BANK}\n\n"
+        f"{PAYMENT_BANK}\n"
+        f"(укажите в комментарии {uname_hint})\n\n"
         f"К оплате: <b>{amount}₽</b>{fire}\n\n"
         f"⚠️ <b>После оплаты нажмите Оплатил(а)</b> ⚠️"
     )
