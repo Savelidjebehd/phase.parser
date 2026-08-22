@@ -3,7 +3,7 @@ phase.parser — агрегатор публичных вакансий из Tel
 Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 """
 from __future__ import annotations
-import asyncio, html, io, json, logging, os, random, re, sqlite3, time
+import asyncio, html, json, logging, os, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
@@ -29,7 +29,6 @@ from telethon.errors import (
     ChannelsTooMuchError, FloodWaitError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
@@ -213,6 +212,10 @@ class Database:
             try: self._c().execute(col_sql)
             except sqlite3.OperationalError: pass  # колонка уже есть
         self._c().commit()
+        # Миграция: колонка для отметки «вакансия удалена админом у всех клиентов»
+        try: self._c().execute("ALTER TABLE vacancies ADD COLUMN deleted_by_admin INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
         if not self._c().execute("SELECT 1 FROM keywords WHERE type='soft_root' LIMIT 1").fetchone():
             for w in SOFT_ROOT_SEED:
@@ -245,6 +248,7 @@ class Database:
             ("reminder_hours_before", "24"),
             ("broadcast_enabled", "0"),
             ("broadcast_time_msk", "10:00"),
+            ("sender_cooldown_min", "30"),
         ):
             self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
@@ -412,6 +416,15 @@ class Database:
     def is_duplicate(self, text: str) -> bool:
         return bool(self._c().execute("SELECT id FROM vacancies WHERE text=?", (text,)).fetchone())
 
+    def recent_vacancy_from_sender(self, author_id: int, minutes: int = 30) -> bool:
+        """Есть ли уже вакансия от этого же отправителя за последние N минут —
+        не даём одному и тому же автору спамить повторными постами вакансии."""
+        if not author_id: return False
+        since = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        return bool(self._c().execute(
+            "SELECT id FROM vacancies WHERE author_id=? AND created_at >= ? LIMIT 1",
+            (author_id, since)).fetchone())
+
     def update_vacancy_ds(self, vid: int, suitable: bool, reason: str,
                           contact: str, contact_id: Optional[int] = None) -> None:
         self._c().execute(
@@ -433,6 +446,15 @@ class Database:
         self._c().execute(
             "INSERT OR IGNORE INTO client_deliveries(vacancy_id,client_id,msg_id,skipped,skip_reason)"
             " VALUES(?,?,?,?,?)", (vacancy_id, client_id, msg_id, 1 if skipped else 0, reason))
+        self._c().commit()
+
+    def get_deliveries(self, vacancy_id: int) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT d.*, c.tg_id FROM client_deliveries d JOIN clients c ON d.client_id=c.id "
+            "WHERE d.vacancy_id=? AND d.msg_id IS NOT NULL", (vacancy_id,)).fetchall()]
+
+    def mark_vacancy_deleted(self, vid: int) -> None:
+        self._c().execute("UPDATE vacancies SET deleted_by_admin=1 WHERE id=?", (vid,))
         self._c().commit()
 
     # ── Платежи ───────────────────────────────────────────────
@@ -551,6 +573,10 @@ class Database:
     def get_blocked_senders(self) -> list[dict]:
         return [dict(r) for r in self._c().execute(
             "SELECT * FROM blocked_senders ORDER BY added_at DESC").fetchall()]
+
+    def unblock_sender(self, sender_id: int) -> None:
+        self._c().execute("DELETE FROM blocked_senders WHERE sender_id=?", (sender_id,))
+        self._c().commit()
 
     def delete_ds_rules(self) -> None:
         self._c().execute("DELETE FROM settings WHERE key LIKE 'ds_rule_%'")
@@ -772,6 +798,73 @@ def kb_client_main() -> InlineKeyboardMarkup:
         [("⚙️ Настройки","client_settings")],
     ])
 
+def render_vacancy_client(v_text: str, contact: str, author_id: int, message_link: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Единый рендер вакансии для клиента — и в обычной рассылке, и в поиске."""
+    contact = contact or ""
+    if contact.lower().endswith("bot"):
+        # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
+        # от своего имени) — писать ему по вакансии бессмысленно, не показываем контакт
+        author_line = "\n\n<i>Автор — бот-публикатор, контакт не показывается</i>"
+    elif contact.startswith("@"):
+        author_line = f"\n\nАвтор: {html.escape(contact)}"
+    elif author_id:
+        # У автора нет юзернейма — tg://user?id= открывает профиль напрямую,
+        # но работает ТОЛЬКО в десктопном приложении Telegram
+        link = f"tg://user?id={author_id}"
+        author_line = (
+            f"\n\nАвтор: <a href='{link}'>{link}</a>\n"
+            f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
+            f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
+        )
+    else:
+        author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
+    msg_text = f"📢 <b>Новая вакансия</b>\n\n{html.escape(v_text)}{author_line}"
+    markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
+    return msg_text, markup
+
+def render_vacancy_admin(v: dict, back_to: Optional[str] = None) -> tuple[str, InlineKeyboardMarkup]:
+    """Единый рендер уведомления/просмотра вакансии для админа — используется и
+    при первой отправке, и при повторном открытии («Назад» из под-экранов, просмотр
+    из списка «📋 Вакансии»). Один источник правды — не даёт экранам разъезжаться."""
+    vid       = v["id"]
+    contact   = v.get("ds_contact") or ""
+    author_id = v.get("author_id") or 0
+    if contact.startswith("@"):
+        client_link = f"https://t.me/{contact.lstrip('@')}"
+    else:
+        client_link = f"tg://user?id={author_id}"
+    short   = html.escape((v.get("text") or "")[:600])
+    deleted = bool(v.get("deleted_by_admin"))
+    rows: list = []
+
+    if v.get("suitable"):
+        title = "🗑 <b>Вакансия удалена</b>" if deleted else "✅ <b>Новая вакансия</b>"
+        text = (
+            f"{title}\n\n"
+            f"<blockquote expandable>{short}</blockquote>\n\n"
+            f"<a href='{v.get('message_link') or '#'}'>Сообщение</a> | "
+            f"<a href='{client_link}'>Автор</a>"
+        )
+        if not deleted:
+            rows.append([("⚠️ Ошибка", f"admin_error_vac:{vid}")])
+            rows.append([("🚫 Заблокировать отправителя",
+                          f"admin_block_sender:{vid}:{author_id}:{v.get('author_username') or ''}")])
+            rows.append([("🗑 Удалить у всех", f"admin_vac_delete_confirm:{vid}")])
+    else:
+        text = (
+            f"❌ <b>Не прошло проверку!</b>\n\n"
+            f"<blockquote expandable>{short}</blockquote>\n\n"
+            f"<b>Причина:</b> {html.escape(v.get('ds_reason') or '')}\n\n"
+            f"<a href='{v.get('message_link') or '#'}'>Сообщение</a> | "
+            f"<a href='{client_link}'>Клиент</a>"
+        )
+        rows.append([("✅ Проверен", f"admin_manual_approve:{vid}"),
+                     ("⚠️ Ошибка",  f"admin_error_vac:{vid}")])
+
+    if back_to:
+        rows.append([("◀️ Назад", back_to)])
+    return text, mkb(rows)
+
 # ═══════════════════════════════════════════════════════════════
 # PIPELINE
 # ═══════════════════════════════════════════════════════════════
@@ -811,6 +904,15 @@ class VacancyPipeline:
             source_title = getattr(chat,"title",None) or str(chat_id)
             username     = getattr(sender,"username",None) or ""
             sender_id    = getattr(sender,"id",0) or event.sender_id or 0
+            if not username and sender_id:
+                # get_sender() иногда отдаёт «урезанный» объект без username,
+                # даже если он у пользователя есть (сессия юзербота его ещё не
+                # закэшировала) — принудительно дозапрашиваем полную entity
+                try:
+                    full_sender = await self.userbot.get_entity(sender_id)
+                    username = getattr(full_sender, "username", None) or ""
+                except Exception:
+                    pass
             message_link = make_msg_link(event, chat)
             text         = extract_text(msg)
             if not text.strip(): return
@@ -852,6 +954,13 @@ class VacancyPipeline:
             # Дубликат
             if self.db.is_duplicate(text):
                 log.info("🔁 Дубликат"); self.db.add_log("INFO", "🔁 Дубликат (уже была такая вакансия)"); return
+
+            # Слишком часто от одного отправителя (не чаще 1 вакансии в N минут)
+            cooldown_min = int(self.db.get_setting("sender_cooldown_min", "30") or "30")
+            if self.db.recent_vacancy_from_sender(sender_id, cooldown_min):
+                log.info(f"⏱ Повтор от отправителя {sender_id} (< {cooldown_min} мин)")
+                self.db.add_log("INFO", f"⏱ Пропущено: повтор от того же отправителя (< {cooldown_min} мин)")
+                return
 
             # Чёрный список (тоже без разницы «ё»/«е»)
             found_bl = [w for w in self.db.get_blacklist("common") if norm_yo(w.lower()) in text_low]
@@ -907,22 +1016,7 @@ class VacancyPipeline:
 
                 # Подписка уже гарантирована (get_active_clients фильтрует по ней) —
                 # контакт можно показывать сразу, без отдельной кнопки-раскрытия
-                contact = ds.contact or ""
-                if contact.startswith("@"):
-                    author_line = f"\n\nАвтор: {html.escape(contact)}"
-                elif vacancy.author_id:
-                    # У автора нет юзернейма — tg://user?id= открывает профиль
-                    # напрямую, но работает ТОЛЬКО в десктопном приложении Telegram
-                    author_line = (
-                        f"\n\nАвтор: <a href='tg://user?id={vacancy.author_id}'>ссылка на ЛС</a> "
-                        f"(ID: {vacancy.author_id})\n"
-                        f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
-                        f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
-                    )
-                else:
-                    author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
-                msg_text = f"📢 <b>Новая вакансия</b>\n\n{html.escape(vacancy.text)}{author_line}"
-                markup = mkb([[("🔗 Перейти к сообщению", vacancy.message_link)]])
+                msg_text, markup = render_vacancy_client(vacancy.text, ds.contact, vacancy.author_id, vacancy.message_link)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -933,22 +1027,9 @@ class VacancyPipeline:
         """Уведомляет админа о новой подходящей вакансии (без авто-отклика)."""
         if self.db.get_setting("notify_reply","1") != "1":
             return
-        short = html.escape(vacancy.text[:600])
-        contact = ds.contact or ""
-        if contact.startswith("@"):
-            client_link = f"https://t.me/{contact.lstrip('@')}"
-        else:
-            client_link = f"tg://user?id={vacancy.author_id}"
-        text = (
-            f"✅ <b>Новая вакансия</b>\n\n"
-            f"<blockquote expandable>{short}</blockquote>\n\n"
-            f"<a href='{vacancy.message_link}'>Сообщение</a> | "
-            f"<a href='{client_link}'>Автор</a>"
-        )
-        markup = mkb([
-            [("⚠️ Ошибка", f"admin_error_vac:{vid}")],
-            [("🚫 Заблокировать отправителя", f"admin_block_sender:{vacancy.author_id}:{vacancy.author_username or ''}")],
-        ])
+        v = self.db.get_vacancy(vid)
+        if not v: return
+        text, markup = render_vacancy_admin(v)
         try:
             await self.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as e:
@@ -956,20 +1037,11 @@ class VacancyPipeline:
             await notify_admin_error(self.bot, "notify_new_vacancy", e)
 
     async def _notify_admin_rejected(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
-        contact = ds.contact
-        client_link = f"https://t.me/{contact.lstrip('@')}" if contact.startswith("@") else f"tg://user?id={vacancy.author_id}"
-        short = html.escape(vacancy.text[:600])
-        text = (
-            f"❌ <b>Не прошло проверку!</b>\n\n"
-            f"<blockquote expandable>{short}</blockquote>\n\n"
-            f"<b>Причина:</b> {ds.reason}\n\n"
-            f"<a href='{vacancy.message_link}'>Сообщение</a> | "
-            f"<a href='{client_link}'>Клиент</a>"
-        )
-        markup = mkb([
-            [("✅ Проверен", f"admin_manual_approve:{vid}"),
-             ("⚠️ Ошибка",  f"admin_error_vac:{vid}")],
-        ])
+        if self.db.get_setting("notify_rejected","1") != "1":
+            return
+        v = self.db.get_vacancy(vid)
+        if not v: return
+        text, markup = render_vacancy_admin(v)
         try:
             await self.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as e:
@@ -1347,17 +1419,44 @@ async def admin_vac_view_cb(call: CallbackQuery):
     vid = int(call.data.split(":")[1])
     v   = _db.get_vacancy(vid)
     if not v: await call.answer("Не найдена"); return
-    text = (
-        f"<blockquote expandable>{html.escape(v['text'][:900])}</blockquote>\n\n"
-        f"Контакт: <code>{html.escape(str(v.get('ds_contact') or '—'))}</code>\n"
-        f"<a href='{v.get('message_link') or '#'}'>Сообщение</a>"
-    )
-    markup = mkb([
-        [("⚠️ Ошибка", f"admin_error_vac:{vid}")],
-        [("🚫 Заблокировать отправителя", f"admin_block_sender:{v.get('author_id',0)}:{v.get('author_username') or ''}")],
-        [("◀️ Назад","admin_replies")],
-    ])
+    text, markup = render_vacancy_admin(v, back_to="admin_replies")
     await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data.startswith("admin_vac_notif_view:"))
+async def admin_vac_notif_view_cb(call: CallbackQuery):
+    """Возврат к уведомлению о вакансии из под-экранов (ошибка/блокировка)."""
+    vid = int(call.data.split(":")[1])
+    v   = _db.get_vacancy(vid)
+    if not v: await call.answer("Вакансия не найдена"); return
+    text, markup = render_vacancy_admin(v)
+    await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data.startswith("admin_vac_delete_confirm:"))
+async def admin_vac_delete_confirm_cb(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    await safe_edit(call,
+        "🗑 <b>Удалить эту вакансию у всех клиентов?</b>\n\nСообщение пропадёт из чата у каждого, кому оно приходило. Действие необратимо.",
+        mkb([[("✅ Да, удалить у всех", f"admin_vac_delete:{vid}"),
+              ("❌ Отмена", f"admin_vac_notif_view:{vid}")]]))
+
+@admin_router.callback_query(F.data.startswith("admin_vac_delete:"))
+async def admin_vac_delete_cb(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    v   = _db.get_vacancy(vid)
+    if not v: await call.answer("Не найдена"); return
+    deliveries = _db.get_deliveries(vid)
+    ok = fail = 0
+    for d in deliveries:
+        try:
+            await call.bot.delete_message(d["tg_id"], d["msg_id"])
+            ok += 1
+        except Exception:
+            fail += 1  # уже удалено получателем/бот не может удалить — не критично
+    _db.mark_vacancy_deleted(vid)
+    v = _db.get_vacancy(vid)
+    text, markup = render_vacancy_admin(v)
+    await safe_edit(call, text, markup)
+    await call.answer(f"✅ Удалено у {ok} из {len(deliveries)}")
 
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — СТАТИСТИКА
@@ -1398,14 +1497,81 @@ async def _show_stats(call: CallbackQuery, period: str) -> None:
 async def admin_monitoring_cb(call: CallbackQuery):
     mon_on = _db.get_setting("monitoring_active","1") == "1"
     srcs   = len(_db.get_sources())
+    cooldown = _db.get_setting("sender_cooldown_min", "30")
     icon   = "🟢 Активен" if mon_on else "🔴 Остановлен"
-    text   = f"<b>🖥️ Мониторинг</b>\n\nСтатус: {icon}\nИсточники отслеживаются: <b>{srcs}</b>"
+    try:
+        ub_ok = _userbot is not None and _userbot.is_connected() and await _userbot.is_user_authorized()
+    except Exception:
+        ub_ok = False
+    ub_icon = "🟢 На связи" if ub_ok else "🔴 Не в сети!"
+    text   = (f"<b>🖥️ Мониторинг</b>\n\nСтатус: {icon}\nUserBot: {ub_icon}\n"
+              f"Источники отслеживаются: <b>{srcs}</b>\n"
+              f"Антиспам от отправителя: не чаще 1 вакансии в <b>{cooldown} мин.</b>")
     markup = mkb([
         [("🔑 Ключевые слова","admin_kw"), ("🚫 Чёрный список","admin_bl")],
         [("🤖 ИИ","admin_deepseek")],
+        [("⏱ Антиспам-период","admin_edit_cooldown"), ("📥 Импорт","admin_import")],
+        [("🚫 Заблокированные","admin_blocked_list")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data == "admin_blocked_list")
+async def admin_blocked_list_cb(call: CallbackQuery):
+    blocked = _db.get_blocked_senders()
+    if not blocked:
+        await safe_edit(call, "<b>🚫 Заблокированные отправители</b>\n\n<i>Список пуст</i>",
+                        kb_back("admin_monitoring"))
+        return
+    rows = []
+    for b in blocked[:20]:
+        label = f"@{b['sender_username']}" if b.get("sender_username") else f"ID {b['sender_id']}"
+        rows.append([(f"❌ {label}", f"admin_unblock:{b['sender_id']}")])
+    rows.append([("◀️ Назад","admin_monitoring")])
+    await safe_edit(call,
+        f"<b>🚫 Заблокированные отправители ({len(blocked)})</b>\n\nНажмите, чтобы разблокировать:",
+        mkb(rows))
+
+@admin_router.callback_query(F.data.startswith("admin_unblock:"))
+async def admin_unblock_cb(call: CallbackQuery):
+    sender_id = int(call.data.split(":")[1])
+    _db.unblock_sender(sender_id)
+    await call.answer("✅ Разблокирован")
+    await admin_blocked_list_cb(call)
+
+@admin_router.callback_query(F.data == "admin_edit_cooldown")
+async def admin_edit_cooldown_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "edit_sender_cooldown"
+    await safe_edit(call,
+        "⏱ Не чаще 1 вакансии от одного отправителя в сколько минут?\n\nПришлите число, например <code>30</code>:",
+        kb_back("admin_monitoring"))
+
+@admin_router.callback_query(F.data == "admin_import")
+async def admin_import_cb(call: CallbackQuery):
+    kw       = _db.get_keywords("common")
+    roots    = _db.get_keywords("soft_root")
+    triggers = _db.get_keywords("trigger")
+    bl       = _db.get_blacklist("common")
+    prompt   = _db.get_setting("ds_system_prompt", "")
+    rules    = _db.get_ds_rules()
+
+    def block(title: str, items: list[str]) -> str:
+        body = "\n".join(items) if items else "(пусто)"
+        return f"=== {title} ===\n{body}\n"
+
+    parts = [
+        block("Ключевые слова", kw),
+        block("Мягкие корни", roots),
+        block("Триггеры", triggers),
+        block("Стоп-слова", bl),
+        f"=== Промт нейросети ===\n{prompt or '(пусто)'}\n",
+        block("Глобальные правила", [r["value"] for r in rules]),
+    ]
+    content = "\n".join(parts)
+    file = BufferedInputFile(content.encode("utf-8"),
+                             filename=f"monitoring_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+    await call.message.answer_document(file, caption="📥 Экспорт раздела «Мониторинг» — можно переслать на разбор")
+    await call.answer()
 
 # ── Ключевые слова ─────────────────────────────────────────────
 async def _kw_text_and_markup(category: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1766,6 +1932,7 @@ async def admin_logs_cb(call: CallbackQuery):
     text  = f"<b>📜 Логи за {today}</b>\nСтрок: <b>{cnt}</b>"
     markup = mkb([
         [("📤 Экспорт",f"admin_logs_export:{today}")],
+        [("🗑 Очистить все логи","admin_clear_logs")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, text, markup)
@@ -1787,8 +1954,6 @@ async def admin_settings_cb(call: CallbackQuery):
     ai_on       = _db.get_setting("ai_active","1") == "1"
     mon_on      = _db.get_setting("monitoring_active","1") == "1"
     cb_on       = _db.get_setting("client_bot_active","1") == "1"
-    ntf_reply   = _db.get_setting("notify_reply","1") == "1"
-    ntf_reject  = _db.get_setting("notify_rejected","1") == "1"
     markup = mkb([
         [(f"🤖 ИИ {'включено' if ai_on else 'выключено'}", "admin_settings_toggle:ai_active")],
         [(f"🖥️ Мониторинг {'включен' if mon_on else 'выключен'}", "admin_settings_toggle:monitoring_active")],
@@ -1805,23 +1970,40 @@ async def admin_broadcast_settings_cb(call: CallbackQuery):
     hours   = _db.get_setting("reminder_hours_before", "24")
     b_on    = _db.get_setting("broadcast_enabled", "0") == "1"
     b_time  = _db.get_setting("broadcast_time_msk", "10:00")
+    b_photo = _db.get_setting("broadcast_photo_file_id", "")
     now_msk = datetime.now(MSK).strftime("%H:%M")
     text = (
         f"<b>📨 Настройки рассылок</b>\n\n"
         f"⏰ Напоминание об окончании подписки: за <b>{hours} ч.</b> до конца\n\n"
         f"📢 Общая рассылка по расписанию: {'✅ включена' if b_on else '❌ выключена'}\n"
-        f"Время отправки: <b>{b_time} МСК</b> (каждый день)\n\n"
+        f"Время отправки: <b>{b_time} МСК</b> (каждый день)\n"
+        f"Фото: {'✅ прикреплено' if b_photo else '— нет'}\n\n"
         f"<i>Сейчас в Москве: {now_msk}</i>"
     )
     markup = mkb([
         [("⏰ Изменить период напоминания","admin_bc_edit_hours")],
         [(f"📢 Рассылка: {'выключить' if b_on else 'включить'}","admin_bc_toggle")],
         [("🕐 Изменить время рассылки (МСК)","admin_bc_edit_time")],
+        [("🖼 Изменить фото" if b_photo else "🖼 Прикрепить фото","admin_bc_set_photo")] +
+        ([("🗑 Убрать фото","admin_bc_remove_photo")] if b_photo else []),
         [("✉️ Текст напоминания","admin_msg_view:msg_reminder_24h"),
          ("✉️ Текст рассылки","admin_msg_view:broadcast_text")],
         [("◀️ Назад","admin_settings")],
     ])
     await safe_edit(call, text, markup)
+
+@admin_router.callback_query(F.data == "admin_bc_set_photo")
+async def admin_bc_set_photo_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "set_broadcast_photo"
+    await safe_edit(call,
+        "🖼 Пришлите фото для рассылки (можно с подписью — подпись не используется, текст берётся из «✉️ Текст рассылки»):",
+        kb_back("admin_broadcast_settings"))
+
+@admin_router.callback_query(F.data == "admin_bc_remove_photo")
+async def admin_bc_remove_photo_cb(call: CallbackQuery):
+    _db.set_setting("broadcast_photo_file_id", "")
+    await call.answer("✅ Фото убрано")
+    await admin_broadcast_settings_cb(call)
 
 @admin_router.callback_query(F.data == "admin_bc_toggle")
 async def admin_bc_toggle_cb(call: CallbackQuery):
@@ -1896,8 +2078,12 @@ async def admin_msg_test_cb(call: CallbackQuery):
     if not tpl: await call.answer("Не найден"); return
     text   = _db.get_setting(key, tpl["default"])
     markup = mkb([[("💳 Тарифы","client_tariffs")]]) if key == "msg_reminder_24h" else None
+    photo_id = _db.get_setting("broadcast_photo_file_id", "") if key == "broadcast_text" else ""
     try:
-        await call.bot.send_message(call.from_user.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        if photo_id:
+            await call.bot.send_photo(call.from_user.id, photo_id, caption=text, parse_mode=ParseMode.HTML)
+        else:
+            await call.bot.send_message(call.from_user.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         await call.answer("✅ Отправлено вам в личку")
     except Exception as e:
         await call.answer(f"Ошибка: {e}", show_alert=True)
@@ -1907,25 +2093,25 @@ async def admin_notifications_cb(call: CallbackQuery):
     ntf_reply  = _db.get_setting("notify_reply","1") == "1"
     ntf_reject = _db.get_setting("notify_rejected","1") == "1"
     markup = mkb([
-        [(f"{'✅' if ntf_reply else '❌'} Отклик отправлен", "admin_settings_toggle:notify_reply")],
-        [(f"{'✅' if ntf_reject else '❌'} Не прошло проверку", "admin_settings_toggle:notify_rejected")],
+        [(f"{'✅' if ntf_reply else '❌'} Новая подходящая вакансия", "admin_settings_toggle:notify_reply")],
+        [(f"{'✅' if ntf_reject else '❌'} Вакансия не прошла проверку", "admin_settings_toggle:notify_rejected")],
         [("◀️ Назад", "admin_settings")],
     ])
     await safe_edit(call,
-        "<b>📣 Оповещения</b>\n\nВыберите какие уведомления получать:",
+        "<b>📣 Оповещения</b>\n\nКакие уведомления присылать вам в этот чат по каждой обработанной вакансии:",
         markup)
 
 
 @admin_router.callback_query(F.data == "admin_clear_logs")
 async def admin_clear_logs_cb(call: CallbackQuery):
     await safe_edit(call, "Вы уверены что хотите очистить все логи?",
-        mkb([[("✅ Да, очистить","admin_clear_logs_confirm"),("❌ Нет","admin_settings")]]))
+        mkb([[("✅ Да, очистить","admin_clear_logs_confirm"),("❌ Нет","admin_logs")]]))
 
 @admin_router.callback_query(F.data == "admin_clear_logs_confirm")
 async def admin_clear_logs_confirm_cb(call: CallbackQuery):
     _db.clear_logs()
     await call.answer("✅ Логи очищены")
-    await admin_settings_cb(call)
+    await admin_logs_cb(call)
 
 @admin_router.callback_query(F.data == "admin_clear_ds_rules")
 async def admin_clear_ds_rules_cb(call: CallbackQuery):
@@ -1960,14 +2146,15 @@ async def admin_settings_confirm_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_block_sender:"))
 async def admin_block_sender_cb(call: CallbackQuery):
-    parts        = call.data.split(":", 2)
-    sender_id    = int(parts[1])
-    sender_uname = parts[2] if len(parts) > 2 else ""
+    parts        = call.data.split(":", 3)
+    vid          = parts[1]
+    sender_id    = int(parts[2])
+    sender_uname = parts[3] if len(parts) > 3 else ""
     # Показываем кто это — username или просто ID
     display = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"ID: <code>{sender_id}</code>"
     markup = mkb([
-        [("✅ Да, заблокировать", f"admin_block_confirm:{sender_id}:{sender_uname}"),
-         ("❌ Нет",               "admin_main")],
+        [("✅ Да, заблокировать", f"admin_block_confirm:{vid}:{sender_id}:{sender_uname}"),
+         ("❌ Нет",               f"admin_vac_notif_view:{vid}")],
     ])
     await safe_edit(call,
         f"🚫 <b>Заблокировать отправителя?</b>\n\n{display}",
@@ -1975,9 +2162,10 @@ async def admin_block_sender_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_block_confirm:"))
 async def admin_block_confirm_cb(call: CallbackQuery):
-    parts        = call.data.split(":", 2)
-    sender_id    = int(parts[1])
-    sender_uname = parts[2] if len(parts) > 2 else ""
+    parts        = call.data.split(":", 3)
+    vid          = parts[1]
+    sender_id    = int(parts[2])
+    sender_uname = parts[3] if len(parts) > 3 else ""
     display      = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"id:{sender_id}"
     _db.block_sender(sender_id, sender_uname, "Заблокирован администратором", None)
     log.info(f"Отправитель заблокирован: {sender_id} {display}")
@@ -1986,7 +2174,7 @@ async def admin_block_confirm_cb(call: CallbackQuery):
     # больше не проверяются (фильтр в _process, is_sender_blocked).
     await safe_edit(call,
         f"✅ <b>Заблокирован</b>\n\n{display}",
-        kb_back("admin_main"))
+        kb_back(f"admin_vac_notif_view:{vid}"))
 
 @admin_router.callback_query(F.data.startswith("admin_error_vac:"))
 async def admin_error_vac_cb(call: CallbackQuery):
@@ -1995,6 +2183,7 @@ async def admin_error_vac_cb(call: CallbackQuery):
         [("🔑 Ключевые слова",f"admin_err_kw:{vid}"),
          ("🚫 Чёрный список",  f"admin_err_bl:{vid}")],
         [("🤖 ИИ",             f"admin_err_ds:{vid}")],
+        [("◀️ Назад", f"admin_vac_notif_view:{vid}")],
     ])
     await safe_edit(call, "⚠️ <b>Выберите категорию ошибки:</b>", markup)
 
@@ -2032,6 +2221,22 @@ async def admin_manual_approve_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "noop")
 async def noop_cb(call: CallbackQuery): await call.answer()
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — ОБРАБОТЧИК ФОТО (только для настроек рассылки)
+# ═══════════════════════════════════════════════════════════════
+@admin_router.message(F.photo)
+async def admin_photo_handler(msg: Message):
+    uid    = msg.from_user.id
+    action = _admin_pending.pop(uid, None)
+    if action == "set_broadcast_photo":
+        # Храним только file_id — маленькую строку-ссылку на уже загруженный
+        # на серверы Telegram файл. Сам файл никогда не попадает в нашу БД —
+        # место не расходуется вообще, независимо от размера/количества фото.
+        file_id = msg.photo[-1].file_id
+        _db.set_setting("broadcast_photo_file_id", file_id)
+        await safe_answer(msg, "✅ Фото для рассылки сохранено", kb_back("admin_broadcast_settings"))
+        return
+    await safe_answer(msg, "Не понял, что делать с этим фото", kb_back("admin_main"))
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ═══════════════════════════════════════════════════════════════
@@ -2085,6 +2290,17 @@ async def admin_text_handler(msg: Message):
             await safe_answer(msg, "❌ Неверный пароль. Попробуйте ещё раз:")
         except Exception as e:
             await safe_answer(msg, f"❌ Ошибка: <code>{e}</code>")
+        return
+
+    # ── Период антиспама от одного отправителя ──────────────────
+    if action == "edit_sender_cooldown":
+        t = text.strip()
+        if not t.isdigit() or not (1 <= int(t) <= 1440):
+            await safe_answer(msg, "❌ Введите число от 1 до 1440 (минут)", kb_back("admin_monitoring"))
+            return
+        _db.set_setting("sender_cooldown_min", t)
+        await safe_answer(msg, f"✅ Теперь не чаще 1 вакансии от отправителя в {t} мин.",
+                          kb_back("admin_monitoring"))
         return
 
     # ── Добавление источников (ссылки с новой строки) ─────────
@@ -2477,7 +2693,6 @@ async def client_invite_inline_query(iq: InlineQuery):
 async def _tariffs_text(cl: dict) -> str:
     sub = fmt_date(cl.get("sub_until"))
     has_paid = bool(cl.get("first_payment"))
-    disc = " нет" if has_paid else ""
     sale_line = "" if has_paid else "\n<b>Скидка на первую оплату 15%</b>🔥"
     return f"Подписка активна до: {sub}{sale_line}"
 
@@ -2575,7 +2790,6 @@ async def client_paid_cb(call: CallbackQuery):
     ])
     await safe_edit(call, text, markup)
     # Уведомление админу
-    cl = _db.get_client_by_tg(call.from_user.id)
     if p.get("method") == "usdt":
         pay_line = (f"Тариф: {p['tariff']} | Сумма: <b>{p['crypto_amount']} USDT</b> "
                     f"(курс {p['crypto_rate']}₽, ≈{p['amount']}₽)\n"
@@ -2841,6 +3055,47 @@ async def _init_userbot(bot: Bot) -> TelegramClient:
     return client
 
 # ═══════════════════════════════════════════════════════════════
+# ПРОВЕРКА ЗДОРОВЬЯ USERBOT-СЕССИИ
+# ═══════════════════════════════════════════════════════════════
+_userbot_health = {"was_ok": True}
+
+async def _check_userbot_health(bot: Bot) -> None:
+    """Раз в 15 минут проверяет, что юзербот-сессия жива. Если аккаунт
+    разлогинило/забанило — единственный видимый симптом обычно «вакансии просто
+    перестали приходить», и это можно не заметить сутками. Уведомляем сразу,
+    как только сессия отваливается, и отдельно — когда снова оживает."""
+    while True:
+        await asyncio.sleep(900)
+        try:
+            ok = False
+            if _userbot is not None:
+                try:
+                    ok = _userbot.is_connected() and await _userbot.is_user_authorized()
+                except Exception:
+                    ok = False
+            was_ok = _userbot_health["was_ok"]
+            if not ok and was_ok:
+                _userbot_health["was_ok"] = False
+                log.error("UserBot health check: сессия недоступна")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        "🔴 <b>UserBot отключён или разлогинен!</b>\n\n"
+                        "Мониторинг источников остановлен — новые вакансии не приходят.\n"
+                        "Зайдите в бот и переавторизуйте юзербота заново (номер телефона).",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+            elif ok and not was_ok:
+                _userbot_health["was_ok"] = True
+                log.info("UserBot health check: сессия восстановлена")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        "🟢 <b>UserBot снова в сети</b> — мониторинг восстановлен.",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+        except Exception as e:
+            log.error(f"_check_userbot_health: {e}")
+
+# ═══════════════════════════════════════════════════════════════
 # УВЕДОМЛЕНИЕ О КОНЦЕ ПОДПИСКИ (раз в неделю после окончания)
 # ═══════════════════════════════════════════════════════════════
 async def _check_expired_subs(bot: Bot) -> None:
@@ -2916,11 +3171,15 @@ async def _scheduled_broadcast(bot: Bot) -> None:
             # Окно в минуту — проверка раз в 60с, так что точного совпадения достаточно
             if not (now_msk.hour == th and now_msk.minute == tm): continue
             text = _db.get_setting("broadcast_text", CLIENT_MSG_TEMPLATES["broadcast_text"]["default"])
+            photo_id = _db.get_setting("broadcast_photo_file_id", "")
             clients = _db.get_active_clients()
             sent_count = 0
             for cl in clients:
                 try:
-                    await bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
+                    if photo_id:
+                        await bot.send_photo(cl["tg_id"], photo_id, caption=text, parse_mode=ParseMode.HTML)
+                    else:
+                        await bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
                     sent_count += 1
                 except Exception: pass
             _db.set_setting("broadcast_last_sent", today_key)
@@ -3041,6 +3300,7 @@ async def main() -> None:
         _check_expired_subs(bot),
         _send_expiry_reminders(bot),
         _scheduled_broadcast(bot),
+        _check_userbot_health(bot),
         _safe_userbot_run(),
     )
 
