@@ -646,6 +646,12 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         "max_tokens": 150,
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
+        # Явно отключаем режим рассуждений (thinking/CoT) — задаче классификации
+        # он не нужен, а его скрытые токены могут в разы раздувать счёт.
+        # Без явного отключения актуальные модели DeepSeek могут включать
+        # reasoning по умолчанию (reasoning_effort=high), даже под именем
+        # легаси-алиаса deepseek-chat.
+        "thinking": {"type": "disabled"},
     }
     log.debug(f"DeepSeek запрос: url={DEEPSEEK_URL} model={DEEPSEEK_MODEL} key={DEEPSEEK_KEY[:8]}...")
     try:
@@ -1691,6 +1697,9 @@ async def admin_bl_del_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data == "admin_deepseek")
 async def admin_deepseek_cb(call: CallbackQuery):
     tok    = _db.get_tokens_today()
+    s      = _db.get_stats("today")
+    calls_today = s.get("vacancies_found",0) + s.get("vacancies_failed",0)
+    avg_tok = (tok['tokens_in']+tok['tokens_out']) // calls_today if calls_today else 0
     ds_status = await check_deepseek_status()
     ds_ok  = ds_status == "ok"
     rules  = _db.get_ds_rules()
@@ -1705,7 +1714,9 @@ async def admin_deepseek_cb(call: CallbackQuery):
     text   = (
         f"<b>🤖 {DEEPSEEK_MODEL}</b>\n\n"
         f"Статус: {status}\n"
+        f"Запросов сегодня: <b>{calls_today}</b>\n"
         f"Расход токенов в день: ↑<code>{tok['tokens_in']}</code> ↓<code>{tok['tokens_out']}</code>\n"
+        f"В среднем на запрос: <b>~{avg_tok}</b> токенов\n"
         f"Глобальных правил: <b>{len(rules)}</b>"
     )
     markup = mkb([
