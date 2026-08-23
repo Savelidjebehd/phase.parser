@@ -3,7 +3,7 @@ phase.parser — агрегатор публичных вакансий из Tel
 Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 """
 from __future__ import annotations
-import asyncio, html, json, logging, os, sqlite3, time
+import asyncio, html, json, logging, os, re, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
@@ -22,6 +22,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.extensions import html as tg_html
 from telethon.errors import (
     PhoneCodeExpiredError, PhoneCodeInvalidError,
     PasswordHashInvalidError, SessionPasswordNeededError,
@@ -114,6 +115,7 @@ async def notify_admin_error(bot: Optional["Bot"], context: str, err: Exception)
 class Vacancy:
     chat_id: int; message_id: int; text: str; author_username: str
     author_id: int; source_title: str; message_link: str; timestamp: datetime
+    html_text: str = ""
 
 @dataclass
 class DeepSeekResult:
@@ -214,6 +216,11 @@ class Database:
         self._c().commit()
         # Миграция: колонка для отметки «вакансия удалена админом у всех клиентов»
         try: self._c().execute("ALTER TABLE vacancies ADD COLUMN deleted_by_admin INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: HTML-версия текста вакансии (с сохранённым форматированием —
+        # жирный, ссылки и т.п.), отдельно от plain-текста для ключевых слов/ИИ
+        try: self._c().execute("ALTER TABLE vacancies ADD COLUMN html_text TEXT")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -402,9 +409,9 @@ class Database:
         try:
             cur = self._c().execute(
                 "INSERT OR IGNORE INTO vacancies(chat_id,message_id,text,author_username,"
-                "author_id,source_title,message_link,ts) VALUES(?,?,?,?,?,?,?,?)",
+                "author_id,source_title,message_link,ts,html_text) VALUES(?,?,?,?,?,?,?,?,?)",
                 (v.chat_id, v.message_id, v.text, v.author_username, v.author_id,
-                 v.source_title, v.message_link, v.timestamp.isoformat()))
+                 v.source_title, v.message_link, v.timestamp.isoformat(), v.html_text))
             self._c().commit()
             if cur.lastrowid: return cur.lastrowid
             row = self._c().execute("SELECT id FROM vacancies WHERE chat_id=? AND message_id=?",
@@ -420,7 +427,7 @@ class Database:
         """Есть ли уже вакансия от этого же отправителя за последние N минут —
         не даём одному и тому же автору спамить повторными постами вакансии."""
         if not author_id: return False
-        since = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
         return bool(self._c().execute(
             "SELECT id FROM vacancies WHERE author_id=? AND created_at >= ? LIMIT 1",
             (author_id, since)).fetchone())
@@ -547,7 +554,7 @@ class Database:
         return "\n".join(f"{r['ts']} | {r['level']:<8} | {r['message']}" for r in rows).encode("utf-8")
 
     def cleanup(self) -> None:
-        cutoff = (datetime.now() - timedelta(days=2)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
         self._c().execute("DELETE FROM logs WHERE ts<?", (cutoff,))
         self._c().execute("DELETE FROM vacancies WHERE suitable=0 AND created_at<?", (cutoff,))
         self._c().commit(); log.info("Авто-очистка выполнена")
@@ -738,16 +745,52 @@ def norm_yo(s: str) -> str:
     списка с текстом сообщения не зависело от того, как автор написал букву."""
     return s.replace("ё", "е").replace("Ё", "Е")
 
-def extract_text(message) -> str:
-    caption = message.text or message.message or ""
-    if message.media is None: return caption
+def now_sql() -> str:
+    """Текущее время в формате и часовом поясе SQLite datetime('now') (UTC,
+    'YYYY-MM-DD HH:MM:SS'). Колонки created_at/ts везде в БД используют именно
+    этот формат по умолчанию — datetime.now().isoformat() даёт другой формат
+    (буква 'T', микросекунды) и локальное время сервера вместо UTC, из-за чего
+    строковое сравнение вида "created_at >= since" в SQLite ломается молча:
+    не бросает ошибку, просто никогда не находит совпадений. Всегда сравнивать
+    с этой функцией, а не с datetime.now().isoformat()."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+# Мусорные шаблонные приписки, которые некоторые боты-публикаторы (например,
+# @mari_pro_vakansii_bot) автоматически добавляют к каждому посту. Ищем по
+# устойчивому паттерну текста, а не по конкретному боту — надёжнее и не
+# зависит от того, как именно называется аккаунт-публикатор.
+_SOURCE_BOILERPLATE_PATTERNS = [
+    re.compile(r"🔻?\s*Прочтите.*?правила безопасности.*?объявлени[ий]\.?\s*", re.DOTALL | re.IGNORECASE),
+]
+
+def strip_source_boilerplate(text: str) -> str:
+    for pat in _SOURCE_BOILERPLATE_PATTERNS:
+        text = pat.sub("", text)
+    return text.strip()
+
+def extract_text(message) -> tuple[str, str]:
+    """Возвращает (plain, html) — plain для БД/ключевых слов/ИИ (без разметки),
+    html — с сохранённым форматированием (жирный, ссылки и т.п.) для показа
+    людям в клиент-боте. Раньше message.text отдавал markdown-реконструкцию
+    (буквальные звёздочки **жирный**), теперь берём raw_text+entities и сами
+    конвертируем в HTML — так форматирование доходит как настоящее, а не текстом."""
+    plain = message.raw_text or ""
+    try:
+        html_body = tg_html.unparse(plain, message.entities or [])
+    except Exception:
+        html_body = html.escape(plain)
+    plain     = strip_source_boilerplate(plain)
+    html_body = strip_source_boilerplate(html_body)
+
+    if message.media is None: return plain, html_body
     if isinstance(message.media, MessageMediaPhoto): marker = "[image]"
     elif isinstance(message.media, MessageMediaDocument):
         mime = getattr(getattr(message.media,"document",None),"mime_type","") or ""
         marker = "[pdf]" if "pdf" in mime else "[voice]" if "audio" in mime or "ogg" in mime else "[file]"
-    elif isinstance(message.media, MessageMediaWebPage): return caption
+    elif isinstance(message.media, MessageMediaWebPage): return plain, html_body
     else: marker = "[file]"
-    return f"{marker}\n\nПодпись:\n{caption}" if caption else marker
+    if not plain: return marker, marker
+    return f"{marker}\n\nПодпись:\n{plain}", f"{marker}\n\nПодпись:\n{html_body}"
 
 def make_msg_link(event, chat) -> str:
     uname = getattr(chat, "username", None); mid = event.message.id
@@ -804,13 +847,16 @@ def kb_client_main() -> InlineKeyboardMarkup:
         [("⚙️ Настройки","client_settings")],
     ])
 
-def render_vacancy_client(v_text: str, contact: str, author_id: int, message_link: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Единый рендер вакансии для клиента — и в обычной рассылке, и в поиске."""
+def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
+    (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
+    вызывающий код отвечает за то, что это безопасный HTML или escape-плейн."""
     contact = contact or ""
     if contact.lower().endswith("bot"):
         # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
-        # от своего имени) — писать ему по вакансии бессмысленно, не показываем контакт
-        author_line = "\n\n<i>Автор — бот-публикатор, контакт не показывается</i>"
+        # от своего имени) — писать ему по вакансии бессмысленно, строку об
+        # авторе просто не показываем вообще (не пишем даже плейсхолдер)
+        author_line = ""
     elif contact.startswith("@"):
         author_line = f"\n\nАвтор: {html.escape(contact)}"
     elif author_id:
@@ -824,7 +870,7 @@ def render_vacancy_client(v_text: str, contact: str, author_id: int, message_lin
         )
     else:
         author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
-    msg_text = f"📢 <b>Новая вакансия</b>\n\n{html.escape(v_text)}{author_line}"
+    msg_text = f"📢 <b>Новая вакансия</b>\n\n{v_html}{author_line}"
     markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
     return msg_text, markup
 
@@ -920,7 +966,7 @@ class VacancyPipeline:
                 except Exception:
                     pass
             message_link = make_msg_link(event, chat)
-            text         = extract_text(msg)
+            text, html_text = extract_text(msg)
             if not text.strip(): return
 
             log.info(f"📥 [{source_title}] @{username}")
@@ -978,7 +1024,7 @@ class VacancyPipeline:
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
                               source_title=source_title, message_link=message_link,
-                              timestamp=datetime.now())
+                              timestamp=datetime.now(), html_text=html_text)
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
@@ -1022,7 +1068,9 @@ class VacancyPipeline:
 
                 # Подписка уже гарантирована (get_active_clients фильтрует по ней) —
                 # контакт можно показывать сразу, без отдельной кнопки-раскрытия
-                msg_text, markup = render_vacancy_client(vacancy.text, ds.contact, vacancy.author_id, vacancy.message_link)
+                msg_text, markup = render_vacancy_client(
+                    vacancy.html_text or html.escape(vacancy.text),
+                    ds.contact, vacancy.author_id, vacancy.message_link)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -1383,7 +1431,7 @@ async def admin_vac_export_cb(call: CallbackQuery):
 async def admin_vac_export_do_cb(call: CallbackQuery):
     days = int(call.data.split(":")[1])
     if days > 0:
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         rows = _db._c().execute(
             "SELECT * FROM vacancies WHERE created_at >= ? ORDER BY id", (since,)).fetchall()
         period_label = f"{days}d"
@@ -2224,7 +2272,8 @@ async def admin_manual_approve_cb(call: CallbackQuery):
         chat_id=vacancy_row["chat_id"], message_id=vacancy_row["message_id"],
         text=vacancy_row["text"], author_username=vacancy_row["author_username"] or "",
         author_id=vacancy_row["author_id"] or 0, source_title=vacancy_row["source_title"] or "",
-        message_link=vacancy_row["message_link"] or "", timestamp=datetime.now())
+        message_link=vacancy_row["message_link"] or "", timestamp=datetime.now(),
+        html_text=vacancy_row.get("html_text") or "")
     ds = DeepSeekResult(suitable=True, reason="Вручную", contact=vacancy_row.get("ds_contact",""))
     await _pipeline._handle_suitable(v, ds, vid)
     await call.answer("✅ Вакансия одобрена и отправлена в рассылку")
