@@ -251,6 +251,13 @@ class Database:
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
             "broadcast_text",
             "👋 <b>phase.parser</b>\n\nНапоминаем: у нас каждый день новые вакансии на монтаж видео!"))
+        self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (
+            "msg_welcome_search_started",
+            "🔍 <b>Поиск вакансий уже запущен!</b>\n\n"
+            "Ничего дополнительно нажимать не нужно — как только найдём подходящую "
+            "вакансию на монтаж видео, она сразу придёт вам сюда, в этот чат.\n\n"
+            "Обычно это занимает от нескольких минут до пары часов, в зависимости "
+            "от того, как часто публикуют подходящие вакансии — просто ждите 🙂"))
         for k, v in (
             ("reminder_hours_before", "24"),
             ("broadcast_enabled", "0"),
@@ -899,8 +906,7 @@ def render_vacancy_admin(v: dict, back_to: Optional[str] = None) -> tuple[str, I
         )
         if not deleted:
             rows.append([("⚠️ Ошибка", f"admin_error_vac:{vid}")])
-            rows.append([("🚫 Заблокировать отправителя",
-                          f"admin_block_sender:{vid}:{author_id}:{v.get('author_username') or ''}")])
+            rows.append([("🚫 Заблокировать отправителя", f"admin_block_sender:{vid}")])
             rows.append([("🗑 Удалить у всех", f"admin_vac_delete_confirm:{vid}")])
     else:
         text = (
@@ -1938,7 +1944,7 @@ async def admin_client_detail_cb(call: CallbackQuery):
     )
     markup = mkb([
         [("➕ Выдать подписку", f"admin_give_sub_client:{client_id}"),
-         ("🚫 Заблокировать",  f"admin_block_client:{client_id}:{c['tg_id']}:unknown")],
+         ("🚫 Заблокировать",  f"admin_block_client:{client_id}")],
         [("◀️ Назад","admin_clients_list")],
     ])
     await safe_edit(call, text, markup)
@@ -1953,15 +1959,30 @@ async def admin_give_sub_client_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_block_client:"))
 async def admin_block_client_cb(call: CallbackQuery):
-    parts     = call.data.split(":")
-    client_id = parts[1]; tg_id = parts[2]; uname = parts[3] if len(parts) > 3 else ""
-    display   = f"@{uname}" if uname and uname != "unknown" else f"ID: <code>{tg_id}</code>"
-    markup    = mkb([
-        [("✅ Да, заблокировать", f"admin_block_confirm:{tg_id}:{uname}"),
+    client_id = call.data.split(":")[1]
+    c = _db.get_client_by_id(int(client_id))
+    if not c: await call.answer("Клиент не найден"); return
+    tg_id = c["tg_id"]; uname = c.get("username") or ""
+    display = f"@{uname}" if uname else f"ID: <code>{tg_id}</code>"
+    markup = mkb([
+        [("✅ Да, заблокировать", f"admin_block_client_confirm:{client_id}"),
          ("❌ Нет",               f"admin_client_detail:{client_id}")],
     ])
     await safe_edit(call,
         f"🚫 <b>Заблокировать?</b>\n\n{display}", markup)
+
+@admin_router.callback_query(F.data.startswith("admin_block_client_confirm:"))
+async def admin_block_client_confirm_cb(call: CallbackQuery):
+    client_id = call.data.split(":")[1]
+    c = _db.get_client_by_id(int(client_id))
+    if not c: await call.answer("Клиент не найден"); return
+    tg_id = c["tg_id"]; uname = c.get("username") or ""
+    display = f"@{uname}" if uname else f"id:{tg_id}"
+    _db.block_sender(tg_id, uname, "Заблокирован администратором", None)
+    log.info(f"Отправитель заблокирован (из карточки клиента): {tg_id} {display}")
+    await safe_edit(call,
+        f"✅ <b>Заблокирован</b>\n\n{display}",
+        kb_back(f"admin_client_detail:{client_id}"))
 
 
 @admin_router.callback_query(F.data == "admin_give_sub")
@@ -2097,6 +2118,16 @@ CLIENT_MSG_TEMPLATES = {
         "label": "📨 Общая рассылка (по расписанию)",
         "default": ("👋 <b>phase.parser</b>\n\nНапоминаем: у нас каждый день новые вакансии на монтаж видео!"),
     },
+    "msg_welcome_search_started": {
+        "label": "🔍 Приветствие новому клиенту («поиск запущен»)",
+        "default": (
+            "🔍 <b>Поиск вакансий уже запущен!</b>\n\n"
+            "Ничего дополнительно нажимать не нужно — как только найдём подходящую "
+            "вакансию на монтаж видео, она сразу придёт вам сюда, в этот чат.\n\n"
+            "Обычно это занимает от нескольких минут до пары часов, в зависимости "
+            "от того, как часто публикуют подходящие вакансии — просто ждите 🙂"
+        ),
+    },
 }
 
 @admin_router.callback_query(F.data == "admin_msg_texts")
@@ -2205,27 +2236,29 @@ async def admin_settings_confirm_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("admin_block_sender:"))
 async def admin_block_sender_cb(call: CallbackQuery):
-    parts        = call.data.split(":", 3)
-    vid          = parts[1]
-    sender_id    = int(parts[2])
-    sender_uname = parts[3] if len(parts) > 3 else ""
+    vid = call.data.split(":")[1]
+    v   = _db.get_vacancy(int(vid))
+    if not v: await call.answer("Вакансия не найдена"); return
+    sender_id    = v.get("author_id") or 0
+    sender_uname = v.get("author_username") or ""
     # Показываем кто это — username или просто ID
-    display = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"ID: <code>{sender_id}</code>"
+    display = f"@{sender_uname}" if sender_uname else f"ID: <code>{sender_id}</code>"
     markup = mkb([
-        [("✅ Да, заблокировать", f"admin_block_confirm:{vid}:{sender_id}:{sender_uname}"),
+        [("✅ Да, заблокировать", f"admin_block_vac_confirm:{vid}"),
          ("❌ Нет",               f"admin_vac_notif_view:{vid}")],
     ])
     await safe_edit(call,
         f"🚫 <b>Заблокировать отправителя?</b>\n\n{display}",
         markup)
 
-@admin_router.callback_query(F.data.startswith("admin_block_confirm:"))
-async def admin_block_confirm_cb(call: CallbackQuery):
-    parts        = call.data.split(":", 3)
-    vid          = parts[1]
-    sender_id    = int(parts[2])
-    sender_uname = parts[3] if len(parts) > 3 else ""
-    display      = f"@{sender_uname}" if sender_uname and sender_uname != "unknown" else f"id:{sender_id}"
+@admin_router.callback_query(F.data.startswith("admin_block_vac_confirm:"))
+async def admin_block_vac_confirm_cb(call: CallbackQuery):
+    vid = call.data.split(":")[1]
+    v   = _db.get_vacancy(int(vid))
+    if not v: await call.answer("Вакансия не найдена"); return
+    sender_id    = v.get("author_id") or 0
+    sender_uname = v.get("author_username") or ""
+    display      = f"@{sender_uname}" if sender_uname else f"id:{sender_id}"
     _db.block_sender(sender_id, sender_uname, "Заблокирован администратором", None)
     log.info(f"Отправитель заблокирован: {sender_id} {display}")
     # Никаких уведомлений блокируемому не шлём — он может дальше пользоваться
@@ -2563,7 +2596,7 @@ async def admin_text_handler(msg: Message):
         except Exception: pass
         return
 
-    # Блокировка теперь через кнопку admin_block_confirm — ввод текста не нужен
+    # Блокировка теперь через кнопки admin_block_vac_confirm/admin_block_client_confirm — ввод текста не нужен
 
     # ── Рассылка ──────────────────────────────────────────────
     if action == "broadcast":
@@ -2667,6 +2700,14 @@ async def client_start(msg: Message):
             except Exception as e: log.warning(f"Реферал: {e}")
 
     await msg.answer(_client_main_text(cl, is_new), reply_markup=kb_client_main())
+    if is_new:
+        # Отдельным сообщением, явно и заметно — часть новых пользователей не
+        # понимает, что поиск вакансий уже идёт автоматически, и ждёт какого-то
+        # дополнительного действия от себя, чтобы «запустить» его. Текст
+        # редактируется через ⚙️ Настройки → ✉️ Тексты сообщений.
+        text = _db.get_setting("msg_welcome_search_started",
+                               CLIENT_MSG_TEMPLATES["msg_welcome_search_started"]["default"])
+        await msg.answer(text, parse_mode=ParseMode.HTML)
 
 @client_router.message(Command("settings"))
 async def client_cmd_settings(msg: Message):
