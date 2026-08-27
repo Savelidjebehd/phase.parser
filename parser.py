@@ -31,6 +31,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
 )
@@ -962,15 +963,6 @@ class VacancyPipeline:
             source_title = getattr(chat,"title",None) or str(chat_id)
             username     = getattr(sender,"username",None) or ""
             sender_id    = getattr(sender,"id",0) or event.sender_id or 0
-            if not username and sender_id:
-                # get_sender() иногда отдаёт «урезанный» объект без username,
-                # даже если он у пользователя есть (сессия юзербота его ещё не
-                # закэшировала) — принудительно дозапрашиваем полную entity
-                try:
-                    full_sender = await self.userbot.get_entity(sender_id)
-                    username = getattr(full_sender, "username", None) or ""
-                except Exception:
-                    pass
             message_link = make_msg_link(event, chat)
             text, html_text = extract_text(msg)
             if not text.strip(): return
@@ -1026,6 +1018,47 @@ class VacancyPipeline:
                 log.info(f"⛔ ЧС: {found_bl}")
                 self.db.add_log("INFO", f"⛔ Отсеяно чёрным списком: {found_bl}")
                 return
+
+            # Дозапрос username, только если он не пришёл сразу — сюда доходят уже
+            # ТОЛЬКО сообщения, прошедшие все дешёвые фильтры (раньше это делалось
+            # для каждого входящего сообщения, включая весь спам-поток от ботов —
+            # десятки тысяч лишних запросов к серверам Telegram в день, риск
+            # FloodWait на юзерботе). Причина пропуска username чаще всего не в
+            # том, что сессия юзербота вообще не видела этого юзера, а в том, что
+            # Telegram присылает т.н. "min"-конструктор User (без username/bio —
+            # сервер экономит трафик, предполагая что клиент якобы уже всё знает).
+            # get_entity() тогда просто отдаёт тот же урезанный кэш повторно, не
+            # помогает. GetFullUserRequest всегда идёт на сервер за полными
+            # данными и обходит именно эту проблему.
+            if not username and sender_id:
+                # 1) InputUser напрямую из данных этого конкретного апдейта —
+                # содержит свежий access_hash именно из этого сообщения, а не
+                # потенциально устаревший/несовместимый по контексту кэш по
+                # голому ID. Самый надёжный вариант, пробуем первым.
+                try:
+                    input_sender = await msg.get_input_sender()
+                    if input_sender:
+                        full = await self.userbot(GetFullUserRequest(input_sender))
+                        if full.users:
+                            username = getattr(full.users[0], "username", None) or ""
+                except Exception as e:
+                    log.debug(f"GetFullUserRequest(input_sender): {e}")
+                # 2) Резолв по голому ID через кэш сессии
+                if not username:
+                    try:
+                        full_sender = await self.userbot.get_entity(sender_id)
+                        username = getattr(full_sender, "username", None) or ""
+                    except Exception:
+                        pass
+                # 3) GetFullUserRequest по голому ID (может сработать, если
+                # кэш содержит хотя бы устаревший access_hash того же юзера)
+                if not username:
+                    try:
+                        full = await self.userbot(GetFullUserRequest(sender_id))
+                        if full.users:
+                            username = getattr(full.users[0], "username", None) or ""
+                    except Exception as e:
+                        log.debug(f"GetFullUserRequest({sender_id}): {e}")
 
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
@@ -1117,6 +1150,7 @@ _admin_pending:  dict[int, str] = {}
 _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
+_broadcast_draft: dict[int, dict] = {}  # uid -> {"text": str, "photo": Optional[str]}
 
 admin_router  = Router()
 client_router = Router()
@@ -1908,16 +1942,29 @@ async def admin_reject_pay_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_clients_list")
 async def admin_clients_list_cb(call: CallbackQuery):
+    await _show_clients_page(call, 0)
+
+@admin_router.callback_query(F.data.startswith("admin_clients_page:"))
+async def admin_clients_page_cb(call: CallbackQuery):
+    await _show_clients_page(call, int(call.data.split(":")[1]))
+
+async def _show_clients_page(call: CallbackQuery, page: int) -> None:
+    limit   = 30
     clients = _db.get_all_clients()
     now     = datetime.now().isoformat()
+    chunk   = clients[page*limit:(page+1)*limit]
     rows    = []
-    for c in clients[:30]:
+    for c in chunk:
         icon  = "💎" if (c.get("sub_until") or "") > now else "👤"
         uname = c.get("username")
         label = f"@{uname}" if uname else f"id:{c['tg_id']}"
         rows.append([(f"{icon} {label}", f"admin_client_detail:{c['id']}")])
+    nav = []
+    if page > 0: nav.append(("◀️", f"admin_clients_page:{page-1}"))
+    if (page+1)*limit < len(clients): nav.append(("▶️", f"admin_clients_page:{page+1}"))
+    if nav: rows.append(nav)
     rows.append([("◀️ Назад","admin_clients")])
-    await safe_edit(call, f"<b>📋 Клиенты ({len(clients)})</b>", mkb(rows))
+    await safe_edit(call, f"<b>📋 Клиенты ({len(clients)})</b>\nСтраница {page+1}", mkb(rows))
 
 @admin_router.callback_query(F.data.startswith("admin_client_detail:"))
 async def admin_client_detail_cb(call: CallbackQuery):
@@ -1996,10 +2043,59 @@ async def admin_give_sub_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_cb(call: CallbackQuery):
-    _admin_pending[call.from_user.id] = "broadcast"
+    _admin_pending[call.from_user.id] = "broadcast_text"
+    _broadcast_draft.pop(call.from_user.id, None)
     await safe_edit(call,
         "📤 <b>Рассылка всем активным клиентам</b>\n\nВведите текст:",
         kb_back("admin_clients"))
+
+@admin_router.callback_query(F.data == "admin_bcast_add_photo")
+async def admin_bcast_add_photo_cb(call: CallbackQuery):
+    if call.from_user.id not in _broadcast_draft:
+        await call.answer("Сессия истекла, начните заново", show_alert=True); return
+    _admin_pending[call.from_user.id] = "broadcast_photo"
+    await safe_edit(call, "📷 Пришлите фото:", kb_back("admin_clients"))
+
+@admin_router.callback_query(F.data == "admin_bcast_preview")
+async def admin_bcast_preview_cb(call: CallbackQuery):
+    await _show_broadcast_preview(call.bot, call.from_user.id)
+    await call.answer()
+
+async def _show_broadcast_preview(bot: Bot, uid: int) -> None:
+    draft = _broadcast_draft.get(uid)
+    if not draft: return
+    text  = draft["text"]; photo = draft.get("photo")
+    # Показываем ровно то же сообщение, которое получит клиент
+    if photo:
+        await bot.send_photo(uid, photo, caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+    await bot.send_message(uid,
+        "☝️ Именно так это увидит клиент. Отправляем всем активным клиентам?",
+        reply_markup=mkb([[("✅ Отправить всем","admin_bcast_send"), ("❌ Отмена","admin_bcast_cancel")]]))
+
+@admin_router.callback_query(F.data == "admin_bcast_send")
+async def admin_bcast_send_cb(call: CallbackQuery):
+    uid   = call.from_user.id
+    draft = _broadcast_draft.pop(uid, None)
+    if not draft:
+        await call.answer("Сессия истекла, начните заново", show_alert=True); return
+    text = draft["text"]; photo = draft.get("photo")
+    clients = _db.get_active_clients(); sent = 0
+    for cl in clients:
+        try:
+            if photo:
+                await call.bot.send_photo(cl["tg_id"], photo, caption=text, parse_mode=ParseMode.HTML)
+            else:
+                await call.bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
+            sent += 1; await asyncio.sleep(0.05)
+        except Exception as e: log.warning(f"Рассылка {cl['tg_id']}: {e}")
+    await safe_edit(call, f"✅ Рассылка завершена: <b>{sent}/{len(clients)}</b>", kb_back("admin_clients"))
+
+@admin_router.callback_query(F.data == "admin_bcast_cancel")
+async def admin_bcast_cancel_cb(call: CallbackQuery):
+    _broadcast_draft.pop(call.from_user.id, None)
+    await safe_edit(call, "❌ Рассылка отменена", kb_back("admin_clients"))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2329,6 +2425,13 @@ async def admin_photo_handler(msg: Message):
         _db.set_setting("broadcast_photo_file_id", file_id)
         await safe_answer(msg, "✅ Фото для рассылки сохранено", kb_back("admin_broadcast_settings"))
         return
+    if action == "broadcast_photo":
+        draft = _broadcast_draft.get(uid)
+        if not draft:
+            await safe_answer(msg, "Сессия истекла, начните заново", kb_back("admin_clients")); return
+        draft["photo"] = msg.photo[-1].file_id
+        await _show_broadcast_preview(msg.bot, uid)
+        return
     await safe_answer(msg, "Не понял, что делать с этим фото", kb_back("admin_main"))
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
@@ -2599,16 +2702,14 @@ async def admin_text_handler(msg: Message):
     # Блокировка теперь через кнопки admin_block_vac_confirm/admin_block_client_confirm — ввод текста не нужен
 
     # ── Рассылка ──────────────────────────────────────────────
-    if action == "broadcast":
-        clients = _db.get_active_clients(); sent = 0
-        for cl in clients:
-            try:
-                await msg.bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
-                sent += 1; await asyncio.sleep(0.05)
-            except Exception as e: log.warning(f"Рассылка {cl['tg_id']}: {e}")
+    if action == "broadcast_text":
+        _broadcast_draft[uid] = {"text": text, "photo": None}
         await safe_answer(msg,
-            f"✅ Рассылка завершена: <b>{sent}/{len(clients)}</b>",
-            kb_back("admin_clients"))
+            "Прикрепить фото к рассылке?",
+            mkb([
+                [("📷 Да, прикрепить фото","admin_bcast_add_photo")],
+                [("➡️ Без фото, дальше","admin_bcast_preview")],
+            ]))
         return
 
 
