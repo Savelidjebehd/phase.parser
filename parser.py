@@ -361,6 +361,12 @@ class Database:
         row = self._c().execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_client_by_username(self, username: str) -> Optional[dict]:
+        row = self._c().execute(
+            "SELECT * FROM clients WHERE username=? COLLATE NOCASE", (username.lstrip("@"),)
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_all_clients(self) -> list[dict]:
         return [dict(r) for r in self._c().execute("SELECT * FROM clients ORDER BY id DESC").fetchall()]
 
@@ -1628,7 +1634,10 @@ async def admin_monitoring_cb(call: CallbackQuery):
     except Exception:
         ub_ok = False
     ub_icon = "🟢 На связи" if ub_ok else "🔴 Не в сети!"
+    silent_min = int((time.time() - _last_event_at["ts"]) // 60)
+    flow_icon  = "🟢" if silent_min < 15 else "🔴"
     text   = (f"<b>🖥️ Мониторинг</b>\n\nСтатус: {icon}\nUserBot: {ub_icon}\n"
+              f"Поток сообщений: {flow_icon} последнее {silent_min} мин. назад\n"
               f"Источники отслеживаются: <b>{srcs}</b>\n"
               f"Антиспам от отправителя: не чаще 1 вакансии в <b>{cooldown} мин.</b>")
     markup = mkb([
@@ -1895,10 +1904,17 @@ async def admin_clients_cb(call: CallbackQuery):
     if pending:
         rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
     rows.append([("📋 Список (текстом)", "admin_clients_grouped"), ("⚙️ Управление", "admin_clients_list")])
-    rows.append([("➕ Выдать подписку", "admin_give_sub")])
+    rows.append([("➕ Выдать подписку", "admin_give_sub"), ("🔍 Найти клиента", "admin_find_client")])
     rows.append([("📤 Рассылка", "admin_broadcast")])
     rows.append([("◀️ Главное меню", "admin_main")])
     await safe_edit(call, "\n".join(lines), mkb(rows))
+
+@admin_router.callback_query(F.data == "admin_find_client")
+async def admin_find_client_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "find_client"
+    await safe_edit(call,
+        "🔍 <b>Поиск клиента</b>\n\nПришлите @юзернейм или Telegram ID:",
+        kb_back("admin_clients"))
 
 
 @admin_router.callback_query(F.data == "admin_pending_payments")
@@ -2031,11 +2047,9 @@ async def _show_clients_page(call: CallbackQuery, page: int) -> None:
     rows.append([("◀️ Назад","admin_clients")])
     await safe_edit(call, f"<b>📋 Клиенты ({len(clients)})</b>\nСтраница {page+1}", mkb(rows))
 
-@admin_router.callback_query(F.data.startswith("admin_client_detail:"))
-async def admin_client_detail_cb(call: CallbackQuery):
-    client_id = int(call.data.split(":")[1])
+def render_client_detail(client_id: int) -> Optional[tuple[str, InlineKeyboardMarkup]]:
     c = _db.get_client_by_id(client_id)
-    if not c: await call.answer("Не найден"); return
+    if not c: return None
     now    = datetime.now().isoformat()
     active = (c.get("sub_until") or "") > now
     icon   = "💎" if active else "👤"
@@ -2059,6 +2073,14 @@ async def admin_client_detail_cb(call: CallbackQuery):
          ("🚫 Заблокировать",  f"admin_block_client:{client_id}")],
         [("◀️ Назад","admin_clients_list")],
     ])
+    return text, markup
+
+@admin_router.callback_query(F.data.startswith("admin_client_detail:"))
+async def admin_client_detail_cb(call: CallbackQuery):
+    client_id = int(call.data.split(":")[1])
+    result = render_client_detail(client_id)
+    if not result: await call.answer("Не найден"); return
+    text, markup = result
     await safe_edit(call, text, markup)
 
 @admin_router.callback_query(F.data.startswith("admin_give_sub_client:"))
@@ -2562,6 +2584,22 @@ async def admin_text_handler(msg: Message):
         _db.set_setting("sender_cooldown_min", t)
         await safe_answer(msg, f"✅ Теперь не чаще 1 вакансии от отправителя в {t} мин.",
                           kb_back("admin_monitoring"))
+        return
+
+    # ── Поиск клиента по ID/юзернейму ────────────────────────────
+    if action == "find_client":
+        q = text.strip()
+        found = None
+        if q.lstrip("-").isdigit():
+            found = _db.get_client_by_tg(int(q))
+        if not found:
+            found = _db.get_client_by_username(q)
+        if not found:
+            await safe_answer(msg, f"❌ Клиент «{html.escape(q)}» не найден", kb_back("admin_clients"))
+            return
+        result = render_client_detail(found["id"])
+        detail_text, markup = result
+        await safe_answer(msg, detail_text, markup)
         return
 
     # ── Добавление источников (ссылки с новой строки) ─────────
@@ -3299,6 +3337,9 @@ async def client_text_handler(msg: Message):
 def _register_userbot(userbot: TelegramClient, pipeline: VacancyPipeline) -> None:
     @userbot.on(events.NewMessage())
     async def _handler(event):
+        _last_event_at["ts"] = time.time()  # фиксируем ДО любой фильтрации —
+        # нужно знать, что MTProto-сессия вообще получает апдейты от Telegram,
+        # даже если это сообщение потом отфильтруется по источнику/настройкам
         try:
             if _db.get_setting("monitoring_active","1") != "1": return
             srcs = _db.get_sources(active_only=True)
@@ -3377,6 +3418,53 @@ async def _check_userbot_health(bot: Bot) -> None:
                 except Exception: pass
         except Exception as e:
             log.error(f"_check_userbot_health: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# ПРОВЕРКА ПОТОКА СООБЩЕНИЙ (не только «жив ли коннект», а «идут ли апдейты»)
+# ═══════════════════════════════════════════════════════════════
+_last_event_at: dict = {"ts": time.time()}
+_message_flow_health = {"was_ok": True}
+
+async def _check_message_flow(bot: Bot) -> None:
+    """_check_userbot_health проверяет только is_connected()/is_user_authorized() —
+    оба могут быть True, даже когда MTProto-сессия «зависла» и реально перестала
+    получать апдейты от Telegram (известная особенность долгоживущих Telethon-сессий:
+    сокет формально жив, а обновления не идут). Эта проверка ловит именно такой
+    случай — по факту прихода событий, а не по статусу объекта клиента.
+    При обычном объёме источников (сообщения каждые несколько секунд) пауза
+    дольше STALL_MINUTES без единого апдейта — почти наверняка сбой, а не
+    настоящее затишье."""
+    STALL_MINUTES = 15
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if _db.get_setting("monitoring_active","1") != "1": continue
+            if not _db.get_sources(active_only=True): continue
+            silent_for = time.time() - _last_event_at["ts"]
+            ok     = silent_for < STALL_MINUTES * 60
+            was_ok = _message_flow_health["was_ok"]
+            if not ok and was_ok:
+                _message_flow_health["was_ok"] = False
+                minutes = int(silent_for // 60)
+                log.error(f"Поток сообщений остановился: {minutes} мин. без единого апдейта")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        f"🔴 <b>Юзербот не получает сообщения уже {minutes} мин.!</b>\n\n"
+                        f"Соединение формально активно, но апдейты от Telegram не приходят — "
+                        f"известная особенность долгоживущих MTProto-сессий. Мониторинг фактически стоит.\n\n"
+                        f"Обычно помогает перезапуск процесса бота.",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+            elif ok and not was_ok:
+                _message_flow_health["was_ok"] = True
+                log.info("Поток сообщений восстановился")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        "🟢 <b>Сообщения снова поступают</b> — мониторинг восстановлен.",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+        except Exception as e:
+            log.error(f"_check_message_flow: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # УВЕДОМЛЕНИЕ О КОНЦЕ ПОДПИСКИ (раз в неделю после окончания)
@@ -3584,6 +3672,7 @@ async def main() -> None:
         _send_expiry_reminders(bot),
         _scheduled_broadcast(bot),
         _check_userbot_health(bot),
+        _check_message_flow(bot),
         _safe_userbot_run(),
     )
 
