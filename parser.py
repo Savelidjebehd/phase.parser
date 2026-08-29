@@ -224,6 +224,12 @@ class Database:
         try: self._c().execute("ALTER TABLE vacancies ADD COLUMN html_text TEXT")
         except sqlite3.OperationalError: pass
         self._c().commit()
+        # Миграция: причина отсева ДО DeepSeek (чёрный список и т.п.) — чтобы
+        # можно было выгрузить и посмотреть, что именно отсеяло конкретное слово,
+        # вместо того чтобы терять текст вакансии безвозвратно
+        try: self._c().execute("ALTER TABLE vacancies ADD COLUMN block_reason TEXT")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
         if not self._c().execute("SELECT 1 FROM keywords WHERE type='soft_root' LIMIT 1").fetchone():
             for w in SOFT_ROOT_SEED:
@@ -431,13 +437,24 @@ class Database:
     def is_duplicate(self, text: str) -> bool:
         return bool(self._c().execute("SELECT id FROM vacancies WHERE text=?", (text,)).fetchone())
 
+    def set_block_reason(self, vid: int, reason: str) -> None:
+        """Помечает вакансию как отсеянную ДО DeepSeek (чёрным списком и т.п.),
+        сохраняя причину — suitable остаётся NULL (не «не прошла ИИ», а вообще
+        не дошла до ИИ), чтобы не путать со статистикой vacancies_failed."""
+        self._c().execute("UPDATE vacancies SET block_reason=? WHERE id=?", (reason, vid))
+        self._c().commit()
+
     def recent_vacancy_from_sender(self, author_id: int, minutes: int = 30) -> bool:
         """Есть ли уже вакансия от этого же отправителя за последние N минут —
-        не даём одному и тому же автору спамить повторными постами вакансии."""
+        не даём одному и тому же автору спамить повторными постами вакансии.
+        Не считаем записи, отсеянные чёрным списком (block_reason) — иначе
+        одно неудачное сообщение блокировало бы кулдауном совсем другой,
+        нормальный пост того же человека в течение получаса."""
         if not author_id: return False
         since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
         return bool(self._c().execute(
-            "SELECT id FROM vacancies WHERE author_id=? AND created_at >= ? LIMIT 1",
+            "SELECT id FROM vacancies WHERE author_id=? AND created_at >= ? "
+            "AND block_reason IS NULL LIMIT 1",
             (author_id, since)).fetchone())
 
     def update_vacancy_ds(self, vid: int, suitable: bool, reason: str,
@@ -1017,6 +1034,14 @@ class VacancyPipeline:
             if found_bl:
                 log.info(f"⛔ ЧС: {found_bl}")
                 self.db.add_log("INFO", f"⛔ Отсеяно чёрным списком: {found_bl}")
+                # Сохраняем текст, а не теряем его безвозвратно — чтобы потом
+                # можно было выгрузить и проверить, что именно отсеяло слово
+                blocked_v = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
+                                    author_username=username, author_id=sender_id,
+                                    source_title=source_title, message_link=message_link,
+                                    timestamp=datetime.now(), html_text=html_text)
+                bvid = self.db.save_vacancy(blocked_v)
+                if bvid: self.db.set_block_reason(bvid, f"чёрный список: {found_bl}")
                 return
 
             # Дозапрос username, только если он не пришёл сразу — сюда доходят уже
@@ -1151,6 +1176,7 @@ _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
 _broadcast_draft: dict[int, dict] = {}  # uid -> {"text": str, "photo": Optional[str]}
+_payment_drafts: dict[str, dict] = {}  # ticket -> детали платежа до подтверждения клиентом
 
 admin_router  = Router()
 client_router = Router()
@@ -1483,29 +1509,33 @@ async def admin_vac_export_do_cb(call: CallbackQuery):
         await call.answer("За этот период вакансий нет", show_alert=True); return
 
     lines = []
-    ok_count = fail_count = 0
+    ok_count = fail_count = blocked_count = 0
     for r in rows:
         v = dict(r)
-        suitable = v.get("suitable")
+        suitable     = v.get("suitable")
+        block_reason = v.get("block_reason")
         if suitable == 1:
             status = "✅ ПРОШЛА"; ok_count += 1
         elif suitable == 0:
-            status = "❌ НЕ ПРОШЛА"; fail_count += 1
+            status = "❌ НЕ ПРОШЛА ИИ"; fail_count += 1
+        elif block_reason:
+            status = f"🚫 ОТСЕЯНО ДО ИИ ({block_reason})"; blocked_count += 1
         else:
             status = "⏳ НЕ ОБРАБОТАНА"
         lines.append(
             f"=== #{v['id']} | {status} | {v.get('created_at','')} ===\n"
             f"Источник: {v.get('source_title','')}\n"
-            f"Причина: {v.get('ds_reason','') or '—'}\n"
+            f"Причина: {v.get('ds_reason','') or block_reason or '—'}\n"
             f"Контакт: {v.get('ds_contact','') or '—'}\n"
             f"Ссылка: {v.get('message_link','') or '—'}\n"
             f"Текст:\n{v.get('text','')}\n"
         )
-    header = f"Экспорт вакансий phase.parser | период: {period_label} | всего: {len(rows)} (прошло: {ok_count}, не прошло: {fail_count})\n\n"
+    header = (f"Экспорт вакансий phase.parser | период: {period_label} | всего: {len(rows)} "
+              f"(прошло: {ok_count}, не прошло ИИ: {fail_count}, отсеяно до ИИ: {blocked_count})\n\n")
     content = header + ("\n" + "-"*60 + "\n\n").join(lines)
 
     file = BufferedInputFile(content.encode("utf-8"), filename=f"vacancies_{period_label}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
-    await call.message.answer_document(file, caption=f"📤 {len(rows)} вакансий за период «{period_label}» (✅{ok_count} / ❌{fail_count})")
+    await call.message.answer_document(file, caption=f"📤 {len(rows)} вакансий за период «{period_label}» (✅{ok_count} / ❌{fail_count} / 🚫{blocked_count})")
     await call.answer()
 
 @admin_router.callback_query(F.data.startswith("admin_vac_view:"))
@@ -1864,7 +1894,7 @@ async def admin_clients_cb(call: CallbackQuery):
     rows = []
     if pending:
         rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
-    rows.append([("📋 Все клиенты", "admin_clients_list")])
+    rows.append([("📋 Список (текстом)", "admin_clients_grouped"), ("⚙️ Управление", "admin_clients_list")])
     rows.append([("➕ Выдать подписку", "admin_give_sub")])
     rows.append([("📤 Рассылка", "admin_broadcast")])
     rows.append([("◀️ Главное меню", "admin_main")])
@@ -1939,6 +1969,41 @@ async def admin_reject_pay_cb(call: CallbackQuery):
     await call.answer("Отклонено")
     await safe_edit(call, f"❌ Платёж <code>{ticket}</code> отклонён", kb_back("admin_clients"))
 
+
+@admin_router.callback_query(F.data == "admin_clients_grouped")
+async def admin_clients_grouped_cb(call: CallbackQuery):
+    clients = _db.get_all_clients()
+    now     = datetime.now().isoformat()
+    with_sub, without_sub = [], []
+    for c in clients:
+        if c.get("username"):
+            label = f"@{c['username']}"
+        else:
+            link = f"tg://user?id={c['tg_id']}"
+            label = f"<a href='{link}'>{link}</a>"
+        (with_sub if (c.get("sub_until") or "") > now else without_sub).append(label)
+
+    def build_block(title: str, items: list[str], budget: int) -> tuple[str, int]:
+        """Возвращает (текст блока, сколько символов израсходовано). Обрезаем
+        по границе целых строк — никогда не разрываем HTML-тег посередине,
+        иначе Telegram откажется парсить сообщение целиком."""
+        header = f"<b>{title} ({len(items)})</b>\n"
+        used   = len(header)
+        lines  = []
+        for item in items:
+            if used + len(item) + 1 > budget:
+                lines.append(f"<i>...и ещё {len(items) - len(lines)}</i>")
+                break
+            lines.append(item); used += len(item) + 1
+        body = "\n".join(lines) if lines else "<i>пусто</i>"
+        return header + body, used
+
+    budget = 3800  # с запасом от лимита в 4096
+    sub_block, used1   = build_block(f"С подпиской", with_sub, budget // 2)
+    free_block, used2  = build_block(f"Без подписки", without_sub, budget - used1)
+
+    text = f"<b>👥 Все клиенты ({len(clients)})</b>\n\n{sub_block}\n\n{free_block}"
+    await safe_edit(call, text, kb_back("admin_clients"))
 
 @admin_router.callback_query(F.data == "admin_clients_list")
 async def admin_clients_list_cb(call: CallbackQuery):
@@ -2923,7 +2988,11 @@ async def client_buy_cb(call: CallbackQuery):
     cl      = _db.get_or_create_client(uid, call.from_user.username)
     has_paid = bool(cl.get("first_payment"))
     amount  = p["full"] if has_paid else p["sale"]
-    ticket  = _db.create_payment(cl["id"], tariff, amount, p["days"], method="rub")
+    ticket  = f"DRAFT-{int(time.time()*1000)}"
+    _payment_drafts[ticket] = {"client_id": cl["id"], "tariff": tariff, "amount": amount,
+                              "days": p["days"], "method": "rub"}
+    log.info(f"Черновик оплаты создан: {ticket} (клиент {uid}, тариф {tariff}) — в БД пока не пишем, "
+             f"пока клиент не нажмёт «Оплатил(а)»")
     fire    = "" if has_paid else "🔥"
     uname_hint = f"@{call.from_user.username}" if call.from_user.username else f"<code>{uid}</code>"
     text    = (
@@ -2957,8 +3026,11 @@ async def client_buy_crypto_cb(call: CallbackQuery):
         await call.answer("Не удалось получить курс, попробуйте ещё раз через минуту", show_alert=True)
         return
     usdt_amount = round(amount / rate, 2)
-    ticket = _db.create_payment(cl["id"], tariff, amount, p["days"],
-                                method="usdt", crypto_amount=usdt_amount, crypto_rate=rate)
+    ticket = f"DRAFT-{int(time.time()*1000)}"
+    _payment_drafts[ticket] = {"client_id": cl["id"], "tariff": tariff, "amount": amount,
+                              "days": p["days"], "method": "usdt",
+                              "crypto_amount": usdt_amount, "crypto_rate": rate}
+    log.info(f"Черновик оплаты создан: {ticket} (клиент {uid}, тариф {tariff}, USDT) — в БД пока не пишем")
     fire = "" if has_paid else "🔥"
     text = (
         f"Тариф <b>{p['label']}</b>\n\n"
@@ -2977,9 +3049,17 @@ async def client_buy_crypto_cb(call: CallbackQuery):
 
 @client_router.callback_query(F.data.startswith("client_paid:"))
 async def client_paid_cb(call: CallbackQuery):
-    ticket = call.data.split(":", 1)[1]
-    p      = _db.get_payment_by_ticket(ticket)
-    if not p: await call.answer("Тикет не найден"); return
+    draft_ticket = call.data.split(":", 1)[1]
+    draft = _payment_drafts.pop(draft_ticket, None)
+    if not draft:
+        await call.answer("Сессия истекла, выберите тариф заново", show_alert=True)
+        return
+    # Запись в БД (и, соответственно, индикатор 🔴 у админа) появляется
+    # ИМЕННО ТЕПЕРЬ — по факту подтверждения клиентом, а не при выборе тарифа
+    ticket = _db.create_payment(draft["client_id"], draft["tariff"], draft["amount"], draft["days"],
+                                method=draft["method"], crypto_amount=draft.get("crypto_amount"),
+                                crypto_rate=draft.get("crypto_rate"))
+    p = _db.get_payment_by_ticket(ticket)
     text = (
         f"⏳ <b>Проверка оплаты...</b>\n\n"
         f"Оплата проверяется вручную\n"
@@ -2991,7 +3071,8 @@ async def client_paid_cb(call: CallbackQuery):
         [("◀️ Главное меню","client_main")],
     ])
     await safe_edit(call, text, markup)
-    # Уведомление админу
+    # Уведомление админу — отправляется ИСКЛЮЧИТЕЛЬНО здесь, по нажатию «Оплатил(а)»
+    log.info(f"Клиент нажал «Оплатил(а)», создан тикет {ticket} — уведомляю админа")
     if p.get("method") == "usdt":
         pay_line = (f"Тариф: {p['tariff']} | Сумма: <b>{p['crypto_amount']} USDT</b> "
                     f"(курс {p['crypto_rate']}₽, ≈{p['amount']}₽)\n"
