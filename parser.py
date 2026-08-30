@@ -1198,6 +1198,7 @@ _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
 _broadcast_draft: dict[int, dict] = {}  # uid -> {"text": str, "photo": Optional[str]}
+_give_sub_all_draft: dict[int, dict] = {}  # uid -> {"days": int, "comment": str}
 _payment_drafts: dict[str, dict] = {}  # ticket -> детали платежа до подтверждения клиентом
 
 admin_router  = Router()
@@ -1921,6 +1922,7 @@ async def admin_clients_cb(call: CallbackQuery):
         rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
     rows.append([("📋 Список (текстом)", "admin_clients_grouped"), ("⚙️ Управление", "admin_clients_list")])
     rows.append([("➕ Выдать подписку", "admin_give_sub"), ("🔍 Найти клиента", "admin_find_client")])
+    rows.append([("🎁 Выдать подписку всем", "admin_give_sub_all")])
     rows.append([("📤 Рассылка", "admin_broadcast")])
     rows.append([("◀️ Главное меню", "admin_main")])
     await safe_edit(call, "\n".join(lines), mkb(rows))
@@ -2142,6 +2144,58 @@ async def admin_give_sub_cb(call: CallbackQuery):
         "➕ <b>Выдача подписки</b>\n\nВведите: <code>TG_ID количество_дней</code>\n"
         "Пример: <code>123456789 30</code>",
         kb_back("admin_clients"))
+
+@admin_router.callback_query(F.data == "admin_give_sub_all")
+async def admin_give_sub_all_cb(call: CallbackQuery):
+    uid = call.from_user.id
+    _give_sub_all_draft.pop(uid, None)
+    _admin_pending[uid] = "give_sub_all_days"
+    total = len(_db.get_all_clients())
+    await safe_edit(call,
+        f"🎁 <b>Выдать подписку всем клиентам ({total} чел.)</b>\n\nНа сколько дней продлить каждому?",
+        kb_back("admin_clients"))
+
+async def _show_give_sub_all_preview(bot: Bot, uid: int) -> None:
+    draft = _give_sub_all_draft.get(uid)
+    if not draft: return
+    days    = draft["days"]
+    comment = draft.get("comment", "")
+    fake_until = fmt_date((datetime.now() + timedelta(days=days)).isoformat())
+    text = f"🎁 Вам начислено <b>+{days} дн.</b> к подписке!\nАктивна до: <b>{fake_until}</b>"
+    if comment:
+        text += f"\n\n{comment}"
+    total = len(_db.get_all_clients())
+    await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+    await bot.send_message(uid,
+        f"☝️ Именно так это увидит каждый клиент (дата у каждого будет своя, "
+        f"в зависимости от текущей подписки). Выдать <b>{total}</b> клиентам?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=mkb([[("✅ Выдать всем","admin_give_sub_all_send"), ("❌ Отмена","admin_give_sub_all_cancel")]]))
+
+@admin_router.callback_query(F.data == "admin_give_sub_all_send")
+async def admin_give_sub_all_send_cb(call: CallbackQuery):
+    uid   = call.from_user.id
+    draft = _give_sub_all_draft.pop(uid, None)
+    if not draft:
+        await call.answer("Сессия истекла, начните заново", show_alert=True); return
+    days    = draft["days"]; comment = draft.get("comment","")
+    clients = _db.get_all_clients()
+    ok = 0
+    for c in clients:
+        try:
+            until = _db.extend_subscription(c["id"], days)
+            text  = f"🎁 Вам начислено <b>+{days} дн.</b> к подписке!\nАктивна до: <b>{fmt_date(until.isoformat())}</b>"
+            if comment: text += f"\n\n{comment}"
+            await call.bot.send_message(c["tg_id"], text, parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
+            ok += 1; await asyncio.sleep(0.05)
+        except Exception as e:
+            log.warning(f"Выдача подписки всем {c.get('tg_id')}: {e}")
+    await safe_edit(call, f"✅ Подписка выдана: <b>{ok}/{len(clients)}</b> клиентам (+{days} дн.)", kb_back("admin_clients"))
+
+@admin_router.callback_query(F.data == "admin_give_sub_all_cancel")
+async def admin_give_sub_all_cancel_cb(call: CallbackQuery):
+    _give_sub_all_draft.pop(call.from_user.id, None)
+    await safe_edit(call, "❌ Отменено", kb_back("admin_clients"))
 
 
 @admin_router.callback_query(F.data == "admin_broadcast")
@@ -2822,6 +2876,26 @@ async def admin_text_handler(msg: Message):
         return
 
     # Блокировка теперь через кнопки admin_block_vac_confirm/admin_block_client_confirm — ввод текста не нужен
+
+    # ── Выдача подписки всем: шаг 1 — дни ────────────────────
+    if action == "give_sub_all_days":
+        if not text.strip().isdigit() or int(text.strip()) <= 0:
+            await safe_answer(msg, "❌ Введите положительное число дней")
+            _admin_pending[uid] = "give_sub_all_days"; return
+        _give_sub_all_draft[uid] = {"days": int(text.strip())}
+        _admin_pending[uid] = "give_sub_all_comment"
+        await safe_answer(msg,
+            "💬 Прикрепить комментарий к уведомлению? Пришлите текст, или отправьте <code>-</code> чтобы без комментария:")
+        return
+
+    # ── Выдача подписки всем: шаг 2 — комментарий → предпросмотр ──
+    if action == "give_sub_all_comment":
+        draft = _give_sub_all_draft.get(uid)
+        if not draft:
+            await safe_answer(msg, "Сессия истекла, начните заново", kb_back("admin_clients")); return
+        draft["comment"] = "" if text.strip() == "-" else text.strip()
+        await _show_give_sub_all_preview(msg.bot, uid)
+        return
 
     # ── Рассылка ──────────────────────────────────────────────
     if action == "broadcast_text":
