@@ -730,10 +730,26 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         if _pipeline: await notify_admin_error(_pipeline.bot, "DeepSeek", e)
         return _DS_FAIL
 
+_ds_status_cache: dict = {"value": None, "ts": 0.0}
+DS_STATUS_CACHE_TTL = 120  # секунд
+
 async def check_deepseek_status() -> str:
     """
     Возвращает: 'ok', 'no_key', 'wrong_model', 'error:<msg>'
+    Кэшируется на DS_STATUS_CACHE_TTL секунд — без кэша каждое открытие
+    главного меню админа (и раздела ИИ) делало живой платный запрос к DeepSeek
+    просто ради иконки статуса, при частой навигации это накручивало лишние
+    вызовы API и шумело в логах, не имея отношения к реальной проверке вакансий.
     """
+    now = time.time()
+    if _ds_status_cache["value"] and (now - _ds_status_cache["ts"]) < DS_STATUS_CACHE_TTL:
+        return _ds_status_cache["value"]
+    result = await _fetch_deepseek_status()
+    _ds_status_cache["value"] = result
+    _ds_status_cache["ts"] = now
+    return result
+
+async def _fetch_deepseek_status() -> str:
     if not DEEPSEEK_KEY:
         log.warning("DeepSeek: DEEPSEEK_API_KEY не задан в .env")
         return "no_key"
@@ -2204,6 +2220,9 @@ async def admin_logs_cb(call: CallbackQuery):
 async def admin_logs_export_cb(call: CallbackQuery):
     date = call.data.split(":")[1]
     data = _db.export_logs(date)
+    if not data:
+        await call.answer(f"За {date} логов нет (пусто)", show_alert=True)
+        return
     await call.message.answer_document(
         BufferedInputFile(data, filename=f"logs_{date}.txt"),
         caption=f"📜 Логи за {date}")
