@@ -3423,14 +3423,16 @@ async def _check_userbot_health(bot: Bot) -> None:
 # ПРОВЕРКА ПОТОКА СООБЩЕНИЙ (не только «жив ли коннект», а «идут ли апдейты»)
 # ═══════════════════════════════════════════════════════════════
 _last_event_at: dict = {"ts": time.time()}
-_message_flow_health = {"was_ok": True}
+_message_flow_health = {"was_ok": True, "notified": False}
 
 async def _check_message_flow(bot: Bot) -> None:
     """_check_userbot_health проверяет только is_connected()/is_user_authorized() —
     оба могут быть True, даже когда MTProto-сессия «зависла» и реально перестала
     получать апдейты от Telegram (известная особенность долгоживущих Telethon-сессий:
     сокет формально жив, а обновления не идут). Эта проверка ловит именно такой
-    случай — по факту прихода событий, а не по статусу объекта клиента.
+    случай — по факту прихода событий, а не по статусу объекта клиента, и сама
+    пытается переподключить ТОТ ЖЕ САМЫЙ юзербот (disconnect+connect), без создания
+    второго аккаунта — обычно это чинит зависшую сессию за секунды.
     При обычном объёме источников (сообщения каждые несколько секунд) пауза
     дольше STALL_MINUTES без единого апдейта — почти наверняка сбой, а не
     настоящее затишье."""
@@ -3441,27 +3443,59 @@ async def _check_message_flow(bot: Bot) -> None:
             if _db.get_setting("monitoring_active","1") != "1": continue
             if not _db.get_sources(active_only=True): continue
             silent_for = time.time() - _last_event_at["ts"]
-            ok     = silent_for < STALL_MINUTES * 60
-            was_ok = _message_flow_health["was_ok"]
-            if not ok and was_ok:
-                _message_flow_health["was_ok"] = False
-                minutes = int(silent_for // 60)
-                log.error(f"Поток сообщений остановился: {minutes} мин. без единого апдейта")
+            ok = silent_for < STALL_MINUTES * 60
+
+            if ok:
+                if not _message_flow_health["was_ok"]:
+                    _message_flow_health["was_ok"]  = True
+                    _message_flow_health["notified"] = False
+                    log.info("Поток сообщений восстановился")
+                    try:
+                        await bot.send_message(ADMIN_ID,
+                            "🟢 <b>Сообщения снова поступают</b> — мониторинг восстановлен.",
+                            parse_mode=ParseMode.HTML)
+                    except Exception: pass
+                continue
+
+            # Тишина дольше STALL_MINUTES — пробуем переподключить юзербота.
+            # Делаем это на КАЖДОМ цикле проверки, пока не восстановится (не
+            # только один раз при первом обнаружении) — если первая попытка
+            # не помогла, вторая через 5 минут вполне может.
+            _message_flow_health["was_ok"] = False
+            minutes = int(silent_for // 60)
+            log.error(f"Поток сообщений остановился: {minutes} мин. — пробую переподключить UserBot")
+            reconnect_ok = False
+            if _userbot is not None:
                 try:
-                    await bot.send_message(ADMIN_ID,
-                        f"🔴 <b>Юзербот не получает сообщения уже {minutes} мин.!</b>\n\n"
-                        f"Соединение формально активно, но апдейты от Telegram не приходят — "
-                        f"известная особенность долгоживущих MTProto-сессий. Мониторинг фактически стоит.\n\n"
-                        f"Обычно помогает перезапуск процесса бота.",
-                        parse_mode=ParseMode.HTML)
-                except Exception: pass
-            elif ok and not was_ok:
-                _message_flow_health["was_ok"] = True
-                log.info("Поток сообщений восстановился")
+                    await _userbot.disconnect()
+                    await asyncio.sleep(2)
+                    await _userbot.connect()
+                    reconnect_ok = await _userbot.is_user_authorized()
+                    if reconnect_ok:
+                        log.info("UserBot переподключен автоматически")
+                except Exception as e:
+                    log.error(f"Переподключение UserBot не удалось: {e}")
+
+            # Уведомляем только один раз за весь простой — иначе спам каждые 5 минут
+            if not _message_flow_health["notified"]:
+                _message_flow_health["notified"] = True
                 try:
-                    await bot.send_message(ADMIN_ID,
-                        "🟢 <b>Сообщения снова поступают</b> — мониторинг восстановлен.",
-                        parse_mode=ParseMode.HTML)
+                    if reconnect_ok:
+                        await bot.send_message(ADMIN_ID,
+                            f"🔄 <b>UserBot завис на {minutes} мин. — переподключил автоматически.</b>\n\n"
+                            f"Если сообщения не появятся в течение 15-20 минут — буду пробовать ещё, "
+                            f"но возможно аккаунт ограничен/забанен Telegram, тогда переподключение "
+                            f"не поможет, нужно проверить аккаунт вручную.",
+                            parse_mode=ParseMode.HTML)
+                    else:
+                        await bot.send_message(ADMIN_ID,
+                            f"🔴 <b>UserBot не получает сообщения уже {minutes} мин., "
+                            f"автопереподключение не удалось!</b>\n\n"
+                            f"Похоже на бан/ограничение аккаунта в Telegram, а не на обычное "
+                            f"зависание сессии. Буду пробовать переподключить каждые 5 минут, "
+                            f"но стоит проверить аккаунт вручную (переавторизация в боте либо "
+                            f"в официальном приложении Telegram).",
+                            parse_mode=ParseMode.HTML)
                 except Exception: pass
         except Exception as e:
             log.error(f"_check_message_flow: {e}")
@@ -3638,11 +3672,22 @@ async def main() -> None:
 
     log.info("Запуск задач...")
     async def _safe_userbot_run():
-        """Перезапускает userbot при TypeNotFoundError вместо падения."""
+        """Перезапускает userbot при TypeNotFoundError вместо падения.
+        Также штатно переживает намеренные disconnect()/connect() от
+        _check_message_flow (авто-переподключение зависшей сессии) — раньше
+        такой принудительный disconnect() заставлял run_until_disconnected()
+        завершиться «нормально», после чего этот цикл выходил насовсем (break)
+        и переставал следить за клиентом вообще. Теперь после любого
+        завершения run_until_disconnected() просто проверяем: если клиент
+        всё ещё должен работать (снова подключён кем-то другим или мониторинг
+        включён) — ждём и заходим в него заново, а не завершаем задачу."""
         while True:
             try:
                 await _userbot.run_until_disconnected()
-                break  # нормальное завершение
+                if _db.get_setting("monitoring_active","1") != "1":
+                    break  # мониторинг реально выключен — можно выйти
+                await asyncio.sleep(3)
+                continue  # клиента, скорее всего, переподключили — ждём заново
             except Exception as e:
                 if "TypeNotFoundError" in type(e).__name__ or "Constructor ID" in str(e):
                     log.warning(
