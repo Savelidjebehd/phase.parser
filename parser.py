@@ -2795,7 +2795,7 @@ async def admin_text_handler(msg: Message):
     # ── Тексты сообщений клиентам ──────────────────────────────
     if action.startswith("edit_msg_text:"):
         key = action.split(":",1)[1]
-        _db.set_setting(key, text)
+        _db.set_setting(key, msg.html_text)
         await safe_answer(msg, "✅ Текст обновлён", kb_back(f"admin_msg_view:{key}"))
         return
 
@@ -2893,13 +2893,13 @@ async def admin_text_handler(msg: Message):
         draft = _give_sub_all_draft.get(uid)
         if not draft:
             await safe_answer(msg, "Сессия истекла, начните заново", kb_back("admin_clients")); return
-        draft["comment"] = "" if text.strip() == "-" else text.strip()
+        draft["comment"] = "" if text.strip() == "-" else msg.html_text
         await _show_give_sub_all_preview(msg.bot, uid)
         return
 
     # ── Рассылка ──────────────────────────────────────────────
     if action == "broadcast_text":
-        _broadcast_draft[uid] = {"text": text, "photo": None}
+        _broadcast_draft[uid] = {"text": msg.html_text, "photo": None}
         await safe_answer(msg,
             "Прикрепить фото к рассылке?",
             mkb([
