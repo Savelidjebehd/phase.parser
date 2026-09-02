@@ -1114,9 +1114,13 @@ class VacancyPipeline:
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
-            # DeepSeek
+            # DeepSeek — если ИИ выключен или недоступен, вакансия НЕ уходит
+            # клиенту ни при каких условиях (отказ по умолчанию, а не одобрение
+            # по умолчанию) — раньше выключенный ИИ автоматически одобрял любое
+            # совпадение по ключевым словам без единой проверки, из-за чего
+            # клиентам доходил откровенный мусор.
             if self.db.get_setting("ai_active","1") != "1":
-                ds = DeepSeekResult(suitable=True, reason="AI выключен", contact=f"@{username}")
+                ds = DeepSeekResult(suitable=False, reason="ИИ выключен — не проверено", contact="")
             else:
                 ds = await call_deepseek(text, username, self.db)
 
