@@ -1143,6 +1143,36 @@ class VacancyPipeline:
         await self._notify_admin_new_vacancy(vacancy, ds, vid)
         await self._broadcast(vacancy, ds, vid)
 
+    async def recheck_skipped_vacancies(self) -> int:
+        """Когда ИИ снова заработал (после отключения/сбоя) — дозапускает
+        проверку по всем вакансиям, которые совпали по ключевым/стоп-словам,
+        но не были проверены, пока ИИ был выключен/недоступен (см. отметку
+        'ИИ выключен — не проверено' в _process). Возвращает число обработанных."""
+        rows = self.db._c().execute(
+            "SELECT * FROM vacancies WHERE ds_reason = ? ORDER BY id",
+            ("ИИ выключен — не проверено",)).fetchall()
+        if not rows: return 0
+        log.info(f"Довыполняю ИИ-проверку для {len(rows)} пропущенных вакансий")
+        for row in rows:
+            v = dict(row)
+            try:
+                ds = await call_deepseek(v["text"], v.get("author_username") or "", self.db)
+                self.db.update_vacancy_ds(v["id"], ds.suitable, ds.reason, ds.contact)
+                if ds.suitable:
+                    self.db.stat_inc("vacancies_found")
+                    vacancy = Vacancy(
+                        chat_id=v["chat_id"], message_id=v["message_id"], text=v["text"],
+                        author_username=v.get("author_username") or "", author_id=v.get("author_id") or 0,
+                        source_title=v.get("source_title") or "", message_link=v.get("message_link") or "",
+                        timestamp=datetime.now(), html_text=v.get("html_text") or "")
+                    await self._handle_suitable(vacancy, ds, v["id"])
+                else:
+                    self.db.stat_inc("vacancies_failed")
+            except Exception as e:
+                log.error(f"Довыполнение проверки вакансии #{v['id']}: {e}")
+            await asyncio.sleep(1)  # не долбим DeepSeek пачкой разом
+        return len(rows)
+
     async def _broadcast(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
         if self.db.get_setting("client_bot_active","1") != "1": return
         clients = self.db.get_active_clients()
@@ -1657,8 +1687,10 @@ async def admin_monitoring_cb(call: CallbackQuery):
     ub_icon = "🟢 На связи" if ub_ok else "🔴 Не в сети!"
     silent_min = int((time.time() - _last_event_at["ts"]) // 60)
     flow_icon  = "🟢" if silent_min < 15 else "🔴"
+    ai_icon    = "🟢 Работает" if _ai_health["was_ok"] else "🔴 Не работает!"
     text   = (f"<b>🖥️ Мониторинг</b>\n\nСтатус: {icon}\nUserBot: {ub_icon}\n"
               f"Поток сообщений: {flow_icon} последнее {silent_min} мин. назад\n"
+              f"ИИ-проверка: {ai_icon}\n"
               f"Источники отслеживаются: <b>{srcs}</b>\n"
               f"Антиспам от отправителя: не чаще 1 вакансии в <b>{cooldown} мин.</b>")
     markup = mkb([
@@ -3598,6 +3630,57 @@ async def _check_message_flow(bot: Bot) -> None:
             log.error(f"_check_message_flow: {e}")
 
 # ═══════════════════════════════════════════════════════════════
+# ПРОВЕРКА ЗДОРОВЬЯ ИИ-ПРОВЕРКИ ВАКАНСИЙ
+# ═══════════════════════════════════════════════════════════════
+_ai_health = {"was_ok": True}
+
+async def _check_ai_health(bot: Bot) -> None:
+    """Проверяет каждые 5 минут, включён ли ИИ и доступен ли DeepSeek. Пока
+    ИИ не работает, вакансии не одобряются автоматически (отказ по умолчанию —
+    см. _process), а просто копятся с отметкой 'ИИ выключен — не проверено'.
+    Как только ИИ снова заработал — автоматически довыполняет проверку по всем
+    накопленным пропущенным вакансиям через pipeline.recheck_skipped_vacancies()."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            ai_on  = _db.get_setting("ai_active","1") == "1"
+            status = await check_deepseek_status() if ai_on else "disabled"
+            ok     = ai_on and status == "ok"
+            was_ok = _ai_health["was_ok"]
+
+            if not ok and was_ok:
+                _ai_health["was_ok"] = False
+                reason = "выключен вручную (⚙️ Настройки)" if not ai_on else f"DeepSeek недоступен ({status})"
+                log.error(f"ИИ-проверка не работает: {reason}")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        f"🔴 <b>ИИ-проверка вакансий не работает!</b>\n\nПричина: {reason}\n\n"
+                        f"Вакансии, совпавшие по ключевым словам, сейчас никому не отправляются "
+                        f"(отказ по умолчанию, не одобрение) — как только почините, я автоматически "
+                        f"довыполню проверку по всем пропущенным за это время.",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+
+            elif ok and not was_ok:
+                _ai_health["was_ok"] = True
+                log.info("ИИ-проверка снова работает — довыполняю пропущенные вакансии")
+                try:
+                    await bot.send_message(ADMIN_ID,
+                        "🟢 <b>ИИ-проверка снова работает</b> — довыполняю проверку пропущенных вакансий...",
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
+                if _pipeline:
+                    n = await _pipeline.recheck_skipped_vacancies()
+                    if n:
+                        try:
+                            await bot.send_message(ADMIN_ID,
+                                f"✅ Довыполнено: <b>{n}</b> пропущенных вакансий проверено.",
+                                parse_mode=ParseMode.HTML)
+                        except Exception: pass
+        except Exception as e:
+            log.error(f"_check_ai_health: {e}")
+
+# ═══════════════════════════════════════════════════════════════
 # УВЕДОМЛЕНИЕ О КОНЦЕ ПОДПИСКИ (раз в неделю после окончания)
 # ═══════════════════════════════════════════════════════════════
 async def _check_expired_subs(bot: Bot) -> None:
@@ -3815,6 +3898,7 @@ async def main() -> None:
         _scheduled_broadcast(bot),
         _check_userbot_health(bot),
         _check_message_flow(bot),
+        _check_ai_health(bot),
         _safe_userbot_run(),
     )
 
