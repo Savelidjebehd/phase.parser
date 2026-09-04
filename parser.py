@@ -376,6 +376,13 @@ class Database:
             "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND search_active=1",
             (now,)).fetchall()]
 
+    def get_search_active_clients(self) -> list[dict]:
+        """Все клиенты с включённым поиском (search_active=1) — и с подпиской,
+        и без неё. Используется для рассылки вакансий бесплатным клиентам
+        (с урезанным контактом) вместе с платными (с полным контактом)."""
+        return [dict(r) for r in self._c().execute(
+            "SELECT * FROM clients WHERE search_active=1").fetchall()]
+
     def set_subscription(self, client_id: int, until: datetime, is_payment: bool = False) -> None:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
         if is_payment:
@@ -894,31 +901,60 @@ def kb_client_main() -> InlineKeyboardMarkup:
         [("⚙️ Настройки","client_settings")],
     ])
 
-def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str) -> tuple[str, InlineKeyboardMarkup]:
+_MENTION_RE = re.compile(r'(?<!\w)@\w{4,32}')
+
+def censor_mentions(text: str) -> str:
+    """Заменяет любые упоминания вида @username на прочерк — используется
+    в тексте вакансии для клиентов без подписки."""
+    return _MENTION_RE.sub("—", text)
+
+def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
+                          subscribed: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
     (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
-    вызывающий код отвечает за то, что это безопасный HTML или escape-плейн."""
+    вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
+
+    subscribed=False — версия для клиентов без подписки: любой контакт
+    (юзернейм в тексте вакансии, строка "Автор:", ссылка на профиль без
+    юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
+    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?"."""
     contact = contact or ""
+    if not subscribed:
+        v_html = censor_mentions(v_html)
+
     if contact.lower().endswith("bot"):
         # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
         # от своего имени) — писать ему по вакансии бессмысленно, строку об
         # авторе просто не показываем вообще (не пишем даже плейсхолдер)
         author_line = ""
     elif contact.startswith("@"):
-        author_line = f"\n\nАвтор: {html.escape(contact)}"
+        author_line = f"\n\nАвтор: {'—' if not subscribed else html.escape(contact)}"
     elif author_id:
-        # У автора нет юзернейма — tg://user?id= открывает профиль напрямую,
-        # но работает ТОЛЬКО в десктопном приложении Telegram
-        link = f"tg://user?id={author_id}"
-        author_line = (
-            f"\n\nАвтор: <a href='{link}'>{link}</a>\n"
-            f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
-            f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
-        )
+        if not subscribed:
+            # Ссылка tg://user?id= — рабочий способ написать автору напрямую,
+            # без подписки её показывать нельзя точно так же, как юзернейм
+            author_line = "\n\nАвтор: —"
+        else:
+            # У автора нет юзернейма — tg://user?id= открывает профиль напрямую,
+            # но работает ТОЛЬКО в десктопном приложении Telegram
+            link = f"tg://user?id={author_id}"
+            author_line = (
+                f"\n\nАвтор: <a href='{link}'>{link}</a>\n"
+                f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
+                f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
+            )
     else:
         author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
+
     msg_text = f"📢 <b>Новая вакансия</b>\n\n{v_html}{author_line}"
-    markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
+
+    if subscribed:
+        markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
+    else:
+        # Без подписки кнопку-переход не даём — по ней видно настоящий
+        # контакт в канале-источнике, это как раз то, что должна закрывать
+        # подписка. Вместо неё — кнопка с объяснением и тарифами.
+        markup = mkb([[("Как откликнуться?", "client_how_reply")]])
     return msg_text, markup
 
 def render_vacancy_admin(v: dict, back_to: Optional[str] = None) -> tuple[str, InlineKeyboardMarkup]:
@@ -1175,7 +1211,11 @@ class VacancyPipeline:
 
     async def _broadcast(self, vacancy: Vacancy, ds: DeepSeekResult, vid: int) -> None:
         if self.db.get_setting("client_bot_active","1") != "1": return
-        clients = self.db.get_active_clients()
+        # Рассылаем ВСЕМ клиентам с включённым поиском — и подписчикам, и без
+        # подписки. Без подписки контакт автора скрывается (render_vacancy_client
+        # сам решает по subscribed=False), это не отдельная выборка получателей.
+        now = datetime.now().isoformat()
+        clients = self.db.get_search_active_clients()
         log.info(f"📢 Рассылка {len(clients)} клиентам")
         for cl in clients:
             try:
@@ -1186,11 +1226,11 @@ class VacancyPipeline:
                 if hit:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
-                # Подписка уже гарантирована (get_active_clients фильтрует по ней) —
-                # контакт можно показывать сразу, без отдельной кнопки-раскрытия
+                subscribed = bool(cl.get("sub_until") and cl["sub_until"] > now)
                 msg_text, markup = render_vacancy_client(
                     vacancy.html_text or html.escape(vacancy.text),
-                    ds.contact, vacancy.author_id, vacancy.message_link)
+                    ds.contact, vacancy.author_id, vacancy.message_link,
+                    subscribed=subscribed)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -3145,6 +3185,18 @@ async def client_tariffs_cb(call: CallbackQuery):
     uid = call.from_user.id; uname = call.from_user.username
     cl  = _db.get_or_create_client(uid, uname)
     await safe_edit(call, await _tariffs_text(cl), _tariffs_kb(cl))
+
+@client_router.callback_query(F.data == "client_how_reply")
+async def client_how_reply_cb(call: CallbackQuery):
+    """Кнопка "Как откликнуться?" под вакансией у клиентов без подписки —
+    объясняет, зачем нужна подписка, и сразу даёт тарифы. Отправляем отдельным
+    новым сообщением (не редактируем вакансию), чтобы она осталась как есть."""
+    uid = call.from_user.id; uname = call.from_user.username
+    cl  = _db.get_or_create_client(uid, uname)
+    await call.answer()
+    await call.message.answer(
+        "Чтобы откликнуться на вакансию вам нужно приобрести подписку",
+        reply_markup=_tariffs_kb(cl), parse_mode=ParseMode.HTML)
 
 @client_router.callback_query(F.data.startswith("client_buy:"))
 async def client_buy_cb(call: CallbackQuery):
