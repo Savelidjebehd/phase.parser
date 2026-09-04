@@ -764,7 +764,18 @@ async def _fetch_deepseek_status() -> str:
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 DEEPSEEK_URL,
-                json={"model": DEEPSEEK_MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1},
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 1,
+                    # То же самое, что и в call_deepseek: без явного отключения
+                    # thinking-режима модель может считать скрытые
+                    # рассуждения даже на этот пустяковый пинг "ok" — а он
+                    # летает каждые 5 минут (288 раз/сутки), так что раздутие
+                    # токенов здесь бьёт по счёту ещё сильнее, чем в основной
+                    # проверке вакансий.
+                    "thinking": {"type": "disabled"},
+                },
                 headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
