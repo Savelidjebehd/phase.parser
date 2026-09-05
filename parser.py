@@ -43,6 +43,11 @@ API_ID         = int(os.getenv("API_ID", "0"))
 API_HASH       = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
 ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
+# Версия сборки — меняется вручную при каждой правке кода. Показывается в
+# главном меню админ-бота и пишется в лог при старте, чтобы можно было
+# проверить визуально, что на Ботхосте реально запущена свежая версия после
+# пересборки образа (git push сам по себе бота не обновляет).
+BOT_VERSION    = "2026-09-05 22:14"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -1333,7 +1338,7 @@ async def _admin_main_text() -> str:
         ds_label = "Недоступна"
 
     return (
-        f"<b>phase.parser</b>\n\n"
+        f"<b>phase.parser</b>  <code>{BOT_VERSION}</code>\n\n"
         f"Статус бота: {ico(ub_ok)} {'Активен' if ub_ok else 'Не авторизован'}\n"
         f"ИИ проверка: {ico(ds_ok and ai_on)} {ds_label if not (ds_ok and ai_on) else 'Активна'}\n"
         f"Клиент бот: {ico(cb_on)} {'Активен' if cb_on else 'Выключен'}\n"
@@ -3870,7 +3875,7 @@ async def main() -> None:
     global _db, _pipeline, _userbot
 
     log.info("=" * 60)
-    log.info("phase.parser запускается")
+    log.info(f"phase.parser запускается | версия: {BOT_VERSION}")
     log.info("=" * 60)
 
     # БД
