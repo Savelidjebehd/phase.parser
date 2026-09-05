@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-05 22:14"
+BOT_VERSION    = "2026-09-05 22:22"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -717,8 +717,35 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
                     log.error(f"DeepSeek HTTP {resp.status}: {body[:300]}")
                     db.stat_inc("ai_errors"); return _DS_FAIL
                 data = json.loads(body)
-        usage = data.get("usage", {})
-        db.add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        usage = data.get("usage", {}) or {}
+        # Реальные названия полей из официального API DeepSeek (api-docs.deepseek.com):
+        # prompt_tokens/completion_tokens/total_tokens — плоские поля верхнего уровня,
+        # prompt_cache_hit_tokens/prompt_cache_miss_tokens — тоже плоские (не вложены
+        # в prompt_tokens_details, как у OpenAI). Если поля нет в ответе — 0, чтобы
+        # не падать на разных версиях API.
+        prompt_tokens      = usage.get("prompt_tokens", 0) or 0
+        completion_tokens  = usage.get("completion_tokens", 0) or 0
+        total_tokens       = usage.get("total_tokens", 0) or 0
+        cache_hit_tokens   = usage.get("prompt_cache_hit_tokens", 0) or 0
+        cache_miss_tokens  = usage.get("prompt_cache_miss_tokens", 0) or 0
+        # Бонус, не входит в исходное задание, но напрямую относится к багу с
+        # thinking-режимом: если reasoning_tokens > 0 — модель всё-таки считает
+        # скрытые рассуждения несмотря на "thinking": {"type": "disabled"} в
+        # запросе, и именно это раздувает счёт. completion_tokens_details может
+        # отсутствовать целиком на некоторых версиях API — тогда None/0.
+        reasoning_tokens = ((usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)) or 0
+        log.info(
+            f"DeepSeek usage: prompt={prompt_tokens} completion={completion_tokens} "
+            f"total={total_tokens} cache_hit={cache_hit_tokens} cache_miss={cache_miss_tokens} "
+            f"reasoning={reasoning_tokens}"
+        )
+        if reasoning_tokens:
+            log.warning(
+                f"DeepSeek: reasoning_tokens={reasoning_tokens} > 0 несмотря на "
+                f"thinking:disabled в запросе — модель всё равно считает скрытые "
+                f"рассуждения, это раздувает счёт"
+            )
+        db.add_tokens(prompt_tokens, completion_tokens)
         raw_content = data["choices"][0]["message"]["content"]
         log.debug(f"DeepSeek content: {raw_content}")
         parsed   = json.loads(raw_content)
