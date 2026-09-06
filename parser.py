@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-05 22:24"
+BOT_VERSION    = "2026-09-07 00:54"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -693,7 +693,7 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
             {"role": "system", "content": system},
             {"role": "user", "content": f"Автор: @{author_username}\n\nТекст:\n{text[:3000]}"},
         ],
-        "max_tokens": 150,
+        "max_tokens": 300,
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
         # Явно отключаем режим рассуждений (thinking/CoT) — задаче классификации
@@ -739,16 +739,37 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
             f"total={total_tokens} cache_hit={cache_hit_tokens} cache_miss={cache_miss_tokens} "
             f"reasoning={reasoning_tokens}"
         )
+        # То же самое — в db.add_log, чтобы попадало в экспорт "📥 Мониторинг"
+        # (log.info выше уходит только в docker logs, которых у пользователя
+        # обычно нет под рукой — а именно экспорт он присылает на разбор)
+        db.add_log("INFO", f"DS usage: in={prompt_tokens} out={completion_tokens} "
+                            f"hit={cache_hit_tokens} miss={cache_miss_tokens} reasoning={reasoning_tokens}")
         if reasoning_tokens:
             log.warning(
                 f"DeepSeek: reasoning_tokens={reasoning_tokens} > 0 несмотря на "
                 f"thinking:disabled в запросе — модель всё равно считает скрытые "
                 f"рассуждения, это раздувает счёт"
             )
+            db.add_log("WARNING", f"⚠️ ИИ считает скрытые рассуждения (reasoning={reasoning_tokens}) "
+                                   f"несмотря на thinking:disabled — раздувает счёт")
         db.add_tokens(prompt_tokens, completion_tokens)
         raw_content = data["choices"][0]["message"]["content"]
         log.debug(f"DeepSeek content: {raw_content}")
-        parsed   = json.loads(raw_content)
+        try:
+            parsed = json.loads(raw_content)
+        except json.JSONDecodeError:
+            # DeepSeek сам предупреждает в документации: в режиме JSON Output
+            # есть шанс получить не строго чистый JSON (пустой content, обёртку
+            # в ```json ... ``` и т.п.), особенно на новых моделях линейки V4,
+            # где response_format не даёт жёсткой гарантии схемы. Вместо того
+            # чтобы сразу сдаваться (и терять токены впустую), пробуем вытащить
+            # первый {...} блок из текста регуляркой.
+            m = re.search(r'\{.*\}', raw_content, re.DOTALL)
+            if not m:
+                raise
+            parsed = json.loads(m.group(0))
+            log.warning(f"DeepSeek: JSON пришлось вытаскивать регуляркой из ответа: {raw_content[:200]!r}")
+            db.add_log("WARNING", f"⚠️ ИИ вернул не чистый JSON, вытащили регуляркой: {raw_content[:120]!r}")
         suitable = bool(parsed.get("suitable", False))
         reason   = str(parsed.get("reason", ""))[:60]
         # Автор — ВСЕГДА тот, кто реально написал сообщение (кто его отправил в
@@ -760,11 +781,13 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
         return DeepSeekResult(suitable=suitable, reason=reason, contact=contact)
     except json.JSONDecodeError as e:
         log.error(f"DeepSeek JSON ошибка: {e}")
+        db.add_log("ERROR", f"❌ DeepSeek не вернул валидный JSON: {e}")
         db.stat_inc("ai_errors")
         if _pipeline: await notify_admin_error(_pipeline.bot, "DeepSeek JSON", e)
         return _DS_FAIL
     except Exception as e:
         log.error(f"DeepSeek ошибка: {e}", exc_info=True)
+        db.add_log("ERROR", f"❌ DeepSeek ошибка: {e}")
         db.stat_inc("ai_errors")
         if _pipeline: await notify_admin_error(_pipeline.bot, "DeepSeek", e)
         return _DS_FAIL
