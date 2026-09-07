@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-07 11:06"
+BOT_VERSION    = "2026-09-07 11:14"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -531,7 +531,7 @@ class Database:
         self._c().commit(); return p
 
     # ── Статистика ────────────────────────────────────────────
-    def _today(self) -> str: return datetime.now().strftime("%Y-%m-%d")
+    def _today(self) -> str: return datetime.now(MSK).strftime("%Y-%m-%d")
 
     def stat_inc(self, field: str, n: int = 1) -> None:
         today = self._today()
@@ -541,17 +541,19 @@ class Database:
             (today, n)); self._c().commit()
 
     def get_stats(self, period: str = "today") -> dict:
-        c = self._c(); now = datetime.now()
+        c = self._c()
+        now = datetime.now()          # для sub_until — там везде naive UTC, не трогаем
+        now_msk = datetime.now(MSK)   # только для дат-ключей stats_daily (московские сутки)
         if period == "today":
             rows = c.execute("SELECT * FROM stats_daily WHERE date=?", (self._today(),)).fetchall()
         elif period == "week":
-            since = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            since = (now_msk - timedelta(days=7)).strftime("%Y-%m-%d")
             rows = c.execute("SELECT * FROM stats_daily WHERE date>=?", (since,)).fetchall()
         elif period == "month":
-            since = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            since = (now_msk - timedelta(days=30)).strftime("%Y-%m-%d")
             rows = c.execute("SELECT * FROM stats_daily WHERE date>=?", (since,)).fetchall()
         else:  # year
-            since = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+            since = (now_msk - timedelta(days=365)).strftime("%Y-%m-%d")
             rows = c.execute("SELECT * FROM stats_daily WHERE date>=?", (since,)).fetchall()
         totals = {"vacancies_found":0,"vacancies_failed":0,"replies_sent":0,"ai_errors":0,"subs_bought":0}
         for r in rows:
@@ -576,6 +578,11 @@ class Database:
         return dict(row) if row else {"tokens_in": 0, "tokens_out": 0}
 
     # ── Логи ──────────────────────────────────────────────────
+    # ts в таблице logs хранится в UTC (datetime('now') в SQLite). Чтобы кнопка
+    # "Экспорт" и счётчик "Логи за <дата>" резались по московским суткам (а не
+    # съезжали на 3 часа), везде ниже сравниваем не сам ts, а datetime(ts,'+3
+    # hours') — то есть сдвигаем ТОЛЬКО на время сравнения/вывода, само хранение
+    # в БД не меняем (это важно для остальной части кода, которая тоже читает ts).
     def add_log(self, level: str, message: str) -> None:
         try:
             self._c().execute("INSERT INTO logs(level,message) VALUES(?,?)", (level, message))
@@ -584,17 +591,17 @@ class Database:
 
     def get_logs(self, date: str, limit: int = 200) -> list[dict]:
         return [dict(r) for r in self._c().execute(
-            "SELECT * FROM logs WHERE ts LIKE ? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM logs WHERE datetime(ts,'+3 hours') LIKE ? ORDER BY id DESC LIMIT ?",
             (f"{date}%", limit)).fetchall()]
 
     def count_logs(self, date: str) -> int:
         return self._c().execute(
-            "SELECT COUNT(*) FROM logs WHERE ts LIKE ?", (f"{date}%",)).fetchone()[0]
+            "SELECT COUNT(*) FROM logs WHERE datetime(ts,'+3 hours') LIKE ?", (f"{date}%",)).fetchone()[0]
 
     def export_logs(self, date: str) -> bytes:
         rows = self._c().execute(
-            "SELECT * FROM logs WHERE ts LIKE ? ORDER BY id ASC", (f"{date}%",)).fetchall()
-        return "\n".join(f"{r['ts']} | {r['level']:<8} | {r['message']}" for r in rows).encode("utf-8")
+            "SELECT * FROM logs WHERE datetime(ts,'+3 hours') LIKE ? ORDER BY id ASC", (f"{date}%",)).fetchall()
+        return "\n".join(f"{fmt_msk(r['ts'])} | {r['level']:<8} | {r['message']}" for r in rows).encode("utf-8")
 
     def cleanup(self) -> None:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
@@ -889,6 +896,20 @@ def now_sql() -> str:
     с этой функцией, а не с datetime.now().isoformat()."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+def fmt_msk(sql_or_iso: Optional[str], fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """ТОЛЬКО для показа времени человеку. В БД везде хранится UTC (through
+    now_sql()/datetime('now')) — эта функция сдвигает его на +3 часа (Москва,
+    без перехода на летнее/зимнее) и форматирует под нужный вид. Никогда не
+    использовать результат для сравнений/фильтров в SQL — там как хранилось
+    в UTC, так и должно сравниваться с UTC (см. now_sql), иначе получим тот
+    же баг, что уже чинили с несовпадением форматов дат."""
+    if not sql_or_iso: return ""
+    try:
+        dt = datetime.fromisoformat(sql_or_iso)
+    except Exception:
+        return sql_or_iso
+    return (dt + timedelta(hours=3)).strftime(fmt)
+
 # Мусорные шаблонные приписки, которые некоторые боты-публикаторы (например,
 # @mari_pro_vakansii_bot) автоматически добавляют к каждому посту. Ищем по
 # устойчивому паттерну текста, а не по конкретному боту — надёжнее и не
@@ -935,7 +956,7 @@ def make_msg_link(event, chat) -> str:
 
 def fmt_date(iso: Optional[str]) -> str:
     if not iso: return "—"
-    try: return datetime.fromisoformat(iso).strftime("%d.%m.%Y")
+    try: return (datetime.fromisoformat(iso) + timedelta(hours=3)).strftime("%d.%m.%Y")
     except Exception: return iso[:10]
 
 # ═══════════════════════════════════════════════════════════════
@@ -1700,7 +1721,7 @@ async def admin_vac_export_do_cb(call: CallbackQuery):
         else:
             status = "⏳ НЕ ОБРАБОТАНА"
         lines.append(
-            f"=== #{v['id']} | {status} | {v.get('created_at','')} ===\n"
+            f"=== #{v['id']} | {status} | {fmt_msk(v.get('created_at'))} ===\n"
             f"Источник: {v.get('source_title','')}\n"
             f"Причина: {v.get('ds_reason','') or block_reason or '—'}\n"
             f"Контакт: {v.get('ds_contact','') or '—'}\n"
@@ -1711,7 +1732,7 @@ async def admin_vac_export_do_cb(call: CallbackQuery):
               f"(прошло: {ok_count}, не прошло ИИ: {fail_count}, отсеяно до ИИ: {blocked_count})\n\n")
     content = header + ("\n" + "-"*60 + "\n\n").join(lines)
 
-    file = BufferedInputFile(content.encode("utf-8"), filename=f"vacancies_{period_label}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+    file = BufferedInputFile(content.encode("utf-8"), filename=f"vacancies_{period_label}_{datetime.now(MSK).strftime('%Y%m%d_%H%M')}.txt")
     await call.message.answer_document(file, caption=f"📤 {len(rows)} вакансий за период «{period_label}» (✅{ok_count} / ❌{fail_count} / 🚫{blocked_count})")
     await call.answer()
 
@@ -1875,7 +1896,7 @@ async def admin_import_cb(call: CallbackQuery):
     ]
     content = "\n".join(parts)
     file = BufferedInputFile(content.encode("utf-8"),
-                             filename=f"monitoring_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+                             filename=f"monitoring_{datetime.now(MSK).strftime('%Y%m%d_%H%M')}.txt")
     await call.message.answer_document(file, caption="📥 Экспорт раздела «Мониторинг» — можно переслать на разбор")
     await call.answer()
 
@@ -2127,7 +2148,7 @@ async def admin_pay_detail_cb(call: CallbackQuery):
         f"Тариф: <b>{p['tariff']}</b>",
         f"Сумма: <b>{p['amount']}₽</b>",
         f"Дней: <b>{p['days']}</b>",
-        f"Создан: {p['created_at'][:16]}",
+        f"Создан: {fmt_msk(p['created_at'], '%Y-%m-%d %H:%M')}",
     ]
     markup = mkb([
         [("✅ Подтвердить", f"admin_confirm_pay:{ticket}"),
@@ -2233,7 +2254,7 @@ def render_client_detail(client_id: int) -> Optional[tuple[str, InlineKeyboardMa
 
     # История пополнений
     payments = _db.get_client_payments(client_id)
-    hist_lines = [f"{p['created_at'][:10]} {p['tariff']} {p['amount']}₽" for p in payments]
+    hist_lines = [f"{fmt_msk(p['created_at'], '%Y-%m-%d')} {p['tariff']} {p['amount']}₽" for p in payments]
     hist_block = "<blockquote>" + "\n".join(hist_lines) + "</blockquote>" if hist_lines else "<i>нет</i>"
 
     text = (
@@ -2416,9 +2437,9 @@ async def admin_bcast_cancel_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 @admin_router.callback_query(F.data == "admin_logs")
 async def admin_logs_cb(call: CallbackQuery):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(MSK).strftime("%Y-%m-%d")
     cnt   = _db.count_logs(today)
-    text  = f"<b>📜 Логи за {today}</b>\nСтрок: <b>{cnt}</b>"
+    text  = f"<b>📜 Логи за {today} (МСК)</b>\nСтрок: <b>{cnt}</b>"
     markup = mkb([
         [("📤 Экспорт",f"admin_logs_export:{today}")],
         [("🗑 Очистить все логи","admin_clear_logs")],
