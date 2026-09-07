@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-07 00:54"
+BOT_VERSION    = "2026-09-07 11:06"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -837,6 +837,20 @@ async def _fetch_deepseek_status() -> str:
                 body = await resp.text()
                 if resp.status == 200:
                     log.info(f"DeepSeek OK: model={DEEPSEEK_MODEL}")
+                    # Логируем usage и здесь же — пинг летает 288 раз/сутки,
+                    # раньше именно он оказался причиной раздутого счёта из-за
+                    # забытого thinking:disabled. Теперь параметр стоит, но
+                    # стоит убедиться цифрами, а не считать это как о факте.
+                    try:
+                        u = (json.loads(body).get("usage", {})) or {}
+                        r = ((u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)) or 0
+                        if _db:
+                            _db.add_log("INFO", f"DS health-ping usage: in={u.get('prompt_tokens',0)} "
+                                                 f"out={u.get('completion_tokens',0)} "
+                                                 f"hit={u.get('prompt_cache_hit_tokens',0)} "
+                                                 f"miss={u.get('prompt_cache_miss_tokens',0)} reasoning={r}")
+                    except Exception:
+                        pass
                     return "ok"
                 # Разбираем ошибку
                 log.warning(f"DeepSeek HTTP {resp.status}: {body[:300]}")
