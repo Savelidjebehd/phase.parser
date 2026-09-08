@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-07 11:14"
+BOT_VERSION    = "2026-09-08 12:58"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -209,6 +209,18 @@ class Database:
                 date TEXT PRIMARY KEY, vacancies_found INTEGER DEFAULT 0,
                 vacancies_failed INTEGER DEFAULT 0, replies_sent INTEGER DEFAULT 0,
                 ai_errors INTEGER DEFAULT 0, subs_bought INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
+                photo_file_id TEXT, segment TEXT NOT NULL,
+                sent_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+                tg_id INTEGER NOT NULL, username TEXT,
+                broadcast_id INTEGER REFERENCES broadcasts(id) ON DELETE SET NULL,
+                text TEXT NOT NULL, is_read INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')));
         """)
         self._c().commit()
         # Миграция: добавляем поля для крипто-оплаты в уже существующую БД
@@ -233,6 +245,12 @@ class Database:
         # можно было выгрузить и посмотреть, что именно отсеяло конкретное слово,
         # вместо того чтобы терять текст вакансии безвозвратно
         try: self._c().execute("ALTER TABLE vacancies ADD COLUMN block_reason TEXT")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: какую рассылку клиент получил последней — чтобы свободное
+        # текстовое сообщение от него в чате с ботом можно было связать именно
+        # с той рассылкой, на которую он отвечает
+        try: self._c().execute("ALTER TABLE clients ADD COLUMN last_broadcast_id INTEGER")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -387,6 +405,59 @@ class Database:
         (с урезанным контактом) вместе с платными (с полным контактом)."""
         return [dict(r) for r in self._c().execute(
             "SELECT * FROM clients WHERE search_active=1").fetchall()]
+
+    def get_clients_by_segment(self, segment: str) -> list[dict]:
+        """Гибкий таргетинг для ручной рассылки (не для вакансий — это отдельная
+        рассылка объявлений/новостей). segment: 'all' | 'subscribed' | 'free'.
+        В отличие от get_active_clients/get_search_active_clients здесь НЕ
+        учитывается search_active — это тумблер "получать вакансии", он не
+        должен влиять на то, дойдёт ли до человека объявление от админа."""
+        now = datetime.now().isoformat()
+        if segment == "subscribed":
+            return [dict(r) for r in self._c().execute(
+                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ?", (now,)).fetchall()]
+        if segment == "free":
+            return [dict(r) for r in self._c().execute(
+                "SELECT * FROM clients WHERE sub_until IS NULL OR sub_until <= ?", (now,)).fetchall()]
+        return [dict(r) for r in self._c().execute("SELECT * FROM clients").fetchall()]
+
+    # ── Рассылки и обратная связь ─────────────────────────────
+    def create_broadcast(self, text: str, photo: Optional[str], segment: str, total: int) -> int:
+        cur = self._c().execute(
+            "INSERT INTO broadcasts(text,photo_file_id,segment,total_count) VALUES(?,?,?,?)",
+            (text, photo, segment, total))
+        self._c().commit(); return cur.lastrowid
+
+    def finish_broadcast(self, broadcast_id: int, sent_count: int, recipient_client_ids: list[int]) -> None:
+        self._c().execute("UPDATE broadcasts SET sent_count=? WHERE id=?", (sent_count, broadcast_id))
+        if recipient_client_ids:
+            self._c().executemany(
+                "UPDATE clients SET last_broadcast_id=? WHERE id=?",
+                [(broadcast_id, cid) for cid in recipient_client_ids])
+        self._c().commit()
+
+    def save_feedback(self, client_id: int, tg_id: int, username: Optional[str],
+                       broadcast_id: Optional[int], text: str) -> None:
+        self._c().execute(
+            "INSERT INTO feedback(client_id,tg_id,username,broadcast_id,text) VALUES(?,?,?,?,?)",
+            (client_id, tg_id, username, broadcast_id, text))
+        self._c().commit()
+
+    def get_feedback(self, limit: int = 30) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT f.*, b.text AS broadcast_text FROM feedback f "
+            "LEFT JOIN broadcasts b ON b.id=f.broadcast_id "
+            "ORDER BY f.id DESC LIMIT ?", (limit,)).fetchall()]
+
+    def count_unread_feedback(self) -> int:
+        return self._c().execute("SELECT COUNT(*) FROM feedback WHERE is_read=0").fetchone()[0]
+
+    def mark_feedback_read(self) -> None:
+        self._c().execute("UPDATE feedback SET is_read=1 WHERE is_read=0"); self._c().commit()
+
+    def get_client_by_id(self, client_id: int) -> Optional[dict]:
+        row = self._c().execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+        return dict(row) if row else None
 
     def set_subscription(self, client_id: int, until: datetime, is_payment: bool = False) -> None:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
@@ -2094,15 +2165,38 @@ async def admin_clients_cb(call: CallbackQuery):
     ]
     if pending:
         lines.append(f"🔴 Ожидают подтверждения: <b>{len(pending)}</b>")
+    unread_fb = _db.count_unread_feedback()
+    if unread_fb:
+        lines.append(f"💬 Новая обратная связь: <b>{unread_fb}</b>")
     rows = []
     if pending:
         rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
     rows.append([("📋 Список (текстом)", "admin_clients_grouped"), ("⚙️ Управление", "admin_clients_list")])
     rows.append([("➕ Выдать подписку", "admin_give_sub"), ("🔍 Найти клиента", "admin_find_client")])
     rows.append([("🎁 Выдать подписку всем", "admin_give_sub_all")])
-    rows.append([("📤 Рассылка", "admin_broadcast")])
+    rows.append([("📤 Рассылка", "admin_broadcast"),
+                 (f"💬 Обратная связь{' 🔴' if unread_fb else ''}", "admin_feedback")])
     rows.append([("◀️ Главное меню", "admin_main")])
     await safe_edit(call, "\n".join(lines), mkb(rows))
+
+@admin_router.callback_query(F.data == "admin_feedback")
+async def admin_feedback_cb(call: CallbackQuery):
+    fb = _db.get_feedback(30)
+    _db.mark_feedback_read()
+    if not fb:
+        await safe_edit(call, "💬 <b>Обратная связь</b>\n\nПока пусто — ответов от клиентов не было.",
+                         kb_back("admin_clients"))
+        return
+    lines = [f"💬 <b>Обратная связь</b> — последние {len(fb)}\n"]
+    for f in fb:
+        who = f"@{f['username']}" if f.get("username") else str(f["tg_id"])
+        when = fmt_msk(f["created_at"], "%d.%m %H:%M")
+        on_bc = f"\n<i>↳ на рассылку: {(f['broadcast_text'] or '')[:60]}</i>" if f.get("broadcast_text") else ""
+        lines.append(f"<b>{who}</b> · {when}{on_bc}\n{f['text']}\n")
+    text = "\n".join(lines)
+    # Telegram режет сообщение по 4096 символов — на всякий случай подрежем
+    if len(text) > 3900: text = text[:3900] + "\n\n… (обрежьте период, слишком много)"
+    await safe_edit(call, text, kb_back("admin_clients"))
 
 @admin_router.callback_query(F.data == "admin_find_client")
 async def admin_find_client_cb(call: CallbackQuery):
@@ -2377,10 +2471,26 @@ async def admin_give_sub_all_cancel_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_cb(call: CallbackQuery):
-    _admin_pending[call.from_user.id] = "broadcast_text"
-    _broadcast_draft.pop(call.from_user.id, None)
+    _broadcast_draft[call.from_user.id] = {}
     await safe_edit(call,
-        "📤 <b>Рассылка всем активным клиентам</b>\n\nВведите текст:",
+        "📤 <b>Рассылка</b>\n\nКому отправить?",
+        mkb([
+            [("👥 Всем клиентам", "admin_bcast_segment:all")],
+            [("💎 Только с подпиской", "admin_bcast_segment:subscribed")],
+            [("🆓 Только без подписки", "admin_bcast_segment:free")],
+            [("◀️ Назад", "admin_clients")],
+        ]))
+
+@admin_router.callback_query(F.data.startswith("admin_bcast_segment:"))
+async def admin_bcast_segment_cb(call: CallbackQuery):
+    segment = call.data.split(":")[1]
+    uid = call.from_user.id
+    _broadcast_draft[uid] = {"segment": segment}
+    _admin_pending[uid] = "broadcast_text"
+    count = len(_db.get_clients_by_segment(segment))
+    label = {"all": "всем клиентам", "subscribed": "клиентам с подпиской", "free": "клиентам без подписки"}[segment]
+    await safe_edit(call,
+        f"📤 <b>Рассылка {label}</b> (получателей: {count})\n\nВведите текст:",
         kb_back("admin_clients"))
 
 @admin_router.callback_query(F.data == "admin_bcast_add_photo")
@@ -2399,14 +2509,17 @@ async def _show_broadcast_preview(bot: Bot, uid: int) -> None:
     draft = _broadcast_draft.get(uid)
     if not draft: return
     text  = draft["text"]; photo = draft.get("photo")
+    segment = draft.get("segment", "all")
+    label = {"all": "всем клиентам", "subscribed": "клиентам с подпиской", "free": "клиентам без подписки"}[segment]
+    count = len(_db.get_clients_by_segment(segment))
     # Показываем ровно то же сообщение, которое получит клиент
     if photo:
         await bot.send_photo(uid, photo, caption=text, parse_mode=ParseMode.HTML)
     else:
         await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
     await bot.send_message(uid,
-        "☝️ Именно так это увидит клиент. Отправляем всем активным клиентам?",
-        reply_markup=mkb([[("✅ Отправить всем","admin_bcast_send"), ("❌ Отмена","admin_bcast_cancel")]]))
+        f"☝️ Именно так это увидит клиент.\n\nОтправляем {label} (получателей: {count})?",
+        reply_markup=mkb([[("✅ Отправить","admin_bcast_send"), ("❌ Отмена","admin_bcast_cancel")]]))
 
 @admin_router.callback_query(F.data == "admin_bcast_send")
 async def admin_bcast_send_cb(call: CallbackQuery):
@@ -2414,17 +2527,22 @@ async def admin_bcast_send_cb(call: CallbackQuery):
     draft = _broadcast_draft.pop(uid, None)
     if not draft:
         await call.answer("Сессия истекла, начните заново", show_alert=True); return
-    text = draft["text"]; photo = draft.get("photo")
-    clients = _db.get_active_clients(); sent = 0
+    text    = draft["text"]; photo = draft.get("photo")
+    segment = draft.get("segment", "all")
+    clients = _db.get_clients_by_segment(segment)
+    bc_id   = _db.create_broadcast(text, photo, segment, len(clients))
+    sent = 0; delivered_ids: list[int] = []
     for cl in clients:
         try:
             if photo:
                 await call.bot.send_photo(cl["tg_id"], photo, caption=text, parse_mode=ParseMode.HTML)
             else:
                 await call.bot.send_message(cl["tg_id"], text, parse_mode=ParseMode.HTML)
-            sent += 1; await asyncio.sleep(0.05)
+            sent += 1; delivered_ids.append(cl["id"]); await asyncio.sleep(0.05)
         except Exception as e: log.warning(f"Рассылка {cl['tg_id']}: {e}")
-    await safe_edit(call, f"✅ Рассылка завершена: <b>{sent}/{len(clients)}</b>", kb_back("admin_clients"))
+    _db.finish_broadcast(bc_id, sent, delivered_ids)
+    await safe_edit(call, f"✅ Рассылка завершена: <b>{sent}/{len(clients)}</b>\n\n"
+                          f"Ответы клиентов появятся в «💬 Обратная связь».", kb_back("admin_clients"))
 
 @admin_router.callback_query(F.data == "admin_bcast_cancel")
 async def admin_bcast_cancel_cb(call: CallbackQuery):
@@ -3076,7 +3194,9 @@ async def admin_text_handler(msg: Message):
 
     # ── Рассылка ──────────────────────────────────────────────
     if action == "broadcast_text":
-        _broadcast_draft[uid] = {"text": msg.html_text, "photo": None}
+        draft = _broadcast_draft.get(uid) or {}
+        draft["text"] = msg.html_text; draft["photo"] = None
+        _broadcast_draft[uid] = draft
         await safe_answer(msg,
             "Прикрепить фото к рассылке?",
             mkb([
@@ -3612,6 +3732,19 @@ async def client_text_handler(msg: Message):
             mkb([[("🚫 К списку","client_stopwords")]]))
         return
 
+    # Свободное сообщение, не относящееся ни к одному сценарию — считаем это
+    # обратной связью (в т.ч. ответом на рассылку) и показываем админу в
+    # «Клиенты → 💬 Обратная связь», плюс сразу дублируем ему в личку.
+    _db.save_feedback(cl["id"], uid, uname, cl.get("last_broadcast_id"), msg.text)
+    try:
+        who = f"@{uname}" if uname else str(uid)
+        await msg.bot.send_message(
+            ADMIN_ID,
+            f"💬 <b>Сообщение от клиента</b> {who}:\n\n{html.escape(msg.text)}",
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.warning(f"Пересылка обратной связи админу: {e}")
+    await msg.answer("💬 Спасибо, ваше сообщение передано.")
     await msg.answer(_client_main_text(cl), reply_markup=kb_client_main())
 # ═══════════════════════════════════════════════════════════════
 # USERBOT
