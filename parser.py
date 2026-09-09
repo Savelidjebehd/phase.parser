@@ -47,7 +47,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-08 12:58"
+BOT_VERSION    = "2026-09-09 07:33"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1107,13 +1107,23 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
             # без подписки её показывать нельзя точно так же, как юзернейм
             author_line = "\n\nАвтор: —"
         else:
-            # У автора нет юзернейма — tg://user?id= открывает профиль напрямую,
-            # но работает ТОЛЬКО в десктопном приложении Telegram
+            # У автора нет юзернейма. По документации Bot API tg://user?id=
+            # гарантированно резолвится только если автор уже писал НАШЕМУ
+            # боту в личку — а случайный автор вакансии из чужого канала этого
+            # никогда не делал, так что для него это в лучшем случае "повезёт
+            # на конкретном устройстве", а не рабочий способ. Поэтому не выдаём
+            # это за реальную ссылку — основной, реально рабочий путь это
+            # перейти в сообщение-источник и написать автору оттуда (там
+            # Telegram видит его по-настоящему, это работает на любом
+            # устройстве). Саму tg://user всё равно оставляем "на удачу" вторым
+            # вариантом — иногда она у конкретного клиента срабатывает, если
+            # автор уже где-то засветился в его Telegram.
             link = f"tg://user?id={author_id}"
             author_line = (
-                f"\n\nАвтор: <a href='{link}'>{link}</a>\n"
-                f"⚠️ <i>Ссылка работает только в десктопном приложении Telegram. "
-                f"Если вы не в приложении — перейдите в сообщение по кнопке ниже</i> ⚠️"
+                f"\n\n⚠️ <i>У автора нет юзернейма. Надёжный способ написать ему — "
+                f"перейти в сообщение по кнопке ниже и написать прямо там (работает "
+                f"на любом устройстве). Также можно попробовать</i> <a href='{link}'>прямую ссылку</a>"
+                f" <i>— иногда открывает профиль, но не гарантированно</i> ⚠️"
             )
     else:
         author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
@@ -1298,13 +1308,14 @@ class VacancyPipeline:
                             username = getattr(full.users[0], "username", None) or ""
                 except Exception as e:
                     log.debug(f"GetFullUserRequest(input_sender): {e}")
+                    self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 1, input_sender) не удался: {e}")
                 # 2) Резолв по голому ID через кэш сессии
                 if not username:
                     try:
                         full_sender = await self.userbot.get_entity(sender_id)
                         username = getattr(full_sender, "username", None) or ""
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 2, get_entity) не удался: {e}")
                 # 3) GetFullUserRequest по голому ID (может сработать, если
                 # кэш содержит хотя бы устаревший access_hash того же юзера)
                 if not username:
@@ -1314,6 +1325,10 @@ class VacancyPipeline:
                             username = getattr(full.users[0], "username", None) or ""
                     except Exception as e:
                         log.debug(f"GetFullUserRequest({sender_id}): {e}")
+                        self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 3, по ID) не удался: {e}")
+                if not username:
+                    self.db.add_log("INFO", f"ℹ️ У автора {sender_id} нет юзернейма "
+                                             f"(все 3 способа резолва отработали, юзернейма действительно нет)")
 
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
