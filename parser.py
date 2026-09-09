@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-09 12:49"
+BOT_VERSION    = "2026-09-09 12:56"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -3545,7 +3545,20 @@ async def client_contact_cb(call: CallbackQuery):
     настоящим упоминанием автора из приватного канала-прокладки прямо в чат
     клиента через copy_message. Канал приватный без username, ссылки на пост
     не существует — увидеть контакт можно только так, дойдя до конкретной
-    вакансии в самом боте (не по ссылке кому попало)."""
+    вакансии в самом боте (не по ссылке кому попало).
+
+    Подписку проверяем ЗДЕСЬ, в момент нажатия, а не полагаемся на то, что
+    кнопка вообще была показана только подписчику при отправке вакансии —
+    сообщение с кнопкой остаётся в чате и после того, как подписка закончится,
+    иначе истёкшая подписка не мешала бы получать контакты по старым вакансиям."""
+    cl = _db.get_client_by_tg(call.from_user.id)
+    now = datetime.now().isoformat()
+    if not cl or not (cl.get("sub_until") and cl["sub_until"] > now):
+        await call.answer("Подписка закончилась — оформите новую, чтобы писать авторам", show_alert=True)
+        await call.message.answer("Чтобы откликнуться на вакансию, нужна активная подписка",
+                                   reply_markup=_tariffs_kb(cl or _db.get_or_create_client(
+                                       call.from_user.id, call.from_user.username)))
+        return
     channel_id = _db.get_setting("contact_relay_channel_id", "")
     msg_id = int(call.data.split(":")[1])
     if not channel_id:
