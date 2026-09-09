@@ -19,6 +19,7 @@ from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, Message, BotCommand, BotCommandScopeChat,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    MessageOriginChannel,
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -34,6 +35,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInv
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
+    PeerChannel,
 )
 
 # ── Конфигурация ──────────────────────────────────────────────
@@ -47,17 +49,12 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-09 07:43"
+BOT_VERSION    = "2026-09-09 12:49"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
-# Канал-прокладка для контактов авторов без юзернейма (см. get_contact_link).
-# Юзербот должен быть админом этого канала с правом постить сообщения.
-# Без этой переменной функция просто не используется — старое поведение
-# (только tg://user?id= "на удачу") сохраняется как есть.
-CONTACT_RELAY_CHANNEL = os.getenv("CONTACT_RELAY_CHANNEL", "")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "Савелий Сергеевич С.")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
@@ -127,8 +124,8 @@ class Vacancy:
     chat_id: int; message_id: int; text: str; author_username: str
     author_id: int; source_title: str; message_link: str; timestamp: datetime
     html_text: str = ""
-    contact_link: str = ""  # ссылка на пост-упоминание в канале-прокладке,
-                             # если у автора нет юзернейма (см. get_contact_link)
+    contact_msg_id: int = 0  # ID поста-упоминания в приватном канале-прокладке,
+                              # если у автора нет юзернейма (см. get_contact_link)
 
 @dataclass
 class DeepSeekResult:
@@ -777,32 +774,40 @@ async def get_usdt_rub_rate() -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════
 _DS_FAIL = DeepSeekResult(suitable=False, reason="Ошибка API", contact="")
 
-async def get_contact_link(userbot: "TelegramClient", db: Database, author_id: int) -> str:
-    """Для авторов без юзернейма: постит в канал-прокладку (CONTACT_RELAY_CHANNEL)
-    сообщение с упоминанием автора по ID через юзербот. Так как юзербот в этот
-    момент уже располагает полным access_hash автора (только что получил от него
-    сообщение), Telethon кодирует упоминание как настоящую MTProto-сущность
-    (inputMessageEntityMentionName) — она навсегда впечатывается в этот пост и
-    остаётся кликабельной для ЛЮБОГО, кто откроет пост, на любом устройстве, в
-    отличие от голого tg://user?id=, который резолвится только если у смотрящего
-    клиента уже есть кэш этого пользователя. Кэшируем по author_id — на одного
-    автора один пост, переиспользуем его для всех его вакансий."""
-    if not CONTACT_RELAY_CHANNEL or not author_id:
-        return ""
+async def get_contact_link(userbot: TelegramClient, db: Database, author_id: int) -> tuple[str, int]:
+    """Для авторов без юзернейма: постит в ПРИВАТНЫЙ канал-прокладку сообщение
+    с упоминанием автора по ID через юзербот. Юзербот в этот момент уже
+    располагает полным access_hash автора (только что получил от него
+    сообщение), поэтому Telethon кодирует упоминание как настоящую MTProto-
+    сущность (inputMessageEntityMentionName) — она навсегда впечатывается в
+    этот пост и остаётся кликабельной для ЛЮБОГО, кто его увидит, на любом
+    устройстве. Канал приватный (без username) — попасть на сам пост по ссылке
+    нельзя, доступ только через copy_message из клиент-бота (см. client_contact_cb),
+    то есть только те, кто уже дошёл до конкретной вакансии в самом боте.
+    Кэшируем по author_id — на одного автора один пост, переиспользуем для всех
+    его вакансий. Возвращает (заголовок для показа, msg_id) — msg_id=0 если не
+    получилось/канал не настроен."""
+    channel_id = db.get_setting("contact_relay_channel_id", "")
+    if not channel_id or not author_id:
+        return "", 0
     cached = db.get_contact_post(author_id)
     if cached:
-        return f"https://t.me/{CONTACT_RELAY_CHANNEL}/{cached}"
+        return "ok", cached
     try:
+        # Bot API отдаёт ID канала как -100xxxxxxxxxx, а Telethon PeerChannel
+        # ждёт "сырой" internal_id без этого префикса и без минуса
+        bot_api_id = int(channel_id)
+        raw_id = -bot_api_id - 10**12 if bot_api_id < -10**12 else abs(bot_api_id)
+        entity = await userbot.get_entity(PeerChannel(raw_id))
         sent = await userbot.send_message(
-            CONTACT_RELAY_CHANNEL,
-            f"<a href='tg://user?id={author_id}'>Написать автору вакансии</a>",
+            entity, f"<a href='tg://user?id={author_id}'>Написать автору вакансии</a>",
             parse_mode="html", link_preview=False)
         db.save_contact_post(author_id, sent.id)
-        return f"https://t.me/{CONTACT_RELAY_CHANNEL}/{sent.id}"
+        return "ok", sent.id
     except Exception as e:
         log.warning(f"get_contact_link({author_id}): {e}")
         db.add_log("WARNING", f"⚠️ Не удалось создать пост-контакт в канале-прокладке для {author_id}: {e}")
-        return ""
+        return "", 0
 
 async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSeekResult:
     if not DEEPSEEK_KEY:
@@ -1128,7 +1133,7 @@ def censor_mentions(text: str) -> str:
     return _MENTION_RE.sub("—", text)
 
 def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
-                          subscribed: bool = True, contact_link: str = "") -> tuple[str, InlineKeyboardMarkup]:
+                          subscribed: bool = True, contact_msg_id: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
     (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
     вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
@@ -1138,12 +1143,17 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
     сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?".
 
-    contact_link — пост в канале-прокладке с настоящим упоминанием автора
-    (см. get_contact_link), передаётся только если у автора нет юзернейма."""
+    contact_msg_id — ID поста-упоминания в ПРИВАТНОМ канале-прокладке (см.
+    get_contact_link), передаётся только если у автора нет юзернейма. Ссылки
+    на сам пост не существует (канал приватный, без username) — вместо неё
+    кнопка с callback_data, по которой client_contact_cb скопирует пост прямо
+    в чат клиента через copy_message. Так контакт видит только тот, кто дошёл
+    до этой вакансии внутри бота, а не кто угодно по ссылке."""
     contact = contact or ""
     if not subscribed:
         v_html = censor_mentions(v_html)
 
+    extra_button = None
     if contact.lower().endswith("bot"):
         # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
         # от своего имени) — писать ему по вакансии бессмысленно, строку об
@@ -1156,14 +1166,12 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
             # Контакт (в любом виде) без подписки не показываем точно так же,
             # как юзернейм — иначе подписка теряет смысл
             author_line = "\n\nАвтор: —"
-        elif contact_link:
-            # Есть пост в канале-прокладке с настоящим упоминанием автора —
-            # это надёжный способ, работает на любом устройстве у любого
-            # клиента (в отличие от голого tg://user?id=, см. get_contact_link)
-            author_line = (
-                f"\n\n👤 У автора нет юзернейма, но написать ему можно: "
-                f"<a href='{contact_link}'>нажмите здесь</a>"
-            )
+        elif contact_msg_id:
+            # Есть пост в приватном канале-прокладке с настоящим упоминанием
+            # автора — надёжный способ, работает на любом устройстве. Кнопкой,
+            # а не ссылкой в тексте — сам пост не открыть без copy_message.
+            author_line = "\n\n👤 У автора нет юзернейма, но написать ему можно кнопкой ниже"
+            extra_button = ("💬 Написать автору", f"client_contact:{contact_msg_id}")
         else:
             # Канал-прокладка не настроен/не сработал — старый способ "на
             # удачу" плюс честная оговорка, что гарантий нет
@@ -1180,7 +1188,10 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     msg_text = f"📢 <b>Новая вакансия</b>\n\n{v_html}{author_line}"
 
     if subscribed:
-        markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
+        rows = [[("🔗 Перейти к сообщению", message_link)]] if message_link else []
+        if extra_button:
+            rows.append([extra_button])
+        markup = mkb(rows) if rows else None
     else:
         # Без подписки кнопку-переход не даём — по ней видно настоящий
         # контакт в канале-источнике, это как раз то, что должна закрывать
@@ -1379,15 +1390,15 @@ class VacancyPipeline:
                     self.db.add_log("INFO", f"ℹ️ У автора {sender_id} нет юзернейма "
                                              f"(все 3 способа резолва отработали, юзернейма действительно нет)")
 
-            contact_link = ""
+            contact_msg_id = 0
             if not username and sender_id:
-                contact_link = await get_contact_link(self.userbot, self.db, sender_id)
+                _, contact_msg_id = await get_contact_link(self.userbot, self.db, sender_id)
 
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
                               source_title=source_title, message_link=message_link,
                               timestamp=datetime.now(), html_text=html_text,
-                              contact_link=contact_link)
+                              contact_msg_id=contact_msg_id)
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
@@ -1471,7 +1482,7 @@ class VacancyPipeline:
                 msg_text, markup = render_vacancy_client(
                     vacancy.html_text or html.escape(vacancy.text),
                     ds.contact, vacancy.author_id, vacancy.message_link,
-                    subscribed=subscribed, contact_link=vacancy.contact_link)
+                    subscribed=subscribed, contact_msg_id=vacancy.contact_msg_id)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
@@ -2660,10 +2671,31 @@ async def admin_settings_cb(call: CallbackQuery):
         [(f"👥 Клиент бот {'включен' if cb_on else 'выключен'}", "admin_settings_toggle:client_bot_active")],
         [("📣 Оповещения", "admin_notifications")],
         [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
+        [("🔗 Канал-прокладка (контакты)", "admin_relay_channel")],
         [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, "<b>⚙️ Настройки</b>", markup)
+
+@admin_router.callback_query(F.data == "admin_relay_channel")
+async def admin_relay_channel_cb(call: CallbackQuery):
+    channel_id = _db.get_setting("contact_relay_channel_id", "")
+    status = f"настроен (ID: <code>{channel_id}</code>)" if channel_id else "не настроен"
+    text = (
+        "<b>🔗 Канал-прокладка для контактов</b>\n\n"
+        f"Статус: {status}\n\n"
+        "Нужен для вакансий, у автора которых нет юзернейма — юзербот "
+        "публикует туда пост с настоящим упоминанием автора, а клиент "
+        "получает контакт кнопкой прямо в чат с ботом. Канал должен быть "
+        "<b>приватным</b> — доступ только через бота, не по ссылке.\n\n"
+        "<b>Настройка (один раз):</b>\n"
+        "1. Создайте приватный канал в Telegram (любое название)\n"
+        "2. Добавьте туда юзербот-аккаунт админом с правом «Публикация сообщений»\n"
+        "3. Добавьте туда САМ этот бот админом (достаточно чтения сообщений)\n"
+        "4. Отправьте в канал любое сообщение и перешлите его сюда, в этот чат"
+    )
+    _admin_pending[call.from_user.id] = "relay_channel_setup"
+    await safe_edit(call, text, kb_back("admin_settings"))
 
 @admin_router.callback_query(F.data == "admin_broadcast_settings")
 async def admin_broadcast_settings_cb(call: CallbackQuery):
@@ -2966,6 +2998,25 @@ async def admin_text_handler(msg: Message):
     action = _admin_pending.pop(uid, None)
     if not action: return
     text = msg.text.strip()
+
+    # ── Настройка канала-прокладки для контактов ────────────────
+    if action == "relay_channel_setup":
+        if isinstance(msg.forward_origin, MessageOriginChannel):
+            channel_id = msg.forward_origin.chat.id
+            _db.set_setting("contact_relay_channel_id", str(channel_id))
+            await safe_answer(msg,
+                f"✅ Канал настроен (ID: <code>{channel_id}</code>).\n\n"
+                f"Проверьте, что юзербот и сам бот добавлены туда админами — "
+                f"иначе постить/читать контакты не смогут.",
+                kb_back("admin_settings"))
+        else:
+            _admin_pending[uid] = "relay_channel_setup"
+            await safe_answer(msg,
+                "Это не похоже на пересланное сообщение из канала. "
+                "Перешлите сюда любое сообщение именно из того канала "
+                "(не копируйте текст, а именно перешлите — кнопкой Forward).",
+                kb_back("admin_settings"))
+        return
 
     # ── Авторизация UserBot ────────────────────────────────────
     if action == "userbot_auth_phone":
@@ -3487,6 +3538,25 @@ async def client_how_reply_cb(call: CallbackQuery):
     await call.message.answer(
         "Чтобы откликнуться на вакансию вам нужно приобрести подписку",
         reply_markup=_tariffs_kb(cl), parse_mode=ParseMode.HTML)
+
+@client_router.callback_query(F.data.startswith("client_contact:"))
+async def client_contact_cb(call: CallbackQuery):
+    """Кнопка "Написать автору" для вакансий без юзернейма — копирует пост с
+    настоящим упоминанием автора из приватного канала-прокладки прямо в чат
+    клиента через copy_message. Канал приватный без username, ссылки на пост
+    не существует — увидеть контакт можно только так, дойдя до конкретной
+    вакансии в самом боте (не по ссылке кому попало)."""
+    channel_id = _db.get_setting("contact_relay_channel_id", "")
+    msg_id = int(call.data.split(":")[1])
+    if not channel_id:
+        await call.answer("Канал-прокладка сейчас не настроен", show_alert=True); return
+    try:
+        await call.bot.copy_message(chat_id=call.from_user.id,
+                                     from_chat_id=int(channel_id), message_id=msg_id)
+        await call.answer()
+    except Exception as e:
+        log.warning(f"client_contact_cb: {e}")
+        await call.answer("Не получилось получить контакт, попробуйте позже", show_alert=True)
 
 @client_router.callback_query(F.data.startswith("client_buy:"))
 async def client_buy_cb(call: CallbackQuery):
