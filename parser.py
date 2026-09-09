@@ -47,12 +47,17 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-09 07:33"
+BOT_VERSION    = "2026-09-09 07:43"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
+# Канал-прокладка для контактов авторов без юзернейма (см. get_contact_link).
+# Юзербот должен быть админом этого канала с правом постить сообщения.
+# Без этой переменной функция просто не используется — старое поведение
+# (только tg://user?id= "на удачу") сохраняется как есть.
+CONTACT_RELAY_CHANNEL = os.getenv("CONTACT_RELAY_CHANNEL", "")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "Савелий Сергеевич С.")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
@@ -122,6 +127,8 @@ class Vacancy:
     chat_id: int; message_id: int; text: str; author_username: str
     author_id: int; source_title: str; message_link: str; timestamp: datetime
     html_text: str = ""
+    contact_link: str = ""  # ссылка на пост-упоминание в канале-прокладке,
+                             # если у автора нет юзернейма (см. get_contact_link)
 
 @dataclass
 class DeepSeekResult:
@@ -220,6 +227,9 @@ class Database:
                 tg_id INTEGER NOT NULL, username TEXT,
                 broadcast_id INTEGER REFERENCES broadcasts(id) ON DELETE SET NULL,
                 text TEXT NOT NULL, is_read INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS contact_posts (
+                author_id INTEGER PRIMARY KEY, channel_msg_id INTEGER NOT NULL,
                 created_at TEXT DEFAULT (datetime('now')));
         """)
         self._c().commit()
@@ -455,9 +465,19 @@ class Database:
     def mark_feedback_read(self) -> None:
         self._c().execute("UPDATE feedback SET is_read=1 WHERE is_read=0"); self._c().commit()
 
-    def get_client_by_id(self, client_id: int) -> Optional[dict]:
-        row = self._c().execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
-        return dict(row) if row else None
+    # ── Канал-прокладка для контактов без юзернейма ──────────────
+    def get_contact_post(self, author_id: int) -> Optional[int]:
+        row = self._c().execute(
+            "SELECT channel_msg_id FROM contact_posts WHERE author_id=?", (author_id,)).fetchone()
+        return row[0] if row else None
+
+    def save_contact_post(self, author_id: int, msg_id: int) -> None:
+        try:
+            self._c().execute(
+                "INSERT INTO contact_posts(author_id,channel_msg_id) VALUES(?,?)", (author_id, msg_id))
+            self._c().commit()
+        except sqlite3.IntegrityError:
+            pass  # уже есть запись (гонка/повтор) — не страшно, старая ссылка всё ещё рабочая
 
     def set_subscription(self, client_id: int, until: datetime, is_payment: bool = False) -> None:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
@@ -756,6 +776,33 @@ async def get_usdt_rub_rate() -> Optional[float]:
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
 _DS_FAIL = DeepSeekResult(suitable=False, reason="Ошибка API", contact="")
+
+async def get_contact_link(userbot: "TelegramClient", db: Database, author_id: int) -> str:
+    """Для авторов без юзернейма: постит в канал-прокладку (CONTACT_RELAY_CHANNEL)
+    сообщение с упоминанием автора по ID через юзербот. Так как юзербот в этот
+    момент уже располагает полным access_hash автора (только что получил от него
+    сообщение), Telethon кодирует упоминание как настоящую MTProto-сущность
+    (inputMessageEntityMentionName) — она навсегда впечатывается в этот пост и
+    остаётся кликабельной для ЛЮБОГО, кто откроет пост, на любом устройстве, в
+    отличие от голого tg://user?id=, который резолвится только если у смотрящего
+    клиента уже есть кэш этого пользователя. Кэшируем по author_id — на одного
+    автора один пост, переиспользуем его для всех его вакансий."""
+    if not CONTACT_RELAY_CHANNEL or not author_id:
+        return ""
+    cached = db.get_contact_post(author_id)
+    if cached:
+        return f"https://t.me/{CONTACT_RELAY_CHANNEL}/{cached}"
+    try:
+        sent = await userbot.send_message(
+            CONTACT_RELAY_CHANNEL,
+            f"<a href='tg://user?id={author_id}'>Написать автору вакансии</a>",
+            parse_mode="html", link_preview=False)
+        db.save_contact_post(author_id, sent.id)
+        return f"https://t.me/{CONTACT_RELAY_CHANNEL}/{sent.id}"
+    except Exception as e:
+        log.warning(f"get_contact_link({author_id}): {e}")
+        db.add_log("WARNING", f"⚠️ Не удалось создать пост-контакт в канале-прокладке для {author_id}: {e}")
+        return ""
 
 async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSeekResult:
     if not DEEPSEEK_KEY:
@@ -1081,7 +1128,7 @@ def censor_mentions(text: str) -> str:
     return _MENTION_RE.sub("—", text)
 
 def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
-                          subscribed: bool = True) -> tuple[str, InlineKeyboardMarkup]:
+                          subscribed: bool = True, contact_link: str = "") -> tuple[str, InlineKeyboardMarkup]:
     """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
     (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
     вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
@@ -1089,7 +1136,10 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     subscribed=False — версия для клиентов без подписки: любой контакт
     (юзернейм в тексте вакансии, строка "Автор:", ссылка на профиль без
     юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
-    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?"."""
+    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?".
+
+    contact_link — пост в канале-прокладке с настоящим упоминанием автора
+    (см. get_contact_link), передаётся только если у автора нет юзернейма."""
     contact = contact or ""
     if not subscribed:
         v_html = censor_mentions(v_html)
@@ -1103,21 +1153,20 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
         author_line = f"\n\nАвтор: {'—' if not subscribed else html.escape(contact)}"
     elif author_id:
         if not subscribed:
-            # Ссылка tg://user?id= — рабочий способ написать автору напрямую,
-            # без подписки её показывать нельзя точно так же, как юзернейм
+            # Контакт (в любом виде) без подписки не показываем точно так же,
+            # как юзернейм — иначе подписка теряет смысл
             author_line = "\n\nАвтор: —"
+        elif contact_link:
+            # Есть пост в канале-прокладке с настоящим упоминанием автора —
+            # это надёжный способ, работает на любом устройстве у любого
+            # клиента (в отличие от голого tg://user?id=, см. get_contact_link)
+            author_line = (
+                f"\n\n👤 У автора нет юзернейма, но написать ему можно: "
+                f"<a href='{contact_link}'>нажмите здесь</a>"
+            )
         else:
-            # У автора нет юзернейма. По документации Bot API tg://user?id=
-            # гарантированно резолвится только если автор уже писал НАШЕМУ
-            # боту в личку — а случайный автор вакансии из чужого канала этого
-            # никогда не делал, так что для него это в лучшем случае "повезёт
-            # на конкретном устройстве", а не рабочий способ. Поэтому не выдаём
-            # это за реальную ссылку — основной, реально рабочий путь это
-            # перейти в сообщение-источник и написать автору оттуда (там
-            # Telegram видит его по-настоящему, это работает на любом
-            # устройстве). Саму tg://user всё равно оставляем "на удачу" вторым
-            # вариантом — иногда она у конкретного клиента срабатывает, если
-            # автор уже где-то засветился в его Telegram.
+            # Канал-прокладка не настроен/не сработал — старый способ "на
+            # удачу" плюс честная оговорка, что гарантий нет
             link = f"tg://user?id={author_id}"
             author_line = (
                 f"\n\n⚠️ <i>У автора нет юзернейма. Надёжный способ написать ему — "
@@ -1330,10 +1379,15 @@ class VacancyPipeline:
                     self.db.add_log("INFO", f"ℹ️ У автора {sender_id} нет юзернейма "
                                              f"(все 3 способа резолва отработали, юзернейма действительно нет)")
 
+            contact_link = ""
+            if not username and sender_id:
+                contact_link = await get_contact_link(self.userbot, self.db, sender_id)
+
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
                               source_title=source_title, message_link=message_link,
-                              timestamp=datetime.now(), html_text=html_text)
+                              timestamp=datetime.now(), html_text=html_text,
+                              contact_link=contact_link)
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
@@ -1417,7 +1471,7 @@ class VacancyPipeline:
                 msg_text, markup = render_vacancy_client(
                     vacancy.html_text or html.escape(vacancy.text),
                     ds.contact, vacancy.author_id, vacancy.message_link,
-                    subscribed=subscribed)
+                    subscribed=subscribed, contact_link=vacancy.contact_link)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id)
