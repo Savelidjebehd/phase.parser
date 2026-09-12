@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-10 07:20"
+BOT_VERSION    = "2026-09-12 21:02"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -258,6 +258,20 @@ class Database:
         # текстовое сообщение от него в чате с ботом можно было связать именно
         # с той рассылкой, на которую он отвечает
         try: self._c().execute("ALTER TABLE clients ADD COLUMN last_broadcast_id INTEGER")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: ID поста-упоминания в канале-прокладке (если у автора нет
+        # юзернейма) — нужен, чтобы потом (при апгрейде старых сообщений после
+        # оформления подписки) можно было заново построить ссылку на контакт,
+        # а не только в момент самой рассылки
+        try: self._c().execute("ALTER TABLE vacancies ADD COLUMN contact_msg_id INTEGER")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: была ли эта конкретная доставка отправлена клиенту как
+        # подписчику (полная версия) или как бесплатному (урезанная, "Как
+        # откликнуться?") — нужно, чтобы при оформлении подписки апгрейднуть
+        # именно старые бесплатные сообщения, а не трогать остальные
+        try: self._c().execute("ALTER TABLE client_deliveries ADD COLUMN sent_as_subscribed INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -529,9 +543,9 @@ class Database:
         try:
             cur = self._c().execute(
                 "INSERT OR IGNORE INTO vacancies(chat_id,message_id,text,author_username,"
-                "author_id,source_title,message_link,ts,html_text) VALUES(?,?,?,?,?,?,?,?,?)",
+                "author_id,source_title,message_link,ts,html_text,contact_msg_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (v.chat_id, v.message_id, v.text, v.author_username, v.author_id,
-                 v.source_title, v.message_link, v.timestamp.isoformat(), v.html_text))
+                 v.source_title, v.message_link, v.timestamp.isoformat(), v.html_text, v.contact_msg_id or None))
             self._c().commit()
             if cur.lastrowid: return cur.lastrowid
             row = self._c().execute("SELECT id FROM vacancies WHERE chat_id=? AND message_id=?",
@@ -580,16 +594,31 @@ class Database:
         return [dict(r) for r in self._c().execute(q, (limit, offset)).fetchall()]
 
     def save_delivery(self, vacancy_id: int, client_id: int, msg_id: Optional[int],
-                      skipped: bool = False, reason: str = "") -> None:
+                      skipped: bool = False, reason: str = "", subscribed: bool = False) -> None:
         self._c().execute(
-            "INSERT OR IGNORE INTO client_deliveries(vacancy_id,client_id,msg_id,skipped,skip_reason)"
-            " VALUES(?,?,?,?,?)", (vacancy_id, client_id, msg_id, 1 if skipped else 0, reason))
+            "INSERT OR IGNORE INTO client_deliveries(vacancy_id,client_id,msg_id,skipped,skip_reason,sent_as_subscribed)"
+            " VALUES(?,?,?,?,?,?)", (vacancy_id, client_id, msg_id, 1 if skipped else 0, reason, 1 if subscribed else 0))
         self._c().commit()
 
     def get_deliveries(self, vacancy_id: int) -> list[dict]:
         return [dict(r) for r in self._c().execute(
             "SELECT d.*, c.tg_id FROM client_deliveries d JOIN clients c ON d.client_id=c.id "
             "WHERE d.vacancy_id=? AND d.msg_id IS NOT NULL", (vacancy_id,)).fetchall()]
+
+    def get_upgradeable_deliveries(self, client_id: int, limit: int = 100) -> list[dict]:
+        """Доставки этому клиенту, отправленные как бесплатные (урезанный
+        контакт, кнопка "Как откликнуться?"), пока у него не было подписки —
+        нужны, чтобы при её оформлении заменить в этих СТАРЫХ сообщениях
+        кнопку на обычную "Перейти к сообщению"/контакт, как у подписчика."""
+        return [dict(r) for r in self._c().execute(
+            "SELECT d.id AS delivery_id, d.msg_id, v.* FROM client_deliveries d "
+            "JOIN vacancies v ON v.id=d.vacancy_id "
+            "WHERE d.client_id=? AND d.msg_id IS NOT NULL AND d.sent_as_subscribed=0 "
+            "ORDER BY d.id DESC LIMIT ?", (client_id, limit)).fetchall()]
+
+    def mark_delivery_upgraded(self, delivery_id: int) -> None:
+        self._c().execute("UPDATE client_deliveries SET sent_as_subscribed=1 WHERE id=?", (delivery_id,))
+        self._c().commit()
 
     def mark_vacancy_deleted(self, vid: int) -> None:
         self._c().execute("UPDATE vacancies SET deleted_by_admin=1 WHERE id=?", (vid,))
@@ -773,6 +802,34 @@ async def get_usdt_rub_rate() -> Optional[float]:
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
 _DS_FAIL = DeepSeekResult(suitable=False, reason="Ошибка API", contact="")
+
+async def _upgrade_old_deliveries(bot: Bot, cl: dict) -> None:
+    """После оформления/продления подписки — старые вакансии, которые пришли
+    этому клиенту ещё бесплатным (с прочерком вместо контакта и кнопкой "Как
+    откликнуться?"), заменяем на обычный вид подписчика: полный контакт,
+    "Перейти к сообщению" — то же самое сообщение, просто перерисованное.
+    Best-effort: Telegram может отказать редактировать очень старое или уже
+    удалённое сообщение — в этом случае просто пропускаем его и всё равно
+    помечаем как обработанное, чтобы не пытаться бесконечно при каждой
+    следующей подписке."""
+    channel_id = _db.get_setting("contact_relay_channel_id", "")
+    rows = _db.get_upgradeable_deliveries(cl["id"])
+    for v in rows:
+        try:
+            contact_url = ""
+            if v.get("contact_msg_id") and channel_id:
+                contact_url = relay_message_link(channel_id, v["contact_msg_id"])
+            new_text, new_markup = render_vacancy_client(
+                v.get("html_text") or html.escape(v.get("text","")),
+                v.get("ds_contact") or "", v.get("author_id"), v.get("message_link"),
+                subscribed=True, contact_url=contact_url)
+            await bot.edit_message_text(chat_id=cl["tg_id"], message_id=v["msg_id"],
+                                        text=new_text, parse_mode=ParseMode.HTML, reply_markup=new_markup)
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            log.debug(f"_upgrade_old_deliveries {v.get('msg_id')}: {e}")
+        finally:
+            _db.mark_delivery_upgraded(v["delivery_id"])
 
 async def _invite_to_relay_channel(bot: Bot, cl: dict) -> None:
     """После активации/продления подписки — приглашаем клиента в приватный
@@ -1516,7 +1573,7 @@ class VacancyPipeline:
                     subscribed=subscribed, contact_url=contact_url)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
-                self.db.save_delivery(vid, cl_id, sent.message_id)
+                self.db.save_delivery(vid, cl_id, sent.message_id, subscribed=subscribed)
             except Exception as e:
                 log.error(f"Рассылка {cl.get('tg_id')}: {e}")
 
@@ -2570,6 +2627,7 @@ async def admin_give_sub_all_send_cb(call: CallbackQuery):
             if comment: text += f"\n\n{comment}"
             await call.bot.send_message(c["tg_id"], text, parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
             await _invite_to_relay_channel(call.bot, c)
+            await _upgrade_old_deliveries(call.bot, c)
             ok += 1; await asyncio.sleep(0.05)
         except Exception as e:
             log.warning(f"Выдача подписки всем {c.get('tg_id')}: {e}")
@@ -3304,6 +3362,7 @@ async def admin_text_handler(msg: Message):
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
                 parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
             await _invite_to_relay_channel(msg.bot, cl)
+            await _upgrade_old_deliveries(msg.bot, cl)
         except Exception: pass
         return
 
@@ -3326,6 +3385,7 @@ async def admin_text_handler(msg: Message):
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
                 parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
             await _invite_to_relay_channel(msg.bot, cl)
+            await _upgrade_old_deliveries(msg.bot, cl)
         except Exception: pass
         return
 
@@ -3467,6 +3527,7 @@ async def client_start(msg: Message):
         until = _db.extend_subscription(cl["id"], FREE_DAYS)
         cl    = _db.get_client_by_tg(uid)
         await _invite_to_relay_channel(msg.bot, cl)
+        await _upgrade_old_deliveries(msg.bot, cl)
 
         # Реферал — только запоминаем, кто кого пригласил.
         # Дни начисляются позже, только когда приглашённый купит любой тариф (см. admin_confirm_pay_cb).
@@ -3767,6 +3828,7 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
                                 f"Вам начислено <b>+{REF_BONUS_DAYS} дн.</b> к подписке (до {fmt_date(ref_until.isoformat() if hasattr(ref_until,'isoformat') else str(ref_until))}).",
                                 parse_mode=ParseMode.HTML)
                             await _invite_to_relay_channel(call.bot, ref_cl)
+                            await _upgrade_old_deliveries(call.bot, ref_cl)
                         except Exception as e: log.warning(f"Уведомление пригласившему: {e}")
                 except Exception as e:
                     log.error(f"Реферальный бонус: {e}")
@@ -3803,6 +3865,7 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
                     reply_markup=kb_client_main())
                 log.info(f"Клиент {cl['tg_id']} уведомлён")
                 await _invite_to_relay_channel(call.bot, cl)
+                await _upgrade_old_deliveries(call.bot, cl)
             except Exception as e:
                 log.error(f"Уведомление клиента {cl['tg_id']}: {e}")
     except Exception as e:
