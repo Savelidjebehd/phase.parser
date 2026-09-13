@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-12 21:02"
+BOT_VERSION    = "2026-09-13 21:51"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1202,10 +1202,12 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [("⚙️ Настройки","admin_settings")],
     ])
 
+REVIEWS_CHANNEL_URL = "https://t.me/phasereviews"
+
 def kb_client_main() -> InlineKeyboardMarkup:
     return mkb([
         [("👥 Реферальная программа","client_referral")],
-        [("💳 Тарифы","client_tariffs")],
+        [("💳 Тарифы","client_tariffs"), ("⭐ Отзывы", REVIEWS_CHANNEL_URL)],
         [("⚙️ Настройки","client_settings")],
     ])
 
@@ -1245,29 +1247,30 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
         # авторе просто не показываем вообще (не пишем даже плейсхолдер)
         author_line = ""
     elif contact.startswith("@"):
-        author_line = f"\n\nАвтор: {'—' if not subscribed else html.escape(contact)}"
+        author_line = f"\n\n<blockquote>Автор: {'—' if not subscribed else html.escape(contact)}</blockquote>"
     elif author_id:
         if not subscribed:
             # Контакт (в любом виде) без подписки не показываем точно так же,
             # как юзернейм — иначе подписка теряет смысл
-            author_line = "\n\nАвтор: —"
+            author_line = "\n\n<blockquote>Автор: —</blockquote>"
         elif contact_url:
             # Есть пост в приватном канале-прокладке с настоящим упоминанием
             # автора — надёжный способ, работает на любом устройстве
-            author_line = "\n\n👤 У автора нет юзернейма, но написать ему можно кнопкой ниже"
+            author_line = "\n\n<blockquote>👤 У автора нет юзернейма, но написать ему можно кнопкой ниже</blockquote>"
             extra_button = ("💬 Контакт автора", contact_url)
         else:
             # Канал-прокладка не настроен/не сработал — старый способ "на
             # удачу" плюс честная оговорка, что гарантий нет
             link = f"tg://user?id={author_id}"
             author_line = (
-                f"\n\n⚠️ <i>У автора нет юзернейма. Надёжный способ написать ему — "
+                f"\n\n<blockquote>Автор: <a href='{link}'>{link}</a></blockquote>"
+                f"\n<blockquote><i>⚠️ У автора нет юзернейма. Надёжный способ написать ему — "
                 f"перейти в сообщение по кнопке ниже и написать прямо там (работает "
-                f"на любом устройстве). Также можно попробовать</i> <a href='{link}'>прямую ссылку</a>"
-                f" <i>— иногда открывает профиль, но не гарантированно</i> ⚠️"
+                f"на любом устройстве). Также можно попробовать прямую ссылку выше "
+                f"— иногда открывает профиль, но не гарантированно ⚠️</i></blockquote>"
             )
     else:
-        author_line = "\n\n⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️"
+        author_line = "\n\n<blockquote>⚠️ Автор не определён, перейдите к сообщению по кнопке ниже ⚠️</blockquote>"
 
     msg_text = f"📢 <b>Новая вакансия</b>\n\n{v_html}{author_line}"
 
@@ -1716,14 +1719,14 @@ async def admin_src_add_cb(call: CallbackQuery):
         async for dialog in _userbot.iter_dialogs(limit=300):
             e = dialog.entity
             cls = e.__class__.__name__
-            # Только группы и супергруппы — без каналов и личных чатов
+            # Группы, супергруппы и каналы — без личных чатов с людьми
             is_supergroup = getattr(e, "megagroup", False) or getattr(e, "gigagroup", False)
             is_basic_chat = cls == "Chat"
             is_broadcast  = getattr(e, "broadcast", False)
             is_user       = cls == "User"
-            if is_user or is_broadcast:
+            if is_user:
                 continue
-            if not (is_supergroup or is_basic_chat):
+            if not (is_supergroup or is_basic_chat or is_broadcast):
                 continue
             chats.append({
                 "id":       str(dialog.id),
@@ -1739,7 +1742,7 @@ async def admin_src_add_cb(call: CallbackQuery):
 
     if not chats:
         await safe_edit(call,
-            "😕 <b>Групп не найдено</b>\n\nUserBot не состоит ни в одной группе.",
+            "😕 <b>Ничего не найдено</b>\n\nUserBot не состоит ни в одной группе или канале.",
             kb_back("admin_sources"))
         return
 
@@ -2490,6 +2493,8 @@ async def _show_clients_page(call: CallbackQuery, page: int) -> None:
     limit   = 30
     clients = _db.get_all_clients()
     now     = datetime.now().isoformat()
+    # Подписчики — первыми (среди них тоже новые сверху), затем остальные
+    clients.sort(key=lambda c: (c.get("sub_until") or "") <= now)
     chunk   = clients[page*limit:(page+1)*limit]
     rows    = []
     for c in chunk:
@@ -3649,6 +3654,29 @@ def _tariffs_kb(cl: dict) -> InlineKeyboardMarkup:
     rows.append([("◀️ Главное меню","client_main")])
     return mkb(rows)
 
+def _winback_price(cl: dict, tariff: str) -> int:
+    """Цена тарифа со скидкой 15% для win-back сообщения (напоминание после
+    окончания подписки, см. _check_expired_subs) — считается от той цены,
+    которая обычно была бы у этого клиента (full/sale), а не от фиксированной
+    базы, чтобы не давать двойную скидку новым клиентам поверх их и так
+    сниженной первой цены."""
+    p = PRICES[tariff]
+    has_paid = bool(cl.get("first_payment"))
+    base = p["full"] if has_paid else p["sale"]
+    return round(base * 0.85)
+
+def _tariffs_kb_winback(cl: dict) -> InlineKeyboardMarkup:
+    """Тарифы со скидкой 15% — специально для win-back напоминания клиентам,
+    у которых закончилась подписка (текст "Дарим скидку 15%..." в
+    _check_expired_subs). client_buy:{tariff}:wb15 — client_buy_cb по этому
+    суффиксу знает, что применить скидку, а не обычную цену."""
+    rows = []
+    for key, p in PRICES.items():
+        price = _winback_price(cl, key)
+        rows.append([(f"{price}₽🔥 за {p['label']}", f"client_buy:{key}:wb15")])
+    rows.append([("◀️ Главное меню","client_main")])
+    return mkb(rows)
+
 @client_router.callback_query(F.data == "client_tariffs")
 async def client_tariffs_cb(call: CallbackQuery):
     uid = call.from_user.id; uname = call.from_user.username
@@ -3670,18 +3698,20 @@ async def client_how_reply_cb(call: CallbackQuery):
 @client_router.callback_query(F.data.startswith("client_buy:"))
 async def client_buy_cb(call: CallbackQuery):
     uid     = call.from_user.id
-    tariff  = call.data.split(":")[1]
+    parts   = call.data.split(":")
+    tariff  = parts[1]
+    winback = len(parts) > 2 and parts[2] == "wb15"
     p       = PRICES.get(tariff)
     if not p: await call.answer("Неверный тариф"); return
     cl      = _db.get_or_create_client(uid, call.from_user.username)
     has_paid = bool(cl.get("first_payment"))
-    amount  = p["full"] if has_paid else p["sale"]
+    amount  = _winback_price(cl, tariff) if winback else (p["full"] if has_paid else p["sale"])
     ticket  = f"DRAFT-{int(time.time()*1000)}"
     _payment_drafts[ticket] = {"client_id": cl["id"], "tariff": tariff, "amount": amount,
                               "days": p["days"], "method": "rub"}
     log.info(f"Черновик оплаты создан: {ticket} (клиент {uid}, тариф {tariff}) — в БД пока не пишем, "
              f"пока клиент не нажмёт «Оплатил(а)»")
-    fire    = "" if has_paid else "🔥"
+    fire    = "" if (has_paid and not winback) else "🔥"
     uname_hint = f"@{call.from_user.username}" if call.from_user.username else f"<code>{uid}</code>"
     text    = (
         f"Тариф <b>{p['label']}</b>\n\n"
@@ -3693,7 +3723,7 @@ async def client_buy_cb(call: CallbackQuery):
     )
     markup = mkb([
         [("✅ Оплатил(а)", f"client_paid:{ticket}")],
-        [("💱 Оплатить в USDT", f"client_buy_crypto:{tariff}")],
+        [("💱 Оплатить в USDT", f"client_buy_crypto:{tariff}" + (":wb15" if winback else ""))],
         [("◀️ Главное меню","client_main")],
     ])
     await safe_edit(call, text, markup)
@@ -3701,14 +3731,16 @@ async def client_buy_cb(call: CallbackQuery):
 @client_router.callback_query(F.data.startswith("client_buy_crypto:"))
 async def client_buy_crypto_cb(call: CallbackQuery):
     uid    = call.from_user.id
-    tariff = call.data.split(":")[1]
+    parts   = call.data.split(":")
+    tariff  = parts[1]
+    winback = len(parts) > 2 and parts[2] == "wb15"
     p      = PRICES.get(tariff)
     if not p: await call.answer("Неверный тариф"); return
     if not CRYPTO_WALLET:
         await call.answer("Оплата в USDT временно недоступна", show_alert=True); return
     cl       = _db.get_or_create_client(uid, call.from_user.username)
     has_paid = bool(cl.get("first_payment"))
-    amount   = p["full"] if has_paid else p["sale"]
+    amount   = _winback_price(cl, tariff) if winback else (p["full"] if has_paid else p["sale"])
     rate     = await get_usdt_rub_rate()
     if not rate:
         await call.answer("Не удалось получить курс, попробуйте ещё раз через минуту", show_alert=True)
@@ -4252,7 +4284,7 @@ async def _check_expired_subs(bot: Bot) -> None:
                         "Дарим скидку <b>15%</b> на все тарифы!\n"
                         "Подключитесь чтобы получать новые заказы",
                         parse_mode=ParseMode.HTML,
-                        reply_markup=_tariffs_kb(cl))
+                        reply_markup=_tariffs_kb_winback(cl))
                     _db.set_setting(sent_key, now.strftime("%Y-%m-%d"))
                 except Exception: pass
         except Exception as e: log.error(f"_check_expired_subs: {e}")
