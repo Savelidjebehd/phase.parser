@@ -35,7 +35,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInv
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
-    PeerChannel,
+    PeerChannel, InputMessageEntityMentionName, InputUser, InputPeerUser,
 )
 
 # ── Конфигурация ──────────────────────────────────────────────
@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-13 21:51"
+BOT_VERSION    = "2026-09-14 11:36"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -274,6 +274,18 @@ class Database:
         try: self._c().execute("ALTER TABLE client_deliveries ADD COLUMN sent_as_subscribed INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
         self._c().commit()
+        # Одноразовая миграция: старые посты в канале-прокладке создавались
+        # через HTML-парсинг tg://user?id= в Telethon, который на практике не
+        # всегда превращает ссылку в настоящую кликабельную MTProto-сущность
+        # (жалоба: "ничего не происходит" при нажатии). Теперь упоминание
+        # строится вручную через inputMessageEntityMentionName — гарантированно
+        # рабочий способ. Старые посты этим не чинятся (они уже отправлены и
+        # такими и останутся), поэтому чистим кэш один раз, чтобы для всех
+        # авторов посты пересоздались заново уже правильным способом.
+        if self.get_setting("contact_posts_v2_migrated", "") != "1":
+            self._c().execute("DELETE FROM contact_posts")
+            self.set_setting("contact_posts_v2_migrated", "1")
+            self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
         if not self._c().execute("SELECT 1 FROM keywords WHERE type='soft_root' LIMIT 1").fetchone():
             for w in SOFT_ROOT_SEED:
@@ -883,9 +895,20 @@ async def get_contact_link(userbot: TelegramClient, db: Database, author_id: int
         bot_api_id = int(channel_id)
         raw_id = -bot_api_id - 10**12 if bot_api_id < -10**12 else abs(bot_api_id)
         entity = await userbot.get_entity(PeerChannel(raw_id))
-        sent = await userbot.send_message(
-            entity, f"<a href='tg://user?id={author_id}'>Написать автору вакансии</a>",
-            parse_mode="html", link_preview=False)
+        # ВАЖНО: не полагаемся на то, что HTML-парсер Telethon сам превратит
+        # <a href="tg://user?id=..."> в настоящую MTProto-сущность упоминания —
+        # на практике это не всегда срабатывает (проверено: клиенты получали
+        # некликабельный текст). Строим inputMessageEntityMentionName вручную —
+        # это ЯВНО задокументированный официальный способ создать упоминание
+        # по ID, без всякой магии парсинга.
+        author_input = await userbot.get_input_entity(author_id)
+        if not isinstance(author_input, InputPeerUser):
+            raise ValueError(f"нет access_hash для {author_id} (get_input_entity вернул {type(author_input).__name__})")
+        text = "Написать автору вакансии"
+        mention = InputMessageEntityMentionName(
+            offset=0, length=len(text),
+            user_id=InputUser(user_id=author_input.user_id, access_hash=author_input.access_hash))
+        sent = await userbot.send_message(entity, text, formatting_entities=[mention], link_preview=False)
         db.save_contact_post(author_id, sent.id)
         return "ok", sent.id
     except Exception as e:
