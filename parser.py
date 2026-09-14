@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-14 11:58"
+BOT_VERSION    = "2026-09-14 13:21"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1472,10 +1472,17 @@ class VacancyPipeline:
                 # голому ID. Самый надёжный вариант, пробуем первым.
                 try:
                     input_sender = await msg.get_input_sender()
-                    if input_sender:
+                    if not input_sender:
+                        self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 1): get_input_sender() вернул пусто")
+                    else:
                         full = await self.userbot(GetFullUserRequest(input_sender))
                         if full.users:
                             username = getattr(full.users[0], "username", None) or ""
+                            if not username:
+                                self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 1): пользователь получен, "
+                                                          "но username пуст")
+                        else:
+                            self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 1): GetFullUserRequest без users")
                 except Exception as e:
                     log.debug(f"GetFullUserRequest(input_sender): {e}")
                     self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 1, input_sender) не удался: {e}")
@@ -1508,9 +1515,18 @@ class VacancyPipeline:
                     try:
                         chat_ent = await event.get_input_chat()
                         fresh = await self.userbot.get_messages(chat_ent, ids=message_id)
-                        if fresh:
+                        if not fresh:
+                            self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 4): get_messages вернул пусто")
+                        else:
                             fresh_sender = await fresh.get_sender()
-                            username = getattr(fresh_sender, "username", None) or ""
+                            if not fresh_sender:
+                                self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 4): get_sender() у свежего "
+                                                          "сообщения вернул пусто")
+                            else:
+                                username = getattr(fresh_sender, "username", None) or ""
+                                if not username:
+                                    self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 4): отправитель получен "
+                                                              f"({type(fresh_sender).__name__}), но username пуст")
                     except Exception as e:
                         self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 4, get_messages) не удался: {e}")
                 if not username:
