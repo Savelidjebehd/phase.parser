@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-14 11:36"
+BOT_VERSION    = "2026-09-14 11:58"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1496,9 +1496,26 @@ class VacancyPipeline:
                     except Exception as e:
                         log.debug(f"GetFullUserRequest({sender_id}): {e}")
                         self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 3, по ID) не удался: {e}")
+                # 4) Шаги 1-3 упираются в отсутствие access_hash в кэше — если
+                # его там просто нет (Telegram не докинул полные данные
+                # отправителя в само live-событие, так бывает с нечастыми в
+                # этом чате юзерами в больших группах), по голому ID ничего не
+                # резолвится в принципе. Явный повторный запрос ЭТОГО ЖЕ
+                # сообщения с сервера (а не из уже полученного апдейта) обычно
+                # приходит с полными данными отправителя — Telegram досылает
+                # их при точечном запросе иначе, чем в live-потоке.
+                if not username:
+                    try:
+                        chat_ent = await event.get_input_chat()
+                        fresh = await self.userbot.get_messages(chat_ent, ids=message_id)
+                        if fresh:
+                            fresh_sender = await fresh.get_sender()
+                            username = getattr(fresh_sender, "username", None) or ""
+                    except Exception as e:
+                        self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 4, get_messages) не удался: {e}")
                 if not username:
                     self.db.add_log("INFO", f"ℹ️ У автора {sender_id} нет юзернейма "
-                                             f"(все 3 способа резолва отработали, юзернейма действительно нет)")
+                                             f"(все 4 способа резолва отработали, юзернейма действительно нет)")
 
             contact_msg_id = 0
             if not username and sender_id:
