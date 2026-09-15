@@ -19,7 +19,6 @@ from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, Message, BotCommand, BotCommandScopeChat,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
-    MessageOriginChannel, ChatMemberUpdated,
 )
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -36,7 +35,6 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInv
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
-    PeerChannel, InputMessageEntityMentionName, InputUser, InputPeerUser,
 )
 
 # ── Конфигурация ──────────────────────────────────────────────
@@ -50,7 +48,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-15 06:26"
+BOT_VERSION    = "2026-09-15 14:58"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -125,8 +123,6 @@ class Vacancy:
     chat_id: int; message_id: int; text: str; author_username: str
     author_id: int; source_title: str; message_link: str; timestamp: datetime
     html_text: str = ""
-    contact_msg_id: int = 0  # ID поста-упоминания в приватном канале-прокладке,
-                              # если у автора нет юзернейма (см. get_contact_link)
 
 @dataclass
 class DeepSeekResult:
@@ -226,9 +222,6 @@ class Database:
                 broadcast_id INTEGER REFERENCES broadcasts(id) ON DELETE SET NULL,
                 text TEXT NOT NULL, is_read INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')));
-            CREATE TABLE IF NOT EXISTS contact_posts (
-                author_id INTEGER PRIMARY KEY, channel_msg_id INTEGER NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')));
         """)
         self._c().commit()
         # Миграция: добавляем поля для крипто-оплаты в уже существующую БД
@@ -261,13 +254,6 @@ class Database:
         try: self._c().execute("ALTER TABLE clients ADD COLUMN last_broadcast_id INTEGER")
         except sqlite3.OperationalError: pass
         self._c().commit()
-        # Миграция: ID поста-упоминания в канале-прокладке (если у автора нет
-        # юзернейма) — нужен, чтобы потом (при апгрейде старых сообщений после
-        # оформления подписки) можно было заново построить ссылку на контакт,
-        # а не только в момент самой рассылки
-        try: self._c().execute("ALTER TABLE vacancies ADD COLUMN contact_msg_id INTEGER")
-        except sqlite3.OperationalError: pass
-        self._c().commit()
         # Миграция: была ли эта конкретная доставка отправлена клиенту как
         # подписчику (полная версия) или как бесплатному (урезанная, "Как
         # откликнуться?") — нужно, чтобы при оформлении подписки апгрейднуть
@@ -275,18 +261,6 @@ class Database:
         try: self._c().execute("ALTER TABLE client_deliveries ADD COLUMN sent_as_subscribed INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
         self._c().commit()
-        # Одноразовая миграция: старые посты в канале-прокладке создавались
-        # через HTML-парсинг tg://user?id= в Telethon, который на практике не
-        # всегда превращает ссылку в настоящую кликабельную MTProto-сущность
-        # (жалоба: "ничего не происходит" при нажатии). Теперь упоминание
-        # строится вручную через inputMessageEntityMentionName — гарантированно
-        # рабочий способ. Старые посты этим не чинятся (они уже отправлены и
-        # такими и останутся), поэтому чистим кэш один раз, чтобы для всех
-        # авторов посты пересоздались заново уже правильным способом.
-        if self.get_setting("contact_posts_v2_migrated", "") != "1":
-            self._c().execute("DELETE FROM contact_posts")
-            self.set_setting("contact_posts_v2_migrated", "1")
-            self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
         if not self._c().execute("SELECT 1 FROM keywords WHERE type='soft_root' LIMIT 1").fetchone():
             for w in SOFT_ROOT_SEED:
@@ -490,20 +464,6 @@ class Database:
     def mark_feedback_read(self) -> None:
         self._c().execute("UPDATE feedback SET is_read=1 WHERE is_read=0"); self._c().commit()
 
-    # ── Канал-прокладка для контактов без юзернейма ──────────────
-    def get_contact_post(self, author_id: int) -> Optional[int]:
-        row = self._c().execute(
-            "SELECT channel_msg_id FROM contact_posts WHERE author_id=?", (author_id,)).fetchone()
-        return row[0] if row else None
-
-    def save_contact_post(self, author_id: int, msg_id: int) -> None:
-        try:
-            self._c().execute(
-                "INSERT INTO contact_posts(author_id,channel_msg_id) VALUES(?,?)", (author_id, msg_id))
-            self._c().commit()
-        except sqlite3.IntegrityError:
-            pass  # уже есть запись (гонка/повтор) — не страшно, старая ссылка всё ещё рабочая
-
     def set_subscription(self, client_id: int, until: datetime, is_payment: bool = False) -> None:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
         if is_payment:
@@ -557,9 +517,9 @@ class Database:
         try:
             cur = self._c().execute(
                 "INSERT OR IGNORE INTO vacancies(chat_id,message_id,text,author_username,"
-                "author_id,source_title,message_link,ts,html_text,contact_msg_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "author_id,source_title,message_link,ts,html_text) VALUES(?,?,?,?,?,?,?,?,?)",
                 (v.chat_id, v.message_id, v.text, v.author_username, v.author_id,
-                 v.source_title, v.message_link, v.timestamp.isoformat(), v.html_text, v.contact_msg_id or None))
+                 v.source_title, v.message_link, v.timestamp.isoformat(), v.html_text))
             self._c().commit()
             if cur.lastrowid: return cur.lastrowid
             row = self._c().execute("SELECT id FROM vacancies WHERE chat_id=? AND message_id=?",
@@ -826,17 +786,13 @@ async def _upgrade_old_deliveries(bot: Bot, cl: dict) -> None:
     удалённое сообщение — в этом случае просто пропускаем его и всё равно
     помечаем как обработанное, чтобы не пытаться бесконечно при каждой
     следующей подписке."""
-    channel_id = _db.get_setting("contact_relay_channel_id", "")
     rows = _db.get_upgradeable_deliveries(cl["id"])
     for v in rows:
         try:
-            contact_url = ""
-            if v.get("contact_msg_id") and channel_id:
-                contact_url = relay_message_link(channel_id, v["contact_msg_id"])
             new_text, new_markup = render_vacancy_client(
                 v.get("html_text") or html.escape(v.get("text","")),
                 v.get("ds_contact") or "", v.get("author_id"), v.get("message_link"),
-                subscribed=True, contact_url=contact_url)
+                subscribed=True)
             await bot.edit_message_text(chat_id=cl["tg_id"], message_id=v["msg_id"],
                                         text=new_text, parse_mode=ParseMode.HTML, reply_markup=new_markup)
             await asyncio.sleep(0.05)
@@ -844,79 +800,6 @@ async def _upgrade_old_deliveries(bot: Bot, cl: dict) -> None:
             log.debug(f"_upgrade_old_deliveries {v.get('msg_id')}: {e}")
         finally:
             _db.mark_delivery_upgraded(v["delivery_id"])
-
-async def _invite_to_relay_channel(bot: Bot, cl: dict) -> None:
-    """После активации/продления подписки — приглашаем клиента в приватный
-    канал-прокладку (там контакты авторов без юзернейма). Обычная ссылка на
-    вступление, БЕЗ режима "заявка на вступление" — входит сразу в один тап,
-    без лишних кнопок и ожидания одобрения. Подписку дальше проверяет
-    relay_channel_member_cb сразу после того, как человек фактически вступил."""
-    channel_id = _db.get_setting("contact_relay_channel_id", "")
-    if not channel_id: return
-    try:
-        link = await bot.create_chat_invite_link(chat_id=int(channel_id), member_limit=1)
-        await bot.send_message(cl["tg_id"],
-            "Чтобы получать контакты заказчиков без юзернейма, вступите в группу:",
-            reply_markup=mkb([[("➡️ Вступить", link.invite_link)]]))
-    except Exception as e:
-        log.warning(f"_invite_to_relay_channel({cl.get('tg_id')}): {e}")
-
-def relay_message_link(channel_bot_api_id: str, msg_id: int) -> str:
-    """Ссылка на конкретное сообщение в приватном канале-прокладке — работает
-    только для тех, кто уже состоит в канале (Telegram так устроен для
-    приватных каналов: t.me/c/<raw_id>/<msg_id> без username). raw_id — тот
-    же internal_id без префикса -100, что и для Telethon PeerChannel."""
-    bot_api_id = int(channel_bot_api_id)
-    raw_id = -bot_api_id - 10**12 if bot_api_id < -10**12 else abs(bot_api_id)
-    return f"https://t.me/c/{raw_id}/{msg_id}"
-
-async def get_contact_link(userbot: TelegramClient, db: Database, author_id: int) -> tuple[str, int]:
-    """Для авторов без юзернейма: постит в ПРИВАТНЫЙ канал-прокладку сообщение
-    с упоминанием автора по ID через юзербот. Юзербот в этот момент уже
-    располагает полным access_hash автора (только что получил от него
-    сообщение), поэтому Telethon кодирует упоминание как настоящую MTProto-
-    сущность (inputMessageEntityMentionName) — она навсегда впечатывается в
-    этот пост и остаётся кликабельной для ЛЮБОГО, кто его увидит, на любом
-    устройстве. Канал приватный (без username) — попасть на сам пост по ссылке
-    нельзя, доступ только через copy_message из клиент-бота (см. client_contact_cb),
-    то есть только те, кто уже дошёл до конкретной вакансии в самом боте.
-    Кэшируем по author_id — на одного автора один пост, переиспользуем для всех
-    его вакансий. Возвращает (заголовок для показа, msg_id) — msg_id=0 если не
-    получилось/канал не настроен."""
-    channel_id = db.get_setting("contact_relay_channel_id", "")
-    if not channel_id or not author_id:
-        return "", 0
-    cached = db.get_contact_post(author_id)
-    if cached:
-        return "ok", cached
-    try:
-        # Bot API отдаёт ID канала как -100xxxxxxxxxx, а Telethon PeerChannel
-        # ждёт "сырой" internal_id без этого префикса и без минуса — та же
-        # конвертация, что и в relay_message_link, только в обратную сторону
-        # использования (для адресации самого запроса, а не для ссылки)
-        bot_api_id = int(channel_id)
-        raw_id = -bot_api_id - 10**12 if bot_api_id < -10**12 else abs(bot_api_id)
-        entity = await userbot.get_entity(PeerChannel(raw_id))
-        # ВАЖНО: не полагаемся на то, что HTML-парсер Telethon сам превратит
-        # <a href="tg://user?id=..."> в настоящую MTProto-сущность упоминания —
-        # на практике это не всегда срабатывает (проверено: клиенты получали
-        # некликабельный текст). Строим inputMessageEntityMentionName вручную —
-        # это ЯВНО задокументированный официальный способ создать упоминание
-        # по ID, без всякой магии парсинга.
-        author_input = await userbot.get_input_entity(author_id)
-        if not isinstance(author_input, InputPeerUser):
-            raise ValueError(f"нет access_hash для {author_id} (get_input_entity вернул {type(author_input).__name__})")
-        text = "Написать автору вакансии"
-        mention = InputMessageEntityMentionName(
-            offset=0, length=len(text),
-            user_id=InputUser(user_id=author_input.user_id, access_hash=author_input.access_hash))
-        sent = await userbot.send_message(entity, text, formatting_entities=[mention], link_preview=False)
-        db.save_contact_post(author_id, sent.id)
-        return "ok", sent.id
-    except Exception as e:
-        log.warning(f"get_contact_link({author_id}): {e}")
-        db.add_log("WARNING", f"⚠️ Не удалось создать пост-контакт в канале-прокладке для {author_id}: {e}")
-        return "", 0
 
 async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSeekResult:
     if not DEEPSEEK_KEY:
@@ -1244,7 +1127,7 @@ def censor_mentions(text: str) -> str:
     return _MENTION_RE.sub("—", text)
 
 def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
-                          subscribed: bool = True, contact_url: str = "") -> tuple[str, InlineKeyboardMarkup]:
+                          subscribed: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
     (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
     вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
@@ -1252,20 +1135,11 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     subscribed=False — версия для клиентов без подписки: любой контакт
     (юзернейм в тексте вакансии, строка "Автор:", ссылка на профиль без
     юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
-    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?".
-
-    contact_url — прямая ссылка на пост-упоминание в ПРИВАТНОМ канале-прокладке
-    (см. relay_message_link/get_contact_link), передаётся только если у автора
-    нет юзернейма. Открыть её может только тот, кто уже состоит в канале —
-    подписчик вступает туда один раз при активации подписки (см.
-    _invite_to_relay_channel) и удаляется оттуда при её окончании, так что
-    сама ссылка не требует отдельной проверки — Telegram не пустит в канал
-    того, кого там уже нет."""
+    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?"."""
     contact = contact or ""
     if not subscribed:
         v_html = censor_mentions(v_html)
 
-    extra_button = None
     if contact.lower().endswith("bot"):
         # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
         # от своего имени) — писать ему по вакансии бессмысленно, строку об
@@ -1278,14 +1152,12 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
             # Контакт (в любом виде) без подписки не показываем точно так же,
             # как юзернейм — иначе подписка теряет смысл
             author_line = "\n\n<blockquote>Автор: —</blockquote>"
-        elif contact_url:
-            # Есть пост в приватном канале-прокладке с настоящим упоминанием
-            # автора — надёжный способ, работает на любом устройстве
-            author_line = "\n\n<blockquote>👤 У автора нет юзернейма, но написать ему можно кнопкой ниже</blockquote>"
-            extra_button = ("💬 Контакт автора", contact_url)
         else:
-            # Канал-прокладка не настроен/не сработал — старый способ "на
-            # удачу" плюс честная оговорка, что гарантий нет
+            # У автора нет юзернейма — единственный по-настоящему надёжный
+            # способ написать ему это перейти в сообщение-источник и написать
+            # там (Telegram резолвит его правильно в контексте общего чата).
+            # Прямая ссылка tg://user?id= иногда тоже открывает профиль, но
+            # без каких-либо гарантий — оставляем как запасной вариант.
             link = f"tg://user?id={author_id}"
             author_line = (
                 f"\n\n<blockquote>Автор: <a href='{link}'>{link}</a></blockquote>"
@@ -1300,10 +1172,7 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     msg_text = f"📢 <b>Новая вакансия</b>\n\n{v_html}{author_line}"
 
     if subscribed:
-        rows = [[("🔗 Перейти к сообщению", message_link)]] if message_link else []
-        if extra_button:
-            rows.append([extra_button])
-        markup = mkb(rows) if rows else None
+        markup = mkb([[("🔗 Перейти к сообщению", message_link)]]) if message_link else None
     else:
         # Без подписки кнопку-переход не даём — по ней видно настоящий
         # контакт в канале-источнике, это как раз то, что должна закрывать
@@ -1573,15 +1442,10 @@ class VacancyPipeline:
                 if svid: self.db.update_vacancy_ds(svid, False, "Пропущено: нет юзернейма", "")
                 return
 
-            contact_msg_id = 0
-            if not username and sender_id:
-                _, contact_msg_id = await get_contact_link(self.userbot, self.db, sender_id)
-
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
                               source_title=source_title, message_link=message_link,
-                              timestamp=datetime.now(), html_text=html_text,
-                              contact_msg_id=contact_msg_id)
+                              timestamp=datetime.now(), html_text=html_text)
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
@@ -1662,14 +1526,10 @@ class VacancyPipeline:
                     self.db.save_delivery(vid, cl_id, None, skipped=True, reason=f"sw:{hit[0]}"); continue
 
                 subscribed = bool(cl.get("sub_until") and cl["sub_until"] > now)
-                contact_url = ""
-                if vacancy.contact_msg_id:
-                    ch_id = self.db.get_setting("contact_relay_channel_id", "")
-                    if ch_id: contact_url = relay_message_link(ch_id, vacancy.contact_msg_id)
                 msg_text, markup = render_vacancy_client(
                     vacancy.html_text or html.escape(vacancy.text),
                     ds.contact, vacancy.author_id, vacancy.message_link,
-                    subscribed=subscribed, contact_url=contact_url)
+                    subscribed=subscribed)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id, subscribed=subscribed)
@@ -2727,7 +2587,6 @@ async def admin_give_sub_all_send_cb(call: CallbackQuery):
             text  = f"🎁 Вам начислено <b>+{days} дн.</b> к подписке!\nАктивна до: <b>{fmt_date(until.isoformat())}</b>"
             if comment: text += f"\n\n{comment}"
             await call.bot.send_message(c["tg_id"], text, parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
-            await _invite_to_relay_channel(call.bot, c)
             await _upgrade_old_deliveries(call.bot, c)
             ok += 1; await asyncio.sleep(0.05)
         except Exception as e:
@@ -2865,36 +2724,10 @@ async def admin_settings_cb(call: CallbackQuery):
           "admin_settings_toggle:skip_no_username")],
         [("📣 Оповещения", "admin_notifications")],
         [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
-        [("🔗 Канал-прокладка (контакты)", "admin_relay_channel")],
         [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
         [("◀️ Главное меню","admin_main")],
     ])
     await safe_edit(call, "<b>⚙️ Настройки</b>", markup)
-
-@admin_router.callback_query(F.data == "admin_relay_channel")
-async def admin_relay_channel_cb(call: CallbackQuery):
-    channel_id = _db.get_setting("contact_relay_channel_id", "")
-    status = f"настроен (ID: <code>{channel_id}</code>)" if channel_id else "не настроен"
-    text = (
-        "<b>🔗 Канал-прокладка для контактов</b>\n\n"
-        f"Статус: {status}\n\n"
-        "Нужен для вакансий, у автора которых нет юзернейма — юзербот "
-        "публикует туда пост с настоящим упоминанием автора. Доступ к каналу "
-        "автоматический: при активации подписки клиент получает ссылку и "
-        "вступает сразу (без заявок на вступление), а при её окончании бот "
-        "сам удаляет его из канала — вернуться можно только по новой ссылке "
-        "после новой оплаты. Канал должен быть <b>приватным</b> (без "
-        "username) — иначе доступ не ограничить.\n\n"
-        "<b>Настройка (один раз):</b>\n"
-        "1. Создайте приватный канал в Telegram (любое название)\n"
-        "2. Добавьте туда юзербот-аккаунт админом с правом «Публикация сообщений»\n"
-        "3. Добавьте туда САМ этот бот админом с правами «Пригласительные "
-        "ссылки» и «Блокировка пользователей» (без них авто-впуск и "
-        "авто-удаление работать не будут)\n"
-        "4. Отправьте в канал любое сообщение и перешлите его сюда, в этот чат"
-    )
-    _admin_pending[call.from_user.id] = "relay_channel_setup"
-    await safe_edit(call, text, kb_back("admin_settings"))
 
 @admin_router.callback_query(F.data == "admin_broadcast_settings")
 async def admin_broadcast_settings_cb(call: CallbackQuery):
@@ -3198,25 +3031,6 @@ async def admin_text_handler(msg: Message):
     if not action: return
     text = msg.text.strip()
 
-    # ── Настройка канала-прокладки для контактов ────────────────
-    if action == "relay_channel_setup":
-        if isinstance(msg.forward_origin, MessageOriginChannel):
-            channel_id = msg.forward_origin.chat.id
-            _db.set_setting("contact_relay_channel_id", str(channel_id))
-            await safe_answer(msg,
-                f"✅ Канал настроен (ID: <code>{channel_id}</code>).\n\n"
-                f"Проверьте, что юзербот и сам бот добавлены туда админами — "
-                f"иначе постить/читать контакты не смогут.",
-                kb_back("admin_settings"))
-        else:
-            _admin_pending[uid] = "relay_channel_setup"
-            await safe_answer(msg,
-                "Это не похоже на пересланное сообщение из канала. "
-                "Перешлите сюда любое сообщение именно из того канала "
-                "(не копируйте текст, а именно перешлите — кнопкой Forward).",
-                kb_back("admin_settings"))
-        return
-
     # ── Авторизация UserBot ────────────────────────────────────
     if action == "userbot_auth_phone":
         phone = text if text.startswith("+") else "+" + text
@@ -3465,7 +3279,6 @@ async def admin_text_handler(msg: Message):
             await msg.bot.send_message(tg_id,
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
                 parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
-            await _invite_to_relay_channel(msg.bot, cl)
             await _upgrade_old_deliveries(msg.bot, cl)
         except Exception: pass
         return
@@ -3488,7 +3301,6 @@ async def admin_text_handler(msg: Message):
             await msg.bot.send_message(cl["tg_id"],
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
                 parse_mode=ParseMode.HTML, reply_markup=kb_client_main())
-            await _invite_to_relay_channel(msg.bot, cl)
             await _upgrade_old_deliveries(msg.bot, cl)
         except Exception: pass
         return
@@ -3591,33 +3403,6 @@ def _client_main_text(cl: dict, is_new: bool = False) -> str:
         f"📅 Срок действия подписки: {sub}"
     )
 
-@client_router.chat_member()
-async def relay_channel_member_cb(update: ChatMemberUpdated) -> None:
-    """Проверка подписки СРАЗУ ПОСЛЕ фактического вступления в канал-прокладку
-    (не через режим "заявка на вступление" — вход по ссылке мгновенный, без
-    лишней кнопки-одобрения). Если у вступившего нет активной подписки —
-    сразу же удаляем (бан+разбан = кик, без запрета вернуться в будущем по
-    новой ссылке). Если подписка есть — ничего не делаем, человек остаётся."""
-    channel_id = _db.get_setting("contact_relay_channel_id", "")
-    if not channel_id or str(update.chat.id) != channel_id:
-        return
-    # Интересует только сам факт вступления (был не в чате/заявка → стал member)
-    if update.new_chat_member.status != "member":
-        return
-    if update.old_chat_member.status in ("member", "administrator", "creator"):
-        return
-    tg_id = update.new_chat_member.user.id
-    cl = _db.get_client_by_tg(tg_id)
-    now = datetime.now().isoformat()
-    if cl and cl.get("sub_until") and cl["sub_until"] > now:
-        return  # подписка активна — оставляем как есть
-    try:
-        await update.bot.ban_chat_member(chat_id=int(channel_id), user_id=tg_id)
-        await update.bot.unban_chat_member(chat_id=int(channel_id), user_id=tg_id)
-        _db.add_log("INFO", f"🚫 Удалён из канала-прокладки (нет подписки): {tg_id}")
-    except Exception as e:
-        log.warning(f"relay_channel_member_cb kick {tg_id}: {e}")
-
 @client_router.message(Command("start"))
 async def client_start(msg: Message):
     uid   = msg.from_user.id
@@ -3630,7 +3415,6 @@ async def client_start(msg: Message):
         # Бесплатные дни
         until = _db.extend_subscription(cl["id"], FREE_DAYS)
         cl    = _db.get_client_by_tg(uid)
-        await _invite_to_relay_channel(msg.bot, cl)
         await _upgrade_old_deliveries(msg.bot, cl)
 
         # Реферал — только запоминаем, кто кого пригласил.
@@ -3958,7 +3742,6 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
                                 f"🎉 Ваш реферал купил подписку!\n"
                                 f"Вам начислено <b>+{REF_BONUS_DAYS} дн.</b> к подписке (до {fmt_date(ref_until.isoformat() if hasattr(ref_until,'isoformat') else str(ref_until))}).",
                                 parse_mode=ParseMode.HTML)
-                            await _invite_to_relay_channel(call.bot, ref_cl)
                             await _upgrade_old_deliveries(call.bot, ref_cl)
                         except Exception as e: log.warning(f"Уведомление пригласившему: {e}")
                 except Exception as e:
@@ -3995,7 +3778,6 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb_client_main())
                 log.info(f"Клиент {cl['tg_id']} уведомлён")
-                await _invite_to_relay_channel(call.bot, cl)
                 await _upgrade_old_deliveries(call.bot, cl)
             except Exception as e:
                 log.error(f"Уведомление клиента {cl['tg_id']}: {e}")
@@ -4361,19 +4143,8 @@ async def _check_expired_subs(bot: Bot) -> None:
             rows = _db._c().execute(
                 "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until < ? AND sub_until > ?",
                 (now.isoformat(), week)).fetchall()
-            channel_id = _db.get_setting("contact_relay_channel_id", "")
             for row in rows:
                 cl = dict(row)
-                # Удаляем из канала-прокладки — независимо от того, отправляли
-                # ли уже скидочное сообщение сегодня (это два разных действия).
-                # Бан+разбан = кик: человек выходит из канала, но не в вечном
-                # бане — сможет вернуться по новой ссылке, если продлит подписку.
-                if channel_id:
-                    try:
-                        await bot.ban_chat_member(chat_id=int(channel_id), user_id=cl["tg_id"])
-                        await bot.unban_chat_member(chat_id=int(channel_id), user_id=cl["tg_id"])
-                    except Exception:
-                        pass  # скорее всего уже не в канале — это нормально, не ошибка
                 # Проверяем что не отправляли сегодня
                 sent_key = f"expired_notif_{cl['id']}"
                 last = _db.get_setting(sent_key,"")
@@ -4570,7 +4341,7 @@ async def main() -> None:
                     raise
 
     await asyncio.gather(
-        dp.start_polling(bot, allowed_updates=["message","callback_query","inline_query","chat_member"]),
+        dp.start_polling(bot, allowed_updates=["message","callback_query","inline_query"]),
         _pipeline.run_worker(),
         _periodic_cleanup(),
         _check_expired_subs(bot),
