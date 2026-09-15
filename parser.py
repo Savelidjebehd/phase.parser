@@ -31,6 +31,7 @@ from telethon.errors import (
     ChannelsTooMuchError, FloodWaitError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
@@ -49,7 +50,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-14 13:21"
+BOT_VERSION    = "2026-09-15 06:26"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -326,6 +327,7 @@ class Database:
             ("broadcast_enabled", "0"),
             ("broadcast_time_msk", "10:00"),
             ("sender_cooldown_min", "30"),
+            ("skip_no_username", "0"),
         ):
             self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         self._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
@@ -1529,9 +1531,47 @@ class VacancyPipeline:
                                                               f"({type(fresh_sender).__name__}), но username пуст")
                     except Exception as e:
                         self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 4, get_messages) не удался: {e}")
+                # 5) Точечный запрос ЭТОГО КОНКРЕТНОГО участника у самого чата
+                # (channels.getParticipant) — не весь список участников (в
+                # больших публичных группах Telegram и не отдаёт полный список
+                # обычным юзерам), а именно одного человека по ID. Если чат —
+                # супергруппа/канал и этот человек в нём состоит, Telegram
+                # обязан прислать его полные данные, откуда бы ни взялся ID.
+                # Не гарантия (не сработает для базовых Chat, не сработает,
+                # если человек уже вышел из чата) — но ещё один честный шанс.
+                if not username:
+                    try:
+                        chat_ent = await event.get_input_chat()
+                        part = await self.userbot(GetParticipantRequest(chat_ent, sender_id))
+                        if part.users:
+                            username = getattr(part.users[0], "username", None) or ""
+                            if not username:
+                                self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 5): участник получен, "
+                                                          "но username пуст")
+                        else:
+                            self.db.add_log("DEBUG", "⚠️ Резолв username (шаг 5): GetParticipant без users")
+                    except Exception as e:
+                        self.db.add_log("DEBUG", f"⚠️ Резолв username (шаг 5, GetParticipant) не удался: {e}")
                 if not username:
                     self.db.add_log("INFO", f"ℹ️ У автора {sender_id} нет юзернейма "
-                                             f"(все 4 способа резолва отработали, юзернейма действительно нет)")
+                                             f"(все 5 способов резолва отработали, юзернейма действительно нет)")
+
+            # Если юзернейма так и не нашли — по настройке можно вообще не
+            # присылать такую вакансию клиентам (пропала последняя надёжная
+            # возможность автору написать напрямую по клику на юзернейм — а
+            # канал-прокладка/tg://user не гарантированы, см. предыдущие
+            # разборы). ВАЖНО: это отсеет не только тех, у кого юзернейма
+            # реально нет, но и тех, у кого он ЕСТЬ, но резолв не смог его
+            # найти (Telegram иногда просто не досылает данные) — то есть
+            # часть настоящих вакансий будет молча теряться.
+            if not username and self.db.get_setting("skip_no_username", "0") == "1":
+                self.db.add_log("INFO", f"⏭ Пропущено (нет юзернейма, настройка включена): {message_link}")
+                skip_v = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
+                                 author_username="", author_id=sender_id, source_title=source_title,
+                                 message_link=message_link, timestamp=datetime.now(), html_text=html_text)
+                svid = self.db.save_vacancy(skip_v)
+                if svid: self.db.update_vacancy_ds(svid, False, "Пропущено: нет юзернейма", "")
+                return
 
             contact_msg_id = 0
             if not username and sender_id:
@@ -2816,10 +2856,13 @@ async def admin_settings_cb(call: CallbackQuery):
     ai_on       = _db.get_setting("ai_active","1") == "1"
     mon_on      = _db.get_setting("monitoring_active","1") == "1"
     cb_on       = _db.get_setting("client_bot_active","1") == "1"
+    skip_nouser = _db.get_setting("skip_no_username","0") == "1"
     markup = mkb([
         [(f"🤖 ИИ {'включено' if ai_on else 'выключено'}", "admin_settings_toggle:ai_active")],
         [(f"🖥️ Мониторинг {'включен' if mon_on else 'выключен'}", "admin_settings_toggle:monitoring_active")],
         [(f"👥 Клиент бот {'включен' if cb_on else 'выключен'}", "admin_settings_toggle:client_bot_active")],
+        [(f"📵 Вакансии без юзернейма: {'пропускаем' if skip_nouser else 'присылаем'}",
+          "admin_settings_toggle:skip_no_username")],
         [("📣 Оповещения", "admin_notifications")],
         [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
         [("🔗 Канал-прокладка (контакты)", "admin_relay_channel")],
