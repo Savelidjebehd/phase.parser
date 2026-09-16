@@ -48,7 +48,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-15 14:58"
+BOT_VERSION    = "2026-09-16 10:38"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -123,6 +123,8 @@ class Vacancy:
     chat_id: int; message_id: int; text: str; author_username: str
     author_id: int; source_title: str; message_link: str; timestamp: datetime
     html_text: str = ""
+    is_channel_source: bool = False  # источник — канал (не группа): показывать
+                                       # "Автор:" бессмысленно, там нет живого автора
 
 @dataclass
 class DeepSeekResult:
@@ -1127,7 +1129,7 @@ def censor_mentions(text: str) -> str:
     return _MENTION_RE.sub("—", text)
 
 def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
-                          subscribed: bool = True) -> tuple[str, InlineKeyboardMarkup]:
+                          subscribed: bool = True, is_channel_source: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     """Единый рендер вакансии для клиента. v_html — уже готовый HTML-текст
     (Vacancy.html_text, форматирование сохранено), НЕ экранируем его повторно —
     вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
@@ -1135,12 +1137,19 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     subscribed=False — версия для клиентов без подписки: любой контакт
     (юзернейм в тексте вакансии, строка "Автор:", ссылка на профиль без
     юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
-    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?"."""
+    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?".
+
+    is_channel_source=True — вакансия из канала, а не из группы: у поста нет
+    живого автора (отправитель в апдейте — сам канал), поэтому строку "Автор:"
+    не показываем вообще, независимо от подписки и прочих условий."""
     contact = contact or ""
     if not subscribed:
         v_html = censor_mentions(v_html)
 
-    if contact.lower().endswith("bot"):
+    if is_channel_source:
+        # У канала нет живого автора — писать вообще нечего и некому
+        author_line = ""
+    elif contact.lower().endswith("bot"):
         # Автор — бот (например @istochnik_bot, публикующий вакансии в канал
         # от своего имени) — писать ему по вакансии бессмысленно, строку об
         # авторе просто не показываем вообще (не пишем даже плейсхолдер)
@@ -1259,7 +1268,14 @@ class VacancyPipeline:
             chat_id      = event.chat_id
             message_id   = msg.id
             source_title = getattr(chat,"title",None) or str(chat_id)
-            username     = getattr(sender,"username",None) or ""
+            is_channel_source = bool(getattr(chat, "broadcast", False))
+            # Для постов из канала "отправитель" в апдейте — это сам канал, а
+            # не живой человек. Его username тут ни к чему — это не контакт
+            # автора, а страница канала, писать туда как "автору" бессмысленно.
+            # sender_id (ID канала) всё равно оставляем настоящим — он нужен
+            # для антиспам-кулдауна и чёрного списка по отправителю, зануление
+            # слило бы разные каналы-источники в одного "отправителя".
+            username     = "" if is_channel_source else (getattr(sender,"username",None) or "")
             sender_id    = getattr(sender,"id",0) or event.sender_id or 0
             message_link = make_msg_link(event, chat)
             text, html_text = extract_text(msg)
@@ -1336,7 +1352,7 @@ class VacancyPipeline:
             # get_entity() тогда просто отдаёт тот же урезанный кэш повторно, не
             # помогает. GetFullUserRequest всегда идёт на сервер за полными
             # данными и обходит именно эту проблему.
-            if not username and sender_id:
+            if not username and sender_id and not is_channel_source:
                 # 1) InputUser напрямую из данных этого конкретного апдейта —
                 # содержит свежий access_hash именно из этого сообщения, а не
                 # потенциально устаревший/несовместимый по контексту кэш по
@@ -1433,7 +1449,7 @@ class VacancyPipeline:
             # реально нет, но и тех, у кого он ЕСТЬ, но резолв не смог его
             # найти (Telegram иногда просто не досылает данные) — то есть
             # часть настоящих вакансий будет молча теряться.
-            if not username and self.db.get_setting("skip_no_username", "0") == "1":
+            if not username and not is_channel_source and self.db.get_setting("skip_no_username", "0") == "1":
                 self.db.add_log("INFO", f"⏭ Пропущено (нет юзернейма, настройка включена): {message_link}")
                 skip_v = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                                  author_username="", author_id=sender_id, source_title=source_title,
@@ -1445,7 +1461,8 @@ class VacancyPipeline:
             vacancy = Vacancy(chat_id=chat_id, message_id=message_id, text=text,
                               author_username=username, author_id=sender_id,
                               source_title=source_title, message_link=message_link,
-                              timestamp=datetime.now(), html_text=html_text)
+                              timestamp=datetime.now(), html_text=html_text,
+                              is_channel_source=is_channel_source)
             vid = self.db.save_vacancy(vacancy)
             if not vid: return
 
@@ -1529,7 +1546,7 @@ class VacancyPipeline:
                 msg_text, markup = render_vacancy_client(
                     vacancy.html_text or html.escape(vacancy.text),
                     ds.contact, vacancy.author_id, vacancy.message_link,
-                    subscribed=subscribed)
+                    subscribed=subscribed, is_channel_source=vacancy.is_channel_source)
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id, subscribed=subscribed)
