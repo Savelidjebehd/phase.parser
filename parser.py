@@ -48,7 +48,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-16 10:38"
+BOT_VERSION    = "2026-09-20 00:07"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -4286,6 +4286,18 @@ async def main() -> None:
     dp  = Dispatcher()
     dp.include_router(admin_router)   # Обрабатывает только ADMIN_ID (фильтр на уровне роутера)
     dp.include_router(client_router)  # Все остальные
+
+    # Снимаем вебхук перед polling — если он вдруг остался включён (после
+    # ручного вызова setWebhook, тестов или сбойного деплоя), getUpdates()
+    # начинает падать с TelegramConflictError на каждой попытке, и бот
+    # фактически не отвечает никому, при этом молча уходя в бесконечный
+    # цикл повторов. drop_pending_updates=True на всякий случай подчищает
+    # накопившиеся за время простоя апдейты, чтобы не разгребать их разом
+    # при старте.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning(f"delete_webhook: {e}")
 
     # UserBot
     _userbot  = await _init_userbot(bot)
