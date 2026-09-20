@@ -48,7 +48,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 11:48"
+BOT_VERSION    = "2026-09-20 11:58"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -470,6 +470,16 @@ class Database:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
         if is_payment:
             self._c().execute("UPDATE clients SET first_payment=1 WHERE id=?", (client_id,))
+        self._c().commit()
+
+    def revoke_subscription(self, client_id: int) -> None:
+        """Досрочно завершает подписку (например, если её выдали по ошибке) —
+        переводит sub_until в прошлое, клиент сразу перестаёт считаться
+        подписчиком во всех проверках (везде сравнение sub_until > now).
+        История платежей и first_payment не трогаются — это не "отменяет"
+        оплату, просто снимает текущий активный период."""
+        self._c().execute("UPDATE clients SET sub_until=? WHERE id=?",
+                           (datetime.now().isoformat(), client_id))
         self._c().commit()
 
     def extend_subscription(self, client_id: int, days: int) -> datetime:
@@ -2506,6 +2516,7 @@ def render_client_detail(client_id: int) -> Optional[tuple[str, InlineKeyboardMa
     markup = mkb([
         [("➕ Выдать подписку", f"admin_give_sub_client:{client_id}"),
          ("🚫 Заблокировать",  f"admin_block_client:{client_id}")],
+        *([[("🗑 Забрать подписку", f"admin_revoke_sub_ask:{client_id}")]] if active else []),
         [("◀️ Назад","admin_clients_list")],
     ])
     return text, markup
@@ -2525,6 +2536,40 @@ async def admin_give_sub_client_cb(call: CallbackQuery):
     await safe_edit(call,
         "➕ Введите количество дней:",
         kb_back(f"admin_client_detail:{client_id}"))
+
+@admin_router.callback_query(F.data.startswith("admin_revoke_sub_ask:"))
+async def admin_revoke_sub_ask_cb(call: CallbackQuery):
+    """Шаг подтверждения перед отзывом подписки — само действие необратимо
+    (старый sub_until не сохраняется нигде), поэтому спрашиваем явно, как и
+    при блокировке клиента."""
+    client_id = call.data.split(":")[1]
+    c = _db.get_client_by_id(int(client_id))
+    if not c: await call.answer("Клиент не найден"); return
+    uname   = c.get("username") or ""
+    display = f"@{uname}" if uname else f"ID: <code>{c['tg_id']}</code>"
+    until   = fmt_date(c.get("sub_until"))
+    markup  = mkb([
+        [("✅ Да, забрать", f"admin_revoke_sub_confirm:{client_id}"),
+         ("❌ Отмена", f"admin_client_detail:{client_id}")],
+    ])
+    await safe_edit(call,
+        f"🗑 <b>Забрать подписку?</b>\n\n{display}\nДействует до: {until}\n\n"
+        f"Клиент сразу перестанет считаться подписчиком. Уведомление ему отправлено не будет.",
+        markup)
+
+@admin_router.callback_query(F.data.startswith("admin_revoke_sub_confirm:"))
+async def admin_revoke_sub_confirm_cb(call: CallbackQuery):
+    client_id = int(call.data.split(":")[1])
+    c = _db.get_client_by_id(client_id)
+    if not c: await call.answer("Клиент не найден"); return
+    _db.revoke_subscription(client_id)
+    uname   = c.get("username") or ""
+    display = f"@{uname}" if uname else f"ID: <code>{c['tg_id']}</code>"
+    log.info(f"Подписка отозвана администратором (карточка клиента): {c['tg_id']} {display}")
+    await safe_edit(call,
+        f"✅ <b>Подписка забрана</b>\n\n{display}",
+        kb_back(f"admin_client_detail:{client_id}"))
+
 
 @admin_router.callback_query(F.data.startswith("admin_block_client:"))
 async def admin_block_client_cb(call: CallbackQuery):
@@ -3291,7 +3336,8 @@ async def admin_text_handler(msg: Message):
         until = _db.extend_subscription(cl["id"], days)
         await safe_answer(msg,
             f"✅ Подписка выдана: <code>{tg_id}</code> до <b>{fmt_date(until.isoformat())}</b>",
-            kb_back("admin_clients"))
+            mkb([[("↩️ Отменить", f"admin_revoke_sub_confirm:{cl['id']}")],
+                 [("◀️ Назад", "admin_clients")]]))
         try:
             await msg.bot.send_message(tg_id,
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
@@ -3313,7 +3359,8 @@ async def admin_text_handler(msg: Message):
         until = _db.extend_subscription(client_id, days)
         await safe_answer(msg,
             f"✅ Подписка выдана до <b>{fmt_date(until.isoformat())}</b>",
-            kb_back(f"admin_client_detail:{client_id}"))
+            mkb([[("↩️ Отменить", f"admin_revoke_sub_confirm:{client_id}")],
+                 [("◀️ Назад", f"admin_client_detail:{client_id}")]]))
         try:
             await msg.bot.send_message(cl["tg_id"],
                 f"🎁 Вам выдана подписка до <b>{fmt_date(until.isoformat())}</b>!",
