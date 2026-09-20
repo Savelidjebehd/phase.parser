@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 16:54"
+BOT_VERSION    = "2026-09-20 17:00"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -153,6 +153,10 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE NOT NULL,
                 title TEXT NOT NULL, username TEXT, link TEXT, active INTEGER DEFAULT 1,
                 added_at TEXT DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS chat_authors (
+                chat_id INTEGER NOT NULL, sender_id INTEGER NOT NULL,
+                username TEXT, name TEXT, last_seen TEXT,
+                PRIMARY KEY(chat_id, sender_id));
             CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, word TEXT NOT NULL,
                 type TEXT NOT NULL DEFAULT 'common', UNIQUE(word,type));
@@ -349,6 +353,23 @@ class Database:
 
     def delete_source(self, sid: int) -> None:
         self._c().execute("DELETE FROM sources WHERE id=?", (sid,)); self._c().commit()
+
+    def record_author(self, chat_id: int, sender_id: int, username: str, name: str) -> None:
+        """Фиксирует, что этот человек написал в этом чате — по факту
+        пойманного юзерботом сообщения, а не по списку участников Telegram
+        (тот бывает скрыт настройками приватности группы). Вызывается на
+        КАЖДОЕ входящее сообщение из немодерируемых источников, до всех
+        фильтров ключевых слов/ЧС — иначе список "кто писал" будет неполным."""
+        self._c().execute(
+            "INSERT INTO chat_authors(chat_id,sender_id,username,name,last_seen) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(chat_id,sender_id) DO UPDATE SET "
+            "username=excluded.username, name=excluded.name, last_seen=excluded.last_seen",
+            (chat_id, sender_id, username or None, name or None, now_sql()))
+        self._c().commit()
+
+    def get_chat_authors(self, chat_id: int) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT * FROM chat_authors WHERE chat_id=? ORDER BY last_seen DESC", (chat_id,)).fetchall()]
 
     # ── Ключевые слова / ЧС ───────────────────────────────────
     def get_keywords(self, ktype: str = "common") -> list[str]:
@@ -1295,6 +1316,14 @@ class VacancyPipeline:
             log.info(f"📥 [{source_title}] @{username}")
             self.db.add_log("INFO", f"Получено: {message_link} @{username}")
 
+            # Фиксируем автора для выгрузки "кто писал" — до любых фильтров
+            # (ключевые слова, ЧС, антиспам), чтобы список не зависел от
+            # того, оказалось сообщение вакансией или нет.
+            if sender_id and not is_channel_source:
+                full_name = " ".join(filter(None, [getattr(sender, "first_name", None),
+                                                     getattr(sender, "last_name", None)])) if sender else ""
+                self.db.record_author(chat_id, sender_id, username, full_name)
+
             # Фильтр заблокированных отправителей
             if sender_id and self.db.is_sender_blocked(sender_id):
                 log.debug(f"⛔ Заблокированный отправитель: {sender_id}")
@@ -1667,42 +1696,53 @@ async def admin_main_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ИСТОЧНИКИ
 # ═══════════════════════════════════════════════════════════════
-async def _fetch_members_with_roles(userbot: TelegramClient, entity) -> list[dict]:
-    """Собирает участников чата/канала с ролью (Админ/Участник).
+async def _get_admin_ids(userbot: TelegramClient, entity) -> set[int]:
+    """Только ID админов, без полного списка участников. Список админов
+    супергруппы/канала Telegram почти всегда отдаёт даже обычным
+    участникам — в отличие от полного списка участников, который может
+    быть скрыт настройками приватности группы. Поэтому эта функция
+    отдельная и используется и там, где полный список работает, и там,
+    где нет (выгрузка "кто писал")."""
+    if isinstance(entity, Chat):
+        try:
+            full = await userbot(GetFullChatRequest(entity.id))
+            return {p.user_id for p in full.full_chat.participants.participants
+                    if p.__class__.__name__ in ("ChatParticipantAdmin", "ChatParticipantCreator")}
+        except Exception as e:
+            log.warning(f"_get_admin_ids (Chat) {getattr(entity,'id','?')}: {e}")
+            return set()
+    try:
+        admins = await userbot.get_participants(entity, filter=ChannelParticipantsAdmins)
+        return {u.id for u in admins}
+    except Exception as e:
+        log.warning(f"_get_admin_ids (Channel) {getattr(entity,'id','?')}: {e}")
+        return set()
 
-    Базовые группы (Chat, cls=='Chat', до превращения в супергруппу) отдают
-    список участников только через GetFullChatRequest с типами
-    ChatParticipant/ChatParticipantAdmin/ChatParticipantCreator — фильтр
-    ChannelParticipantsAdmins для них не существует (это API каналов).
-    Супергруппы и каналы, наоборот, идут через client.get_participants с
-    фильтром ChannelParticipantsAdmins — так администраторы получаются
-    отдельным быстрым запросом, без разбора каждого участника.
+
+async def _fetch_members_with_roles(userbot: TelegramClient, entity) -> list[dict]:
+    """Собирает ПОЛНЫЙ список участников чата/канала с ролью (Админ/
+    Участник) через API списка участников Telegram. Работает только там,
+    где Telegram вообще отдаёт этот список не-владельцу чата — в закрытых
+    супергруппах или при определённых настройках приватности он может
+    быть недоступен либо неполным (см. _get_admin_ids и выгрузку "кто
+    писал" — тот способ не зависит от этого ограничения).
     Создатель считается администратором — отдельная категория не нужна
     (в задаче их всего две: Админ / Участник)."""
     result: list[dict] = []
     if isinstance(entity, Chat):
         full = await userbot(GetFullChatRequest(entity.id))
-        role_by_id = {}
-        for p in full.full_chat.participants.participants:
-            cls = p.__class__.__name__
-            role_by_id[p.user_id] = "Админ" if cls in ("ChatParticipantAdmin", "ChatParticipantCreator") else "Участник"
-        users = {u.id: u for u in full.users}
-        for uid, role in role_by_id.items():
-            u = users.get(uid)
-            if not u or getattr(u, "bot", False): continue
+        admin_ids = {p.user_id for p in full.full_chat.participants.participants
+                     if p.__class__.__name__ in ("ChatParticipantAdmin", "ChatParticipantCreator")}
+        for u in full.users:
+            if getattr(u, "bot", False): continue
             result.append({
                 "username": getattr(u, "username", None),
                 "name": " ".join(filter(None, [getattr(u, "first_name", None), getattr(u, "last_name", None)])) or None,
-                "id": uid, "role": role,
+                "id": u.id, "role": "Админ" if u.id in admin_ids else "Участник",
             })
     else:
-        admin_ids: set[int] = set()
-        try:
-            admins = await userbot.get_participants(entity, filter=ChannelParticipantsAdmins)
-            admin_ids = {u.id for u in admins}
-        except Exception as e:
-            log.warning(f"get_participants(admins) для {getattr(entity,'id','?')}: {e}")
-        members = await userbot.get_participants(entity, aggressive=True)
+        admin_ids = await _get_admin_ids(userbot, entity)
+        members   = await userbot.get_participants(entity, aggressive=True)
         for u in members:
             if getattr(u, "bot", False): continue
             result.append({
@@ -1907,8 +1947,9 @@ async def admin_src_manage_cb(call: CallbackQuery):
     for s in srcs:
         icon = "✅" if s["active"] else "❌"
         rows.append([(f"{icon} {s['title'][:30]}", f"admin_src_toggle:{s['id']}")])
-        rows.append([(f"🗑 Удалить", f"admin_src_del:{s['id']}"),
-                     (f"👥 Участники", f"admin_src_members:{s['id']}")])
+        rows.append([(f"🗑 Удалить", f"admin_src_del:{s['id']}")])
+        rows.append([(f"👥 Все участники", f"admin_src_members:{s['id']}"),
+                     (f"✍️ Кто писал", f"admin_src_authors:{s['id']}")])
     rows.append([("◀️ Назад","admin_src_list")])
     await safe_edit(call, "<b>⚙️ Управление источниками</b>", mkb(rows))
 
@@ -1958,6 +1999,42 @@ async def admin_src_members_cb(call: CallbackQuery):
         BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"members_{src_id}.txt"),
         caption=caption)
     await safe_edit(call, caption, kb_back("admin_src_manage"))
+
+@admin_router.callback_query(F.data.startswith("admin_src_authors:"))
+async def admin_src_authors_cb(call: CallbackQuery):
+    """Выгрузка "кто писал" — строится из сообщений, реально пойманных
+    юзерботом в этом чате (таблица chat_authors), а не из списка участников
+    Telegram. Работает даже там, где полный список участников API не
+    отдаёт (закрытые группы, настройки приватности) — единственное, что
+    для этого нужно, это чтобы человек хотя бы раз написал в чате после
+    того, как источник был добавлен."""
+    src_id = int(call.data.split(":")[1])
+    src = next((s for s in _db.get_sources(active_only=False) if s["id"] == src_id), None)
+    if not src: await call.answer("Источник не найден"); return
+    authors = _db.get_chat_authors(src["chat_id"])
+    if not authors:
+        await call.answer("Пока никто не писал (или источник только что добавлен)", show_alert=True)
+        return
+    await call.answer()
+
+    admin_ids: set[int] = set()
+    if _userbot is not None:
+        try:
+            entity = await _userbot.get_entity(src["chat_id"])
+            admin_ids = await _get_admin_ids(_userbot, entity)
+        except Exception as e:
+            log.warning(f"admin_src_authors admin_ids {src['chat_id']}: {e}")
+
+    def _label(a: dict) -> str:
+        if a["username"]: return f"@{a['username']}"
+        return f"id:{a['sender_id']}" + (f" ({a['name']})" if a["name"] else "")
+
+    lines   = [f"{_label(a)} {'Админ' if a['sender_id'] in admin_ids else 'Участник'}" for a in authors]
+    admins  = sum(1 for a in authors if a["sender_id"] in admin_ids)
+    caption = f"✍️ {src['title']} — писали {len(authors)} чел., из них админов: {admins}"
+    await call.message.answer_document(
+        BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"authors_{src_id}.txt"),
+        caption=caption)
 
 
 # ═══════════════════════════════════════════════════════════════
