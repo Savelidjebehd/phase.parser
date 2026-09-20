@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 17:34"
+BOT_VERSION    = "2026-09-20 21:25"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -58,8 +58,12 @@ SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
 PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
 PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "Савелий Сергеевич С.")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
-CRYPTO_WALLET    = os.getenv("CRYPTO_WALLET", "")            # адрес USDT-кошелька
-CRYPTO_NETWORK   = os.getenv("CRYPTO_NETWORK", "TRC20")       # сеть (TRC20/BEP20/TON и т.п.)
+CRYPTO_WALLETS   = {
+    "trc20": {"address": os.getenv("CRYPTO_WALLET_TRC20", "TN4Aj7mEENEZcyEgNxEf3VthtkvZk2ASSQ"),
+              "label": "USDT · TRC20 (Tron)", "icon": "🔺"},
+    "ton":   {"address": os.getenv("CRYPTO_WALLET_TON", "UQB2JknVgMhdjHj0ddqEuNoxmDcf8U3k4w6Q0Ldvh6NA4NIV"),
+              "label": "USDT · TON", "icon": "💎"},
+}
 CRYPTO_RATE_BUFFER = float(os.getenv("CRYPTO_RATE_BUFFER", "1.5"))  # % запаса на случай расхождения курса с BingX
 MSK = timezone(timedelta(hours=3))  # Москва — фикс. UTC+3, без перехода на летнее/зимнее
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
@@ -2629,12 +2633,15 @@ async def admin_pay_detail_cb(call: CallbackQuery):
     if not cl:
         await call.answer("Клиент не найден"); return
     uname = cl.get("username") or str(cl["tg_id"])
+    method_labels = {"rub": "💳 Рубли"}
+    method_labels.update({f"usdt_{k}": f"{w['icon']} {w['label']}" for k, w in CRYPTO_WALLETS.items()})
     lines = [
         "💳 <b>Платёж</b>",
         f"Тикет: <code>{ticket}</code>",
         f"Клиент: @{uname} (<code>{cl['tg_id']}</code>)",
         f"Тариф: <b>{p['tariff']}</b>",
         f"Сумма: <b>{p['amount']}₽</b>",
+        f"Способ: {method_labels.get(p.get('method'), p.get('method',''))}",
         f"Дней: <b>{p['days']}</b>",
         f"Создан: {fmt_msk(p['created_at'], '%Y-%m-%d %H:%M')}",
     ]
@@ -3910,20 +3917,36 @@ async def client_buy_cb(call: CallbackQuery):
     )
     markup = mkb([
         [("✅ Оплатил(а)", f"client_paid:{ticket}")],
-        [("💱 Оплатить в USDT", f"client_buy_crypto:{tariff}" + (":wb15" if winback else ""))],
+        [("💱 Оплатить в USDT", f"client_crypto_choose:{tariff}" + (":wb15" if winback else ""))],
         [("◀️ Главное меню","client_main")],
     ])
     await safe_edit(call, text, markup)
 
-@client_router.callback_query(F.data.startswith("client_buy_crypto:"))
-async def client_buy_crypto_cb(call: CallbackQuery):
-    uid    = call.from_user.id
+@client_router.callback_query(F.data.startswith("client_crypto_choose:"))
+async def client_crypto_choose_cb(call: CallbackQuery):
+    """Шаг выбора сети USDT — реквизиты разные для TRC20 и TON, показывать
+    сразу оба варианта одним экраном было бы легко перепутать по невнимательности."""
     parts   = call.data.split(":")
     tariff  = parts[1]
     winback = len(parts) > 2 and parts[2] == "wb15"
-    p      = PRICES.get(tariff)
+    if tariff not in PRICES: await call.answer("Неверный тариф"); return
+    suffix = ":wb15" if winback else ""
+    rows = [[(f"{w['icon']} {w['label']}", f"client_buy_crypto:{tariff}:{key}{suffix}")]
+            for key, w in CRYPTO_WALLETS.items()]
+    rows.append([("◀️ Назад", f"client_buy:{tariff}{suffix}")])
+    await safe_edit(call, "💱 <b>Выберите сеть для оплаты USDT:</b>", mkb(rows))
+
+@client_router.callback_query(F.data.startswith("client_buy_crypto:"))
+async def client_buy_crypto_cb(call: CallbackQuery):
+    uid     = call.from_user.id
+    parts   = call.data.split(":")
+    tariff  = parts[1]
+    network = parts[2] if len(parts) > 2 else "trc20"
+    winback = len(parts) > 3 and parts[3] == "wb15"
+    p       = PRICES.get(tariff)
+    wallet  = CRYPTO_WALLETS.get(network)
     if not p: await call.answer("Неверный тариф"); return
-    if not CRYPTO_WALLET:
+    if not wallet:
         await call.answer("Оплата в USDT временно недоступна", show_alert=True); return
     cl       = _db.get_or_create_client(uid, call.from_user.username)
     has_paid = bool(cl.get("first_payment"))
@@ -3935,21 +3958,23 @@ async def client_buy_crypto_cb(call: CallbackQuery):
     usdt_amount = round(amount / rate, 2)
     ticket = f"DRAFT-{int(time.time()*1000)}"
     _payment_drafts[ticket] = {"client_id": cl["id"], "tariff": tariff, "amount": amount,
-                              "days": p["days"], "method": "usdt",
+                              "days": p["days"], "method": f"usdt_{network}",
                               "crypto_amount": usdt_amount, "crypto_rate": rate}
-    log.info(f"Черновик оплаты создан: {ticket} (клиент {uid}, тариф {tariff}, USDT) — в БД пока не пишем")
+    log.info(f"Черновик оплаты создан: {ticket} (клиент {uid}, тариф {tariff}, USDT/{network}) — в БД пока не пишем")
     fire = "" if has_paid else "🔥"
     text = (
         f"Тариф <b>{p['label']}</b>\n\n"
-        f"Сеть: <b>{CRYPTO_NETWORK}</b>\n"
-        f"Адрес: <code>{CRYPTO_WALLET}</code>\n\n"
+        f"{wallet['icon']} <b>{wallet['label']}</b>\n"
+        f"<blockquote><code>{wallet['address']}</code></blockquote>\n"
         f"К оплате: <b>{usdt_amount} USDT</b>{fire}\n"
         f"<i>(≈ {amount}₽ по курсу {rate}₽ за USDT)</i>\n\n"
-        f"⚠️ <b>Отправьте точную сумму, после оплаты нажмите Оплатил(а)</b> ⚠️\n"
-        f"<i>Курс актуален короткое время — если не успели, вернитесь на этот экран заново, чтобы обновить сумму</i>"
+        f"⚠️ <b>Отправляйте строго в сети {wallet['label']}</b> — перевод в другой сети до получателя не дойдёт и не восстанавливается\n"
+        f"⚠️ <b>После оплаты нажмите Оплатил(а)</b>\n\n"
+        f"<i>Курс актуален короткое время — если не успели, вернитесь назад и выберите сеть заново</i>"
     )
     markup = mkb([
         [("✅ Оплатил(а)", f"client_paid:{ticket}")],
+        [("◀️ Назад", f"client_crypto_choose:{tariff}" + (":wb15" if winback else ""))],
         [("◀️ Главное меню","client_main")],
     ])
     await safe_edit(call, text, markup)
@@ -3980,10 +4005,12 @@ async def client_paid_cb(call: CallbackQuery):
     await safe_edit(call, text, markup)
     # Уведомление админу — отправляется ИСКЛЮЧИТЕЛЬНО здесь, по нажатию «Оплатил(а)»
     log.info(f"Клиент нажал «Оплатил(а)», создан тикет {ticket} — уведомляю админа")
-    if p.get("method") == "usdt":
+    if p.get("method", "").startswith("usdt"):
+        network = p["method"].split("_", 1)[1] if "_" in p["method"] else "trc20"
+        wallet  = CRYPTO_WALLETS.get(network, {})
         pay_line = (f"Тариф: {p['tariff']} | Сумма: <b>{p['crypto_amount']} USDT</b> "
                     f"(курс {p['crypto_rate']}₽, ≈{p['amount']}₽)\n"
-                    f"Сеть: {CRYPTO_NETWORK} | Кошелёк: <code>{CRYPTO_WALLET}</code>")
+                    f"Сеть: {wallet.get('label', network)} | Кошелёк: <code>{wallet.get('address','?')}</code>")
     else:
         pay_line = f"Тариф: {p['tariff']} | Сумма: <b>{p['amount']}₽</b>"
     try:
