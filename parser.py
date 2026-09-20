@@ -31,10 +31,11 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest, GetFullChatRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage, ChatInviteAlready,
+    Chat, ChannelParticipantsAdmins,
 )
 
 # ── Конфигурация ──────────────────────────────────────────────
@@ -48,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 11:58"
+BOT_VERSION    = "2026-09-20 16:54"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1666,6 +1667,51 @@ async def admin_main_cb(call: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ИСТОЧНИКИ
 # ═══════════════════════════════════════════════════════════════
+async def _fetch_members_with_roles(userbot: TelegramClient, entity) -> list[dict]:
+    """Собирает участников чата/канала с ролью (Админ/Участник).
+
+    Базовые группы (Chat, cls=='Chat', до превращения в супергруппу) отдают
+    список участников только через GetFullChatRequest с типами
+    ChatParticipant/ChatParticipantAdmin/ChatParticipantCreator — фильтр
+    ChannelParticipantsAdmins для них не существует (это API каналов).
+    Супергруппы и каналы, наоборот, идут через client.get_participants с
+    фильтром ChannelParticipantsAdmins — так администраторы получаются
+    отдельным быстрым запросом, без разбора каждого участника.
+    Создатель считается администратором — отдельная категория не нужна
+    (в задаче их всего две: Админ / Участник)."""
+    result: list[dict] = []
+    if isinstance(entity, Chat):
+        full = await userbot(GetFullChatRequest(entity.id))
+        role_by_id = {}
+        for p in full.full_chat.participants.participants:
+            cls = p.__class__.__name__
+            role_by_id[p.user_id] = "Админ" if cls in ("ChatParticipantAdmin", "ChatParticipantCreator") else "Участник"
+        users = {u.id: u for u in full.users}
+        for uid, role in role_by_id.items():
+            u = users.get(uid)
+            if not u or getattr(u, "bot", False): continue
+            result.append({
+                "username": getattr(u, "username", None),
+                "name": " ".join(filter(None, [getattr(u, "first_name", None), getattr(u, "last_name", None)])) or None,
+                "id": uid, "role": role,
+            })
+    else:
+        admin_ids: set[int] = set()
+        try:
+            admins = await userbot.get_participants(entity, filter=ChannelParticipantsAdmins)
+            admin_ids = {u.id for u in admins}
+        except Exception as e:
+            log.warning(f"get_participants(admins) для {getattr(entity,'id','?')}: {e}")
+        members = await userbot.get_participants(entity, aggressive=True)
+        for u in members:
+            if getattr(u, "bot", False): continue
+            result.append({
+                "username": getattr(u, "username", None),
+                "name": " ".join(filter(None, [getattr(u, "first_name", None), getattr(u, "last_name", None)])) or None,
+                "id": u.id, "role": "Админ" if u.id in admin_ids else "Участник",
+            })
+    return result
+
 @admin_router.callback_query(F.data == "admin_sources")
 async def admin_sources_cb(call: CallbackQuery):
     srcs  = _db.get_sources(active_only=False)
@@ -1861,7 +1907,8 @@ async def admin_src_manage_cb(call: CallbackQuery):
     for s in srcs:
         icon = "✅" if s["active"] else "❌"
         rows.append([(f"{icon} {s['title'][:30]}", f"admin_src_toggle:{s['id']}")])
-        rows.append([(f"🗑 {s['title'][:28]}", f"admin_src_del:{s['id']}")])
+        rows.append([(f"🗑 Удалить", f"admin_src_del:{s['id']}"),
+                     (f"👥 Участники", f"admin_src_members:{s['id']}")])
     rows.append([("◀️ Назад","admin_src_list")])
     await safe_edit(call, "<b>⚙️ Управление источниками</b>", mkb(rows))
 
@@ -1873,6 +1920,45 @@ async def admin_src_toggle_cb(call: CallbackQuery):
 async def admin_src_del_cb(call: CallbackQuery):
     _db.delete_source(int(call.data.split(":")[1]))
     await call.answer("Удалено"); await admin_src_manage_cb(call)
+
+@admin_router.callback_query(F.data.startswith("admin_src_members:"))
+async def admin_src_members_cb(call: CallbackQuery):
+    """Выгружает список участников источника с ролью (Админ/Участник)
+    файлом — прямо в сообщении список может быть на тысячи строк и не
+    влезет в лимит одного сообщения Telegram."""
+    src_id = int(call.data.split(":")[1])
+    src = next((s for s in _db.get_sources(active_only=False) if s["id"] == src_id), None)
+    if not src: await call.answer("Источник не найден"); return
+    if _userbot is None:
+        await call.answer("Юзербот не подключён", show_alert=True); return
+    await call.answer()
+    await safe_edit(call, f"⏳ <b>Загружаю участников:</b> {html.escape(src['title'])}...", None)
+    try:
+        entity  = await _userbot.get_entity(src["chat_id"])
+        members = await _fetch_members_with_roles(_userbot, entity)
+    except Exception as e:
+        log.error(f"admin_src_members {src['chat_id']}: {e}")
+        await safe_edit(call, f"❌ Не удалось загрузить участников: <code>{html.escape(str(e))}</code>",
+                         kb_back("admin_src_manage"))
+        return
+
+    if not members:
+        await safe_edit(call, "😕 Участников не найдено (или недостаточно прав на просмотр).",
+                         kb_back("admin_src_manage"))
+        return
+
+    def _label(m: dict) -> str:
+        if m["username"]: return f"@{m['username']}"
+        return f"id:{m['id']}" + (f" ({m['name']})" if m["name"] else "")
+
+    lines   = [f"{_label(m)} {m['role']}" for m in members]
+    admins  = sum(1 for m in members if m["role"] == "Админ")
+    caption = f"👥 {src['title']} — {len(members)} участников, из них админов: {admins}"
+    await call.message.answer_document(
+        BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"members_{src_id}.txt"),
+        caption=caption)
+    await safe_edit(call, caption, kb_back("admin_src_manage"))
+
 
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ВАКАНСИИ (авто-отклик убран, только просмотр найденного)
