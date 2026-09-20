@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 21:25"
+BOT_VERSION    = "2026-09-20 22:44"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -791,37 +791,76 @@ class Database:
 _rate_cache: dict = {"value": None, "ts": 0.0}
 RATE_CACHE_TTL = 90  # секунд — не долбим API на каждый клик, но курс остаётся свежим
 
+async def _fetch_binance_p2p_rate() -> float:
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset": "USDT", "fiat": "RUB", "tradeType": "SELL",
+                  "page": 1, "rows": 10, "payTypes": [], "publisherType": None},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json()
+    prices = [float(row["adv"]["price"]) for row in data.get("data", [])]
+    if not prices: raise ValueError("Пустой ответ от Binance P2P")
+    return sum(prices[:5]) / len(prices[:5])
+
+async def _fetch_bybit_p2p_rate() -> float:
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://api2.bybit.com/fiat/otc/item/online",
+            json={"userId": "", "tokenId": "USDT", "currencyId": "RUB",
+                  "payment": [], "side": "1", "size": "10", "page": "1",
+                  "amount": "", "authMaker": False, "canTrade": False},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json()
+    items  = ((data.get("result") or {}).get("items")) or []
+    prices = [float(it["price"]) for it in items]
+    if not prices: raise ValueError("Пустой ответ от Bybit P2P")
+    return sum(prices[:5]) / len(prices[:5])
+
 async def get_usdt_rub_rate() -> Optional[float]:
     """Курс USDT→RUB с P2P-рынка (продажа USDT за рубли).
     Источник — публичный API Binance P2P: цены на P2P синхронизированы между
     биржами (мейкеры арбитражат), поэтому курс близок к тому, что покажет BingX P2P.
     К курсу применяется небольшой запас (CRYPTO_RATE_BUFFER, по умолчанию 1.5%)
     вниз, чтобы не потерять на реальном выводе через BingX P2P.
-    Результат кэшируется на RATE_CACHE_TTL секунд."""
+    Результат кэшируется на RATE_CACHE_TTL секунд.
+
+    Binance для запросов с российских IP (в т.ч. хостингов) периодически
+    режет доступ — поэтому при сбое Binance пробуем Bybit P2P как второй
+    источник, а если недоступны оба — отдаём последний известный курс из
+    кэша, и только в самом крайнем случае (кэша тоже нет — например, бот
+    только что перезапущен) — ручной резервный курс из настроек
+    (usdt_manual_rate, задаётся в ⚙️ Настройки)."""
     now = time.time()
     if _rate_cache["value"] and (now - _rate_cache["ts"]) < RATE_CACHE_TTL:
         return _rate_cache["value"]
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                json={"asset": "USDT", "fiat": "RUB", "tradeType": "SELL",
-                      "page": 1, "rows": 10, "payTypes": [], "publisherType": None},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json()
-        prices = [float(row["adv"]["price"]) for row in data.get("data", [])]
-        if not prices:
-            raise ValueError("Пустой ответ от Binance P2P")
-        # Берём среднее по топ-5 объявлений (устойчивее к разовым выбросам)
-        market_rate = sum(prices[:5]) / len(prices[:5])
+
+    market_rate = None; last_err = None
+    for name, fetcher in (("Binance P2P", _fetch_binance_p2p_rate), ("Bybit P2P", _fetch_bybit_p2p_rate)):
+        try:
+            market_rate = await fetcher()
+            break
+        except Exception as e:
+            last_err = e
+            log.warning(f"get_usdt_rub_rate ({name}): {e}")
+
+    if market_rate is not None:
         rate = round(market_rate * (1 - CRYPTO_RATE_BUFFER / 100), 2)
         _rate_cache["value"] = rate; _rate_cache["ts"] = now
         return rate
-    except Exception as e:
-        log.error(f"get_usdt_rub_rate: {e}")
-        if _pipeline: await notify_admin_error(_pipeline.bot, "get_usdt_rub_rate", e)
-        return _rate_cache["value"]  # отдаём последний известный курс, если API недоступен
+
+    # Оба публичных источника недоступны
+    if _rate_cache["value"]:
+        return _rate_cache["value"]
+    manual = _db.get_setting("usdt_manual_rate", "")
+    if manual:
+        try: return float(manual)
+        except ValueError: pass
+    log.error(f"get_usdt_rub_rate: оба источника недоступны, кэша и резервного курса нет ({last_err})")
+    if _pipeline and last_err: await notify_admin_error(_pipeline.bot, "get_usdt_rub_rate", last_err)
+    return None
 
 # ═══════════════════════════════════════════════════════════════
 # DEEPSEEK
@@ -3033,6 +3072,7 @@ async def admin_settings_cb(call: CallbackQuery):
           "admin_settings_toggle:skip_no_username")],
         [("📣 Оповещения", "admin_notifications")],
         [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
+        [("💱 Резервный курс USDT","admin_usdt_rate")],
         [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
         [("◀️ Главное меню","admin_main")],
     ])
@@ -3090,6 +3130,26 @@ async def admin_bc_edit_hours_cb(call: CallbackQuery):
     await safe_edit(call,
         "⏰ За сколько часов до окончания подписки слать напоминание?\n\nПришлите число, например <code>24</code> или <code>12</code>:",
         kb_back("admin_broadcast_settings"))
+
+@admin_router.callback_query(F.data == "admin_usdt_rate")
+async def admin_usdt_rate_cb(call: CallbackQuery):
+    """Резервный курс USDT→RUB — используется ТОЛЬКО когда недоступны оба
+    публичных источника (Binance P2P и Bybit P2P) и нет ни одного
+    закэшированного курса (например, сразу после перезапуска бота). Без
+    этого в таком случае клиент вообще не смог бы увидеть сумму к оплате
+    в USDT — сейчас именно так и произошло."""
+    current = _db.get_setting("usdt_manual_rate", "")
+    _admin_pending[call.from_user.id] = "edit_usdt_manual_rate"
+    text = (
+        f"💱 <b>Резервный курс USDT→RUB</b>\n\n"
+        f"Сейчас: <b>{current or '— не задан'}</b>\n\n"
+        f"Используется только если недоступны оба публичных источника курса "
+        f"(Binance P2P и Bybit P2P) и нет ни одного сохранённого курса за "
+        f"последние {RATE_CACHE_TTL} сек. Держите его близко к реальному "
+        f"рыночному, чтобы не терять на разнице при выводе.\n\n"
+        f"Пришлите число, например <code>95.5</code>, или <code>-</code> чтобы убрать:"
+    )
+    await safe_edit(call, text, kb_back("admin_settings"))
 
 @admin_router.callback_query(F.data == "admin_bc_edit_time")
 async def admin_bc_edit_time_cb(call: CallbackQuery):
@@ -3545,6 +3605,23 @@ async def admin_text_handler(msg: Message):
         _db.set_setting("reminder_hours_before", t)
         await safe_answer(msg, f"✅ Теперь напоминание шлётся за {t} ч. до конца подписки",
                           kb_back("admin_broadcast_settings"))
+        return
+
+    if action == "edit_usdt_manual_rate":
+        t = text.strip()
+        if t == "-":
+            _db.set_setting("usdt_manual_rate", "")
+            await safe_answer(msg, "✅ Резервный курс убран", kb_back("admin_settings"))
+            return
+        try:
+            val = float(t.replace(",", "."))
+            assert val > 0
+        except Exception:
+            await safe_answer(msg, "❌ Введите число, например 95.5, или - чтобы убрать",
+                              kb_back("admin_settings"))
+            return
+        _db.set_setting("usdt_manual_rate", str(val))
+        await safe_answer(msg, f"✅ Резервный курс сохранён: {val}₽ за USDT", kb_back("admin_settings"))
         return
 
     # ── Время общей рассылки (МСК) ──────────────────────────────
