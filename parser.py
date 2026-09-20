@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 17:07"
+BOT_VERSION    = "2026-09-20 17:34"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -2062,7 +2062,14 @@ async def admin_src_authors_cb(call: CallbackQuery):
     Telegram. Работает даже там, где полный список участников API не
     отдаёт (закрытые группы, настройки приватности) — единственное, что
     для этого нужно, это чтобы человек хотя бы раз написал в чате после
-    того, как источник был добавлен."""
+    того, как источник был добавлен.
+
+    Отправляется отдельными сообщениями (не файлом) — так у каждого
+    @юзернейма кликабельна ссылка прямо в чате, не нужно скачивать файл
+    и переходить куда-то отдельно. Тем, у кого нет юзернейма, ссылка
+    делается через tg://user?id= (может не сработать — тот же нюанс, что
+    и с контактом автора вакансии: юзернейм в Telegram всегда публичный,
+    а вот адресный переход по ID гарантий не даёт)."""
     src_id = int(call.data.split(":")[1])
     src = next((s for s in _db.get_sources(active_only=False) if s["id"] == src_id), None)
     if not src: await call.answer("Источник не найден"); return
@@ -2081,15 +2088,26 @@ async def admin_src_authors_cb(call: CallbackQuery):
             log.warning(f"admin_src_authors admin_ids {src['chat_id']}: {e}")
 
     def _label(a: dict) -> str:
-        if a["username"]: return f"@{a['username']}"
-        return f"id:{a['sender_id']}" + (f" ({a['name']})" if a["name"] else "")
+        if a["username"]: return f"@{html.escape(a['username'])}"
+        name = html.escape(a["name"]) if a["name"] else "без имени"
+        return f'<a href="tg://user?id={a["sender_id"]}">{name}</a>'
 
-    lines   = [f"{_label(a)} {'Админ' if a['sender_id'] in admin_ids else 'Участник'}" for a in authors]
-    admins  = sum(1 for a in authors if a["sender_id"] in admin_ids)
-    caption = f"✍️ {src['title']} — писали {len(authors)} чел., из них админов: {admins}"
-    await call.message.answer_document(
-        BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"authors_{src_id}.txt"),
-        caption=caption)
+    lines  = [f"{_label(a)} — {'Админ' if a['sender_id'] in admin_ids else 'Участник'}" for a in authors]
+    admins = sum(1 for a in authors if a["sender_id"] in admin_ids)
+    header = f"✍️ <b>{html.escape(src['title'])}</b> — писали {len(authors)} чел., из них админов: {admins}\n"
+
+    # Лимит Telegram — 4096 символов на сообщение, режем по строкам, чтобы
+    # не разорвать ссылку посередине
+    chunks, cur, cur_len = [], [header], len(header)
+    for line in lines:
+        if cur_len + len(line) + 1 > 3800 and cur:
+            chunks.append("\n".join(cur)); cur = []; cur_len = 0
+        cur.append(line); cur_len += len(line) + 1
+    if cur: chunks.append("\n".join(cur))
+
+    for chunk in chunks:
+        await call.message.answer(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
     result = render_source_detail(src_id)
     if result:
         text, markup = result
