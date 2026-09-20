@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 17:00"
+BOT_VERSION    = "2026-09-20 17:07"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -370,6 +370,19 @@ class Database:
     def get_chat_authors(self, chat_id: int) -> list[dict]:
         return [dict(r) for r in self._c().execute(
             "SELECT * FROM chat_authors WHERE chat_id=? ORDER BY last_seen DESC", (chat_id,)).fetchall()]
+
+    def get_source_stats(self, chat_id: int) -> dict:
+        row = self._c().execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN suitable=1 THEN 1 ELSE 0 END) AS suitable, "
+            "SUM(CASE WHEN block_reason IS NOT NULL THEN 1 ELSE 0 END) AS blocked, "
+            "MAX(created_at) AS last_at FROM vacancies WHERE chat_id=?", (chat_id,)).fetchone()
+        authors = self._c().execute(
+            "SELECT COUNT(*) FROM chat_authors WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        return {
+            "total": row["total"] or 0, "suitable": row["suitable"] or 0,
+            "blocked": row["blocked"] or 0, "last_at": row["last_at"], "authors": authors or 0,
+        }
 
     # ── Ключевые слова / ЧС ───────────────────────────────────
     def get_keywords(self, ktype: str = "common") -> list[str]:
@@ -1916,19 +1929,32 @@ async def src_pick_done_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_src_list")
 async def admin_src_list_cb(call: CallbackQuery):
+    await _show_sources_page(call, 0)
+
+@admin_router.callback_query(F.data.startswith("admin_src_page:"))
+async def admin_src_page_cb(call: CallbackQuery):
+    await _show_sources_page(call, int(call.data.split(":")[1]))
+
+async def _show_sources_page(call: CallbackQuery, page: int) -> None:
+    """Список источников кнопками — по образцу «Все клиенты»: нажатие на
+    источник открывает его карточку со статистикой и экспортом, вместо
+    отдельного текстового списка со ссылками."""
+    limit = 30
     srcs  = _db.get_sources(active_only=False)
-    lines = []
-    for s in srcs:
+    chunk = srcs[page*limit:(page+1)*limit]
+    rows  = []
+    for s in chunk:
         icon = "✅" if s["active"] else "❌"
-        link = s.get("link") or f"tg://openmessage?chat_id={s['chat_id']}"
-        lines.append(f"{icon} <a href='{link}'>{s['title']}</a>")
-    text   = f"<b>📋 Все источники ({len(srcs)})</b>\n\n" + ("\n".join(lines) if lines else "<i>Нет источников</i>")
-    markup = mkb([
-        [("📤 Импорт базы","admin_src_export")],
-        [("⚙️ Управление","admin_src_manage")],
-        [("◀️ Назад","admin_sources")],
-    ])
-    await safe_edit(call, text, markup)
+        rows.append([(f"{icon} {s['title'][:38]}", f"admin_source_detail:{s['id']}")])
+    nav = []
+    if page > 0: nav.append(("◀️", f"admin_src_page:{page-1}"))
+    if (page+1)*limit < len(srcs): nav.append(("▶️", f"admin_src_page:{page+1}"))
+    if nav: rows.append(nav)
+    rows.append([("📤 Экспорт списка","admin_src_export")])
+    rows.append([("◀️ Назад","admin_sources")])
+    await safe_edit(call,
+        f"<b>📋 Все источники ({len(srcs)})</b>" + (f"\nСтраница {page+1}" if len(srcs) > limit else ""),
+        mkb(rows))
 
 @admin_router.callback_query(F.data == "admin_src_export")
 async def admin_src_export_cb(call: CallbackQuery):
@@ -1939,28 +1965,54 @@ async def admin_src_export_cb(call: CallbackQuery):
         caption="📤 Список источников")
     await call.answer()
 
-@admin_router.callback_query(F.data == "admin_src_manage")
-async def admin_src_manage_cb(call: CallbackQuery):
-    srcs = _db.get_sources(active_only=False)
-    if not srcs: await call.answer("Нет источников"); return
-    rows = []
-    for s in srcs:
-        icon = "✅" if s["active"] else "❌"
-        rows.append([(f"{icon} {s['title'][:30]}", f"admin_src_toggle:{s['id']}")])
-        rows.append([(f"🗑 Удалить", f"admin_src_del:{s['id']}")])
-        rows.append([(f"👥 Все участники", f"admin_src_members:{s['id']}"),
-                     (f"✍️ Кто писал", f"admin_src_authors:{s['id']}")])
-    rows.append([("◀️ Назад","admin_src_list")])
-    await safe_edit(call, "<b>⚙️ Управление источниками</b>", mkb(rows))
+def render_source_detail(source_id: int) -> Optional[tuple[str, InlineKeyboardMarkup]]:
+    s = next((x for x in _db.get_sources(active_only=False) if x["id"] == source_id), None)
+    if not s: return None
+    stats = _db.get_source_stats(s["chat_id"])
+    link  = s.get("link") or f"tg://openmessage?chat_id={s['chat_id']}"
+    added = fmt_msk(s.get("added_at"), "%Y-%m-%d") if s.get("added_at") else "—"
+    last  = fmt_msk(stats["last_at"], "%Y-%m-%d %H:%M") if stats["last_at"] else "—"
+    status = "✅ Активен" if s["active"] else "❌ Отключён"
+    text = (
+        f"<b>♨️ <a href='{link}'>{html.escape(s['title'])}</a></b>\n"
+        f"Статус: {status}\n"
+        f"Добавлен: {added}\n\n"
+        f"<b>📊 Статистика</b>\n"
+        f"Вакансий найдено: <b>{stats['total']}</b>\n"
+        f"  ✅ одобрено ИИ: {stats['suitable']}\n"
+        f"  🚫 отсеяно чёрным списком: {stats['blocked']}\n"
+        f"Писали в чате: <b>{stats['authors']}</b> чел.\n"
+        f"Последняя активность: {last}"
+    )
+    toggle_label = "🔴 Отключить" if s["active"] else "🟢 Включить"
+    markup = mkb([
+        [(toggle_label, f"admin_src_toggle:{source_id}"), ("🗑 Удалить", f"admin_src_del:{source_id}")],
+        [("👥 Все участники", f"admin_src_members:{source_id}"), ("✍️ Кто писал", f"admin_src_authors:{source_id}")],
+        [("◀️ Назад","admin_src_list")],
+    ])
+    return text, markup
+
+@admin_router.callback_query(F.data.startswith("admin_source_detail:"))
+async def admin_source_detail_cb(call: CallbackQuery):
+    result = render_source_detail(int(call.data.split(":")[1]))
+    if not result: await call.answer("Источник не найден"); return
+    text, markup = result
+    await safe_edit(call, text, markup)
 
 @admin_router.callback_query(F.data.startswith("admin_src_toggle:"))
 async def admin_src_toggle_cb(call: CallbackQuery):
-    _db.toggle_source(int(call.data.split(":")[1])); await admin_src_manage_cb(call)
+    source_id = int(call.data.split(":")[1])
+    _db.toggle_source(source_id)
+    result = render_source_detail(source_id)
+    if not result: await call.answer("Источник не найден"); return
+    text, markup = result
+    await safe_edit(call, text, markup)
 
 @admin_router.callback_query(F.data.startswith("admin_src_del:"))
 async def admin_src_del_cb(call: CallbackQuery):
     _db.delete_source(int(call.data.split(":")[1]))
-    await call.answer("Удалено"); await admin_src_manage_cb(call)
+    await call.answer("Удалено")
+    await _show_sources_page(call, 0)
 
 @admin_router.callback_query(F.data.startswith("admin_src_members:"))
 async def admin_src_members_cb(call: CallbackQuery):
@@ -1980,12 +2032,12 @@ async def admin_src_members_cb(call: CallbackQuery):
     except Exception as e:
         log.error(f"admin_src_members {src['chat_id']}: {e}")
         await safe_edit(call, f"❌ Не удалось загрузить участников: <code>{html.escape(str(e))}</code>",
-                         kb_back("admin_src_manage"))
+                         kb_back(f"admin_source_detail:{src_id}"))
         return
 
     if not members:
         await safe_edit(call, "😕 Участников не найдено (или недостаточно прав на просмотр).",
-                         kb_back("admin_src_manage"))
+                         kb_back(f"admin_source_detail:{src_id}"))
         return
 
     def _label(m: dict) -> str:
@@ -1998,7 +2050,10 @@ async def admin_src_members_cb(call: CallbackQuery):
     await call.message.answer_document(
         BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"members_{src_id}.txt"),
         caption=caption)
-    await safe_edit(call, caption, kb_back("admin_src_manage"))
+    result = render_source_detail(src_id)
+    if result:
+        text, markup = result
+        await safe_edit(call, text, markup)
 
 @admin_router.callback_query(F.data.startswith("admin_src_authors:"))
 async def admin_src_authors_cb(call: CallbackQuery):
@@ -2035,6 +2090,10 @@ async def admin_src_authors_cb(call: CallbackQuery):
     await call.message.answer_document(
         BufferedInputFile("\n".join(lines).encode("utf-8"), filename=f"authors_{src_id}.txt"),
         caption=caption)
+    result = render_source_detail(src_id)
+    if result:
+        text, markup = result
+        await safe_edit(call, text, markup)
 
 
 # ═══════════════════════════════════════════════════════════════
