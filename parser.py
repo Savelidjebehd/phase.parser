@@ -48,7 +48,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 00:07"
+BOT_VERSION    = "2026-09-20 11:48"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -777,7 +777,7 @@ async def get_usdt_rub_rate() -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
-_DS_FAIL = DeepSeekResult(suitable=False, reason="Ошибка API", contact="")
+_DS_FAIL = DeepSeekResult(suitable=False, reason="ИИ недоступен — не проверено", contact="")
 
 async def _upgrade_old_deliveries(bot: Bot, cl: dict) -> None:
     """После оформления/продления подписки — старые вакансии, которые пришли
@@ -1501,8 +1501,8 @@ class VacancyPipeline:
         но не были проверены, пока ИИ был выключен/недоступен (см. отметку
         'ИИ выключен — не проверено' в _process). Возвращает число обработанных."""
         rows = self.db._c().execute(
-            "SELECT * FROM vacancies WHERE ds_reason = ? ORDER BY id",
-            ("ИИ выключен — не проверено",)).fetchall()
+            "SELECT * FROM vacancies WHERE ds_reason IN (?, ?, ?) ORDER BY id",
+            ("ИИ выключен — не проверено", "ИИ недоступен — не проверено", "Ошибка API")).fetchall()
         if not rows: return 0
         log.info(f"Довыполняю ИИ-проверку для {len(rows)} пропущенных вакансий")
         for row in rows:
