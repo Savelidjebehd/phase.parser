@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-20 22:44"
+BOT_VERSION    = "2026-09-21 15:37"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -4760,6 +4760,28 @@ async def main() -> None:
                 else:
                     raise
 
+    async def _webhook_guard() -> None:
+        """Разовый delete_webhook() в начале main() не защищает от повторной
+        установки вебхука уже ПОСЛЕ старта — а именно это, похоже,
+        и происходит (конфликт возвращается уже во время работы, а не сразу
+        при запуске). aiogram сам держит getUpdates во внутреннем
+        бесконечном ретрае и наружу эту ошибку не выпускает, так что поймать
+        её обычным try/except вокруг start_polling нельзя. Поэтому отдельно,
+        раз в минуту, проверяем реальный статус через get_webhook_info и
+        снимаем вебхук заново, если он снова оказался включён — не важно,
+        кто его включил (сторонний скрипт, инфраструктура хостинга, забытый
+        старый контейнер того же бота)."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                info = await bot.get_webhook_info()
+                if info.url:
+                    log.warning(f"UserBot/Bot: обнаружен активный вебхук ({info.url}) — снимаю повторно")
+                    _db.add_log("WARNING", f"Обнаружен активный вебхук ({info.url}) — снят повторно")
+                    await bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                log.warning(f"_webhook_guard: {e}")
+
     await asyncio.gather(
         dp.start_polling(bot, allowed_updates=["message","callback_query","inline_query"]),
         _pipeline.run_worker(),
@@ -4771,6 +4793,7 @@ async def main() -> None:
         _check_message_flow(bot),
         _check_ai_health(bot),
         _safe_userbot_run(),
+        _webhook_guard(),
     )
 
 if __name__ == "__main__":
