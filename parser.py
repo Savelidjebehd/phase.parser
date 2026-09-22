@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-22 12:31"
+BOT_VERSION    = "2026-09-22 12:42"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -69,6 +69,7 @@ MSK = timezone(timedelta(hours=3))  # Москва — фикс. UTC+3, без �
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
 REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус купившему рефералу
 REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
+FREE_NUDGE_THRESHOLD = int(os.getenv("FREE_NUDGE_THRESHOLD", "8"))  # после скольки закрытых вакансий слать разовую скидку никогда не платившим
 
 # Цены: до первой оплаты (скидка) / после
 PRICES = {
@@ -270,6 +271,12 @@ class Database:
         # откликнуться?") — нужно, чтобы при оформлении подписки апгрейднуть
         # именно старые бесплатные сообщения, а не трогать остальные
         try: self._c().execute("ALTER TABLE client_deliveries ADD COLUMN sent_as_subscribed INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: счётчик вакансий с закрытым контактом, увиденных клиентом
+        # без подписки — для воронки конверсии (напоминание с накопленным
+        # числом пропущенного, разовый пуш со скидкой после N вакансий)
+        try: self._c().execute("ALTER TABLE clients ADD COLUMN free_vacancies_seen INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -538,6 +545,17 @@ class Database:
     def has_first_payment(self, tg_id: int) -> bool:
         row = self._c().execute("SELECT first_payment FROM clients WHERE tg_id=?", (tg_id,)).fetchone()
         return bool(row and row["first_payment"])
+
+    def inc_free_vacancy_seen(self, client_id: int) -> int:
+        """Считает вакансии с закрытым контактом, показанные клиенту без
+        подписки — используется для воронки конверсии (усиленный текст в
+        карточке вакансии каждые N штук + разовый пуш со скидкой после
+        достижения порога). Обнуляется при первой оплате (см. create_payment)."""
+        self._c().execute("UPDATE clients SET free_vacancies_seen = COALESCE(free_vacancies_seen,0) + 1 WHERE id=?",
+                          (client_id,))
+        self._c().commit()
+        return self._c().execute("SELECT free_vacancies_seen FROM clients WHERE id=?",
+                                 (client_id,)).fetchone()[0]
 
     def toggle_search(self, client_id: int) -> bool:
         row = self._c().execute("SELECT search_active FROM clients WHERE id=?", (client_id,)).fetchone()
@@ -1649,6 +1667,31 @@ class VacancyPipeline:
                     vacancy.html_text or html.escape(vacancy.text),
                     ds.contact, vacancy.author_id, vacancy.message_link,
                     subscribed=subscribed, is_channel_source=vacancy.is_channel_source)
+
+                if not subscribed:
+                    seen = self.db.inc_free_vacancy_seen(cl_id)
+                    # Каждую 3-ю закрытую вакансию усиливаем текст прямо в
+                    # карточке — не полагаемся только на то, что клиент сам
+                    # нажмёт "Как откликнуться?"
+                    if seen % 3 == 0:
+                        msg_text += (f"\n\n<i>💡 Это уже {seen}-я вакансия с закрытым контактом — "
+                                     f"с подпиской вы бы увидели его сразу.</i>")
+                    # Разовый пуш со скидкой тем, кто долго остаётся на бесплатном —
+                    # отдельно от win-back после истечения подписки (тот бьёт по
+                    # только что отвалившимся, этот — по тем, кто вообще никогда
+                    # не платил и уже накопил ощутимое количество вакансий)
+                    if seen == FREE_NUDGE_THRESHOLD and not cl.get("first_payment"):
+                        nudge_key = f"free_nudge_sent_{cl_id}"
+                        if not self.db.get_setting(nudge_key, ""):
+                            self.db.set_setting(nudge_key, "1")
+                            try:
+                                await self.bot.send_message(cl["tg_id"],
+                                    f"👀 Вы уже получили <b>{seen}</b> вакансий, но не смогли посмотреть контакты.\n\n"
+                                    f"Ловите скидку <b>15%</b> на первую подписку — только сейчас:",
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=_tariffs_kb_winback(cl))
+                            except Exception: pass
+
                 sent   = await self.bot.send_message(cl["tg_id"], msg_text,
                                                      parse_mode=ParseMode.HTML, reply_markup=markup)
                 self.db.save_delivery(vid, cl_id, sent.message_id, subscribed=subscribed)
@@ -3968,8 +4011,11 @@ async def client_how_reply_cb(call: CallbackQuery):
     uid = call.from_user.id; uname = call.from_user.username
     cl  = _db.get_or_create_client(uid, uname)
     await call.answer()
+    seen = cl.get("free_vacancies_seen") or 0
+    extra = f" Вы уже получили <b>{seen}</b> таких вакансий." if seen >= 2 else ""
     await call.message.answer(
-        "Чтобы откликнуться на вакансию вам нужно приобрести подписку",
+        f"Чтобы откликнуться на вакансию, нужна подписка.{extra}\n"
+        f"С подпиской контакт автора виден сразу, без ожидания.",
         reply_markup=_tariffs_kb(cl), parse_mode=ParseMode.HTML)
 
 @client_router.callback_query(F.data.startswith("client_buy:"))
