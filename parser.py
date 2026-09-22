@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-21 15:37"
+BOT_VERSION    = "2026-09-22 12:31"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -748,7 +748,13 @@ class Database:
     def cleanup(self) -> None:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
         self._c().execute("DELETE FROM logs WHERE ts<?", (cutoff,))
-        self._c().execute("DELETE FROM vacancies WHERE suitable=0 AND created_at<?", (cutoff,))
+        # Не трогаем вакансии, ожидающие довыполнения ИИ-проверки (см.
+        # recheck_skipped_vacancies) — иначе долгий сбой DeepSeek (>2 суток)
+        # приведёт к тому, что они удалятся раньше, чем будут перепроверены
+        self._c().execute(
+            "DELETE FROM vacancies WHERE suitable=0 AND created_at<? "
+            "AND (ds_reason IS NULL OR ds_reason NOT IN (?, ?, ?))",
+            (cutoff, "ИИ выключен — не проверено", "ИИ недоступен — не проверено", "Ошибка API"))
         self._c().commit(); log.info("Авто-очистка выполнена")
 
     def clear_logs(self) -> None:
