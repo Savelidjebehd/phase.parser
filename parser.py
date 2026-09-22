@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-22 12:42"
+BOT_VERSION    = "2026-09-22 13:45"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1235,10 +1235,19 @@ def kb_client_main() -> InlineKeyboardMarkup:
 
 _MENTION_RE = re.compile(r'(?<!\w)@\w{4,32}')
 
+def _partial_mask(username: str) -> str:
+    """Прячет юзернейм не полностью, а частично: @iv*** вместо голого "—".
+    Так видно, что контакт реальный и есть кому писать, а не абстрактный
+    прочерк, который мог бы значить что угодно (в том числе что автора нет
+    вообще) — это ощутимо убедительнее для конверсии из бесплатных."""
+    name = username.lstrip("@")
+    if len(name) <= 2: return "@" + "*" * len(name)
+    return "@" + name[:2] + "*" * min(len(name) - 2, 5)
+
 def censor_mentions(text: str) -> str:
-    """Заменяет любые упоминания вида @username на прочерк — используется
-    в тексте вакансии для клиентов без подписки."""
-    return _MENTION_RE.sub("—", text)
+    """Заменяет любые упоминания вида @username на частично скрытый вид —
+    используется в тексте вакансии для клиентов без подписки."""
+    return _MENTION_RE.sub(lambda m: _partial_mask(m.group(0)), text)
 
 def render_vacancy_client(v_html: str, contact: str, author_id: int, message_link: str,
                           subscribed: bool = True, is_channel_source: bool = False) -> tuple[str, InlineKeyboardMarkup]:
@@ -1247,9 +1256,11 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
     вызывающий код отвечает за то, что это безопасный HTML или escape-плейн.
 
     subscribed=False — версия для клиентов без подписки: любой контакт
-    (юзернейм в тексте вакансии, строка "Автор:", ссылка на профиль без
-    юзернейма) заменяется на прочерк, а вместо кнопки-перехода к исходному
-    сообщению (там виден настоящий контакт) — кнопка "Как откликнуться?".
+    (юзернейм в тексте вакансии, строка "Автор:") частично скрывается
+    (@iv*** — видно, что контакт реальный, но не полностью), а вместо
+    кнопки-перехода к исходному сообщению (там виден настоящий контакт) —
+    кнопка "Как откликнуться?". Ссылка на профиль без юзернейма (только
+    по ID) без подписки не показывается вообще — там скрывать нечего.
 
     is_channel_source=True — вакансия из канала, а не из группы: у поста нет
     живого автора (отправитель в апдейте — сам канал), поэтому строку "Автор:"
@@ -1267,7 +1278,7 @@ def render_vacancy_client(v_html: str, contact: str, author_id: int, message_lin
         # авторе просто не показываем вообще (не пишем даже плейсхолдер)
         author_line = ""
     elif contact.startswith("@"):
-        author_line = f"\n\n<blockquote>Автор: {'—' if not subscribed else html.escape(contact)}</blockquote>"
+        author_line = f"\n\n<blockquote>Автор: {_partial_mask(contact) if not subscribed else html.escape(contact)}</blockquote>"
     elif author_id:
         if not subscribed:
             # Контакт (в любом виде) без подписки не показываем точно так же,
@@ -1684,10 +1695,12 @@ class VacancyPipeline:
                         nudge_key = f"free_nudge_sent_{cl_id}"
                         if not self.db.get_setting(nudge_key, ""):
                             self.db.set_setting(nudge_key, "1")
+                            _set_winback_offer(cl_id)
                             try:
                                 await self.bot.send_message(cl["tg_id"],
                                     f"👀 Вы уже получили <b>{seen}</b> вакансий, но не смогли посмотреть контакты.\n\n"
-                                    f"Ловите скидку <b>15%</b> на первую подписку — только сейчас:",
+                                    f"Ловите скидку <b>15%</b> на первую подписку — предложение "
+                                    f"действует <b>{WINBACK_VALID_HOURS} часа</b>:",
                                     parse_mode=ParseMode.HTML,
                                     reply_markup=_tariffs_kb_winback(cl))
                             except Exception: pass
@@ -4018,6 +4031,24 @@ async def client_how_reply_cb(call: CallbackQuery):
         f"С подпиской контакт автора виден сразу, без ожидания.",
         reply_markup=_tariffs_kb(cl), parse_mode=ParseMode.HTML)
 
+WINBACK_VALID_HOURS = 24  # срок действия скидочного предложения (см. _set_winback_offer/_winback_valid)
+
+def _set_winback_offer(client_id: int) -> None:
+    """Отмечает момент отправки скидочного предложения (win-back после
+    истечения подписки или разовый пуш для долго-бесплатных) — от этой
+    отметки отсчитывается срок действия скидки (см. _winback_valid).
+    Без дедлайна скидка висела бы бессрочно, и эффект срочности не работал бы."""
+    _db.set_setting(f"wb15_offer_ts_{client_id}", datetime.now().isoformat())
+
+def _winback_valid(client_id: int) -> bool:
+    ts = _db.get_setting(f"wb15_offer_ts_{client_id}", "")
+    if not ts: return False
+    try:
+        sent = datetime.fromisoformat(ts)
+    except Exception:
+        return False
+    return (datetime.now() - sent) < timedelta(hours=WINBACK_VALID_HOURS)
+
 @client_router.callback_query(F.data.startswith("client_buy:"))
 async def client_buy_cb(call: CallbackQuery):
     uid     = call.from_user.id
@@ -4027,6 +4058,11 @@ async def client_buy_cb(call: CallbackQuery):
     p       = PRICES.get(tariff)
     if not p: await call.answer("Неверный тариф"); return
     cl      = _db.get_or_create_client(uid, call.from_user.username)
+    if winback and not _winback_valid(cl["id"]):
+        await call.answer("Скидка уже истекла", show_alert=True)
+        await safe_edit(call, "⏰ Срок скидочного предложения истёк — но вот актуальные тарифы:",
+                        _tariffs_kb(cl))
+        return
     has_paid = bool(cl.get("first_payment"))
     amount  = _winback_price(cl, tariff) if winback else (p["full"] if has_paid else p["sale"])
     ticket  = f"DRAFT-{int(time.time()*1000)}"
@@ -4059,6 +4095,13 @@ async def client_crypto_choose_cb(call: CallbackQuery):
     tariff  = parts[1]
     winback = len(parts) > 2 and parts[2] == "wb15"
     if tariff not in PRICES: await call.answer("Неверный тариф"); return
+    if winback:
+        cl = _db.get_or_create_client(call.from_user.id, call.from_user.username)
+        if not _winback_valid(cl["id"]):
+            await call.answer("Скидка уже истекла", show_alert=True)
+            await safe_edit(call, "⏰ Срок скидочного предложения истёк — но вот актуальные тарифы:",
+                            _tariffs_kb(cl))
+            return
     suffix = ":wb15" if winback else ""
     rows = [[(f"{w['icon']} {w['label']}", f"client_buy_crypto:{tariff}:{key}{suffix}")]
             for key, w in CRYPTO_WALLETS.items()]
@@ -4078,6 +4121,11 @@ async def client_buy_crypto_cb(call: CallbackQuery):
     if not wallet:
         await call.answer("Оплата в USDT временно недоступна", show_alert=True); return
     cl       = _db.get_or_create_client(uid, call.from_user.username)
+    if winback and not _winback_valid(cl["id"]):
+        await call.answer("Скидка уже истекла", show_alert=True)
+        await safe_edit(call, "⏰ Срок скидочного предложения истёк — но вот актуальные тарифы:",
+                        _tariffs_kb(cl))
+        return
     has_paid = bool(cl.get("first_payment"))
     amount   = _winback_price(cl, tariff) if winback else (p["full"] if has_paid else p["sale"])
     rate     = await get_usdt_rub_rate()
@@ -4611,11 +4659,13 @@ async def _check_expired_subs(bot: Bot) -> None:
                 if last and last == now.strftime("%Y-%m-%d"): continue
                 try:
                     await bot.send_message(cl["tg_id"],
-                        "Дарим скидку <b>15%</b> на все тарифы!\n"
-                        "Подключитесь чтобы получать новые заказы",
+                        f"Дарим скидку <b>15%</b> на все тарифы!\n"
+                        f"Предложение действует <b>{WINBACK_VALID_HOURS} часа</b>.\n"
+                        f"Подключитесь чтобы получать новые заказы",
                         parse_mode=ParseMode.HTML,
                         reply_markup=_tariffs_kb_winback(cl))
                     _db.set_setting(sent_key, now.strftime("%Y-%m-%d"))
+                    _set_winback_offer(cl["id"])
                 except Exception: pass
         except Exception as e: log.error(f"_check_expired_subs: {e}")
 
@@ -4647,6 +4697,40 @@ async def _send_expiry_reminders(bot: Bot) -> None:
                     _db.set_setting(sent_key, "1")
                 except Exception: pass
         except Exception as e: log.error(f"_send_expiry_reminders: {e}")
+
+async def _send_mid_trial_reminders(bot: Bot) -> None:
+    """Напоминание в середине бесплатного периода (не путать с напоминанием
+    об истечении — это раньше, примерно на середине FREE_DAYS) — чтобы
+    клиент не забыл о боте на второй день из трёх и увидел пользу ДО того,
+    как включится "паника перед концом". Шлётся только тем, кто ни разу не
+    платил (first_payment=0) — то есть именно на бесплатном пробном
+    периоде, а не продлившим платную подписку. Ровно один раз за период —
+    та же логика дедупа, что и у напоминания об истечении."""
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            midpoint_hours = max(1, FREE_DAYS * 24 // 2)
+            now  = datetime.now()
+            soon = (now + timedelta(hours=midpoint_hours)).isoformat()
+            rows = _db._c().execute(
+                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND sub_until <= ? "
+                "AND (first_payment IS NULL OR first_payment=0)",
+                (now.isoformat(), soon)).fetchall()
+            for row in rows:
+                cl = dict(row)
+                sent_key = f"mid_trial_{cl['id']}_{cl['sub_until']}"
+                if _db.get_setting(sent_key, ""): continue
+                seen = cl.get("free_vacancies_seen") or 0
+                try:
+                    await bot.send_message(cl["tg_id"],
+                        f"👋 Напоминаем про <b>phase.parser</b> — пробный период идёт полным ходом.\n\n"
+                        f"За это время вам уже прислали <b>{seen}</b> вакансий. "
+                        f"С подпиской вы бы видели контакт автора сразу, без ожидания.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=mkb([[("💳 Тарифы","client_tariffs")]]))
+                    _db.set_setting(sent_key, "1")
+                except Exception: pass
+        except Exception as e: log.error(f"_send_mid_trial_reminders: {e}")
 
 async def _scheduled_broadcast(bot: Bot) -> None:
     """Общая рассылка по расписанию — раз в день в заданное московское время
@@ -4840,6 +4924,7 @@ async def main() -> None:
         _periodic_cleanup(),
         _check_expired_subs(bot),
         _send_expiry_reminders(bot),
+        _send_mid_trial_reminders(bot),
         _scheduled_broadcast(bot),
         _check_userbot_health(bot),
         _check_message_flow(bot),
