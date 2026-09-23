@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-22 13:45"
+BOT_VERSION    = "2026-09-23 07:34"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -647,6 +647,18 @@ class Database:
         return [dict(r) for r in self._c().execute(
             "SELECT d.*, c.tg_id FROM client_deliveries d JOIN clients c ON d.client_id=c.id "
             "WHERE d.vacancy_id=? AND d.msg_id IS NOT NULL", (vacancy_id,)).fetchall()]
+
+    def count_deliveries(self, client_id: int, subscribed_only: bool = False) -> int:
+        """Сколько вакансий реально отправлено этому клиенту (msg_id IS NOT
+        NULL — пропущенные из-за ошибки отправки не считаем). В отличие от
+        free_vacancies_seen (который считает только показы БЕЗ подписки),
+        это общее число за всё время — нужно для сообщений, актуальных и
+        во время активного триала/подписки (когда free_vacancies_seen ещё 0)."""
+        q = "SELECT COUNT(*) FROM client_deliveries WHERE client_id=? AND msg_id IS NOT NULL"
+        args = [client_id]
+        if subscribed_only:
+            q += " AND sent_as_subscribed=1"
+        return self._c().execute(q, args).fetchone()[0]
 
     def get_upgradeable_deliveries(self, client_id: int, limit: int = 100) -> list[dict]:
         """Доставки этому клиенту, отправленные как бесплатные (урезанный
@@ -4720,12 +4732,18 @@ async def _send_mid_trial_reminders(bot: Bot) -> None:
                 cl = dict(row)
                 sent_key = f"mid_trial_{cl['id']}_{cl['sub_until']}"
                 if _db.get_setting(sent_key, ""): continue
-                seen = cl.get("free_vacancies_seen") or 0
+                # Во время активного триала контакты УЖЕ открыты (sub_until в
+                # будущем) — free_vacancies_seen тут не подходит, он считает
+                # только показы БЕЗ подписки и во время триала всегда равен 0.
+                # Нужно общее число доставленных вакансий за это время.
+                seen = _db.count_deliveries(cl["id"])
                 try:
                     await bot.send_message(cl["tg_id"],
-                        f"👋 Напоминаем про <b>phase.parser</b> — пробный период идёт полным ходом.\n\n"
-                        f"За это время вам уже прислали <b>{seen}</b> вакансий. "
-                        f"С подпиской вы бы видели контакт автора сразу, без ожидания.",
+                        f"👋 Напоминаем про <b>phase.parser</b> — вы сейчас на пробном периоде "
+                        f"с полным доступом к контактам.\n\n"
+                        f"Уже получили <b>{seen}</b> вакансий с открытыми контактами. "
+                        f"Пробный период скоро закончится — оформите подписку сейчас, "
+                        f"чтобы не потерять доступ.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=mkb([[("💳 Тарифы","client_tariffs")]]))
                     _db.set_setting(sent_key, "1")
