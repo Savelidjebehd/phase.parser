@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-23 07:34"
+BOT_VERSION    = "2026-09-23 12:48"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -3893,13 +3893,96 @@ async def client_start(msg: Message):
 
     await msg.answer(_client_main_text(cl, is_new), reply_markup=kb_client_main())
     if is_new:
-        # Отдельным сообщением, явно и заметно — часть новых пользователей не
-        # понимает, что поиск вакансий уже идёт автоматически, и ждёт какого-то
-        # дополнительного действия от себя, чтобы «запустить» его. Текст
-        # редактируется через ⚙️ Настройки → ✉️ Тексты сообщений.
-        text = _db.get_setting("msg_welcome_search_started",
-                               CLIENT_MSG_TEMPLATES["msg_welcome_search_started"]["default"])
-        await msg.answer(text, parse_mode=ParseMode.HTML)
+        # Между приветствием и сообщением "поиск запущен" — предложение
+        # пройти короткое обучение по функциям бота. Часть новых
+        # пользователей засыпает вопросами в личку вместо того, чтобы
+        # разобраться самим — обучение снимает большинство таких вопросов
+        # заранее, а кто и так всё понимает — жмёт "Пропустить" за секунду.
+        await msg.answer(
+            "❓ <b>Если у вас есть вопросы по работе бота</b> — пройдите "
+            "короткое обучение по кнопке ниже. Это займёт меньше минуты.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=mkb([
+                [("🎓 Пройти обучение","client_onb_start")],
+                [("⏭ Пропустить","client_onb_skip")],
+            ]))
+
+async def _send_search_started_message(bot: Bot, tg_id: int) -> None:
+    """Отдельным сообщением, явно и заметно — часть новых пользователей не
+    понимает, что поиск вакансий уже идёт автоматически, и ждёт какого-то
+    дополнительного действия от себя, чтобы «запустить» его. Текст
+    редактируется через ⚙️ Настройки → ✉️ Тексты сообщений. Отправляется
+    после обучения (или сразу, если его пропустили) — см. client_onb_*."""
+    text = _db.get_setting("msg_welcome_search_started",
+                           CLIENT_MSG_TEMPLATES["msg_welcome_search_started"]["default"])
+    try:
+        await bot.send_message(tg_id, text, parse_mode=ParseMode.HTML)
+    except Exception: pass
+
+# ── Обучение для новых клиентов ──────────────────────────────
+# Контент шагов: (заголовок, текст). Порядок соответствует реальному
+# функционалу бота — если добавляется новая функция клиенту, стоит
+# добавить/поправить шаг здесь же.
+TUTORIAL_STEPS: list[tuple[str, str]] = [
+    ("🔍 Как это работает",
+     "Юзербот круглосуточно мониторит десятки чатов и каналов с вакансиями "
+     "на видеомонтаж.\n\nВам не нужно ничего искать вручную — как только "
+     "найдётся подходящая вакансия, она сама придёт сюда, в этот чат."),
+    ("🔓 Что открывает подписка",
+     "Без подписки вакансии тоже приходят — но контакт автора скрыт частично "
+     "(например, <code>@iv***</code>), а вместо перехода к сообщению — "
+     "кнопка «Как откликнуться?».\n\n"
+     "С подпиской контакт открыт полностью, и доступна кнопка "
+     "«Перейти к сообщению» — прямой переход в чат-источник."),
+    ("💳 Тарифы и оплата",
+     "Оплатить подписку можно переводом по номеру телефона или в USDT — "
+     "на выбор сеть <b>TRC20 (Tron)</b> или <b>TON</b>.\n\n"
+     "Посмотреть тарифы можно в любой момент — кнопка «💳 Тарифы» "
+     "в главном меню бота."),
+    ("👥 Реферальная программа",
+     f"Приглашайте друзей по своей персональной ссылке. Когда приглашённый "
+     f"оплатит любой тариф:\n\n"
+     f"• вам начислится <b>+{REF_BONUS_DAYS} дней</b>\n"
+     f"• другу — <b>+{REF_DAYS} дней</b>\n\n"
+     f"Ссылка — в разделе «👥 Реферальная программа»."),
+    ("⚙️ Настройки",
+     "В разделе «⚙️ Настройки» можно:\n\n"
+     "• добавить свои <b>стоп-слова</b> — вакансии с ними попадать не будут\n"
+     "• полностью <b>включить или выключить поиск</b>, если нужен перерыв"),
+]
+
+def _onboarding_text(idx: int) -> str:
+    title, body = TUTORIAL_STEPS[idx]
+    return f"<b>{title}</b>\n<i>Шаг {idx + 1} из {len(TUTORIAL_STEPS)}</i>\n\n{body}"
+
+def _onboarding_markup(idx: int) -> InlineKeyboardMarkup:
+    is_last  = idx == len(TUTORIAL_STEPS) - 1
+    next_btn = ("🏁 Завершить обучение", "client_onb_finish") if is_last \
+               else ("➡️ Следующий шаг", f"client_onb_next:{idx + 1}")
+    return mkb([[next_btn], [("🚪 Выйти из обучения","client_onb_finish")]])
+
+@client_router.callback_query(F.data == "client_onb_start")
+async def client_onb_start_cb(call: CallbackQuery):
+    await safe_edit(call, _onboarding_text(0), _onboarding_markup(0))
+
+@client_router.callback_query(F.data.startswith("client_onb_next:"))
+async def client_onb_next_cb(call: CallbackQuery):
+    idx = int(call.data.split(":")[1])
+    if not (0 <= idx < len(TUTORIAL_STEPS)): await call.answer(); return
+    await safe_edit(call, _onboarding_text(idx), _onboarding_markup(idx))
+
+@client_router.callback_query(F.data == "client_onb_skip")
+async def client_onb_skip_cb(call: CallbackQuery):
+    await call.answer()
+    await safe_edit(call, "Хорошо, пропускаем 🙂", None)
+    await _send_search_started_message(call.bot, call.from_user.id)
+
+@client_router.callback_query(F.data == "client_onb_finish")
+async def client_onb_finish_cb(call: CallbackQuery):
+    await call.answer()
+    await safe_edit(call, "✅ <b>Обучение пройдено!</b>", None)
+    await _send_search_started_message(call.bot, call.from_user.id)
+
 
 @client_router.message(Command("settings"))
 async def client_cmd_settings(msg: Message):
