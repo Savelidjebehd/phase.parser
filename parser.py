@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-24 14:17"
+BOT_VERSION    = "2026-09-24 22:31"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -77,10 +77,16 @@ FREE_NUDGE_THRESHOLD = int(os.getenv("FREE_NUDGE_THRESHOLD", "8"))  # после
 
 # Цены: до первой оплаты (скидка) / после
 PRICES = {
-    "week":   {"label": "1 нед.",  "days": 7,   "sale": 169,  "full": 199},
-    "month":  {"label": "1 мес.",  "days": 30,  "sale": 424,  "full": 499},
-    "3month": {"label": "3 мес.",  "days": 90,  "sale": 1019, "full": 1119},
+    "week":   {"label": "1 нед.",  "name": "Неделя",   "days": 7,   "sale": 169,  "full": 199},
+    "month":  {"label": "1 мес.",  "name": "Месяц",    "days": 30,  "sale": 424,  "full": 499},
+    "3month": {"label": "3 мес.",  "name": "3 месяца", "days": 90,  "sale": 1019, "full": 1119},
 }
+
+def _tariff_btn_label(key: str, price: int, fire: str = "") -> str:
+    """Текст кнопки тарифа: 'Неделя 199₽ • 28 ₽/день' (цена в день — округлённо)."""
+    p = PRICES[key]
+    per_day = round(price / p["days"])
+    return f"{p['name']} {price}₽{fire} • {per_day} ₽/день"
 
 # Мягкие корни-слова (слишком общие сами по себе, ловят случайный чат) —
 # засчитываются как совпадение по ключевым словам, ТОЛЬКО если в тексте
@@ -4223,7 +4229,7 @@ def _tariffs_kb(cl: dict) -> InlineKeyboardMarkup:
     for key, p in PRICES.items():
         price = p["full"] if has_paid else p["sale"]
         fire  = "" if has_paid else "🔥"
-        rows.append([(f"{price}₽{fire} за {p['label']}", f"client_buy:{key}")])
+        rows.append([(_tariff_btn_label(key, price, fire), f"client_buy:{key}")])
     rows.append([("◀️ Главное меню","client_main")])
     return mkb(rows)
 
@@ -4246,7 +4252,7 @@ def _tariffs_kb_winback(cl: dict) -> InlineKeyboardMarkup:
     rows = []
     for key, p in PRICES.items():
         price = _winback_price(cl, key)
-        rows.append([(f"{price}₽🔥 за {p['label']}", f"client_buy:{key}:wb15")])
+        rows.append([(_tariff_btn_label(key, price, "🔥"), f"client_buy:{key}:wb15")])
     rows.append([("◀️ Главное меню","client_main")])
     return mkb(rows)
 
