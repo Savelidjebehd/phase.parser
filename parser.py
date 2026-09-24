@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-24 07:26"
+BOT_VERSION    = "2026-09-24 07:29"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -620,6 +620,8 @@ class Database:
             "SELECT id, text FROM vacancies WHERE created_at >= ? ORDER BY id DESC LIMIT 3000",
             (since,)).fetchall()
         raw_len = len(text)
+        my_prices = extract_prices(text)
+        price_rejected = None
         for r in rows:
             cand_raw = r["text"] or ""
             # Дешёвые предфильтры — чтобы не гонять тяжёлое сравнение по всей базе
@@ -630,7 +632,19 @@ class Database:
             cw = set(cand.split())
             if len(words & cw) < 0.5 * len(words | cw): continue
             ratio = difflib.SequenceMatcher(None, norm, cand, autojunk=False).ratio()
-            if ratio >= threshold: return (r["id"], ratio)
+            if ratio >= threshold:
+                # Текст почти тот же, но цена другая (обе указаны и не совпадают) —
+                # это новое предложение, а не репост: не считаем дубликатом.
+                cand_prices = extract_prices(cand_raw)
+                if my_prices and cand_prices and my_prices != cand_prices:
+                    if price_rejected is None:
+                        price_rejected = (r["id"], sorted(cand_prices), sorted(my_prices))
+                    continue
+                return (r["id"], ratio)
+        if price_rejected:
+            rid, old_p, new_p = price_rejected
+            log.info(f"Похожа на #{rid}, но цена другая ({old_p} → {new_p}) — не дубликат")
+            self.add_log("INFO", f"💰 Похожа на #{rid}, но цена другая ({old_p} → {new_p}) — не дубликат")
         return None
 
     def is_duplicate(self, text: str) -> bool:
@@ -1188,6 +1202,34 @@ def norm_for_dup(s: str) -> str:
     s = re.sub(r"@\w+", " ", s)
     s = re.sub(r"[\W_]+", " ", s)
     return " ".join(s.split())
+
+_PRICE_MARK = r"(?:тыс\w*|к|k|₽|руб\w*|р|\$|usd|долл\w*|€|eur|евро)"
+_PRICE_AFTER = re.compile(
+    r"(\d[\d\s.,]*?(?:\s*(?:[-–—]|до)\s*\d[\d\s.,]*?)?)\s*(" + _PRICE_MARK + r")(?![a-zа-яё0-9])")
+_PRICE_BEFORE = re.compile(r"([$€₽])\s*(\d[\d\s.,]*)")
+
+def extract_prices(text: str) -> frozenset:
+    """Суммы денег из текста вакансии: числа рядом со знаком валюты/«руб»/«р»/
+    «к»/«тыс» ('1500 руб', '1 500 ₽', '50-70 тыс', '1,5к', '$200'). 'к' и 'тыс'
+    умножают на 1000. Нужна для дедупликации: если цена в репосте другая —
+    это уже не дубликат, а новое предложение."""
+    t = text.lower()
+    found = set()
+
+    def add(chunk: str, mult: bool) -> None:
+        chunk = re.sub(r"(?<=\d)[\s.](?=\d{3}(?!\d))", "", chunk)   # 1 500 / 1.500 -> 1500
+        chunk = chunk.replace(",", ".")
+        for num in re.findall(r"\d+(?:\.\d+)?", chunk):
+            v = float(num)
+            if mult and v < 1000: v *= 1000
+            if v > 0: found.add(int(round(v)))
+
+    for m in _PRICE_AFTER.finditer(t):
+        mark = m.group(2)
+        add(m.group(1), mark.startswith("тыс") or mark in ("к", "k"))
+    for m in _PRICE_BEFORE.finditer(t):
+        add(m.group(2), False)
+    return frozenset(found)
 
 def norm_yo(s: str) -> str:
     """Приводит 'ё'→'е' (и 'Ё'→'Е'), чтобы сравнение ключевых слов/чёрного
