@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-24 07:29"
+BOT_VERSION    = "2026-09-24 14:17"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -2966,6 +2966,19 @@ async def _show_clients_page(call: CallbackQuery, page: int) -> None:
     rows.append([("◀️ Назад","admin_clients")])
     await safe_edit(call, f"<b>📋 Клиенты ({len(clients)})</b>\nСтраница {page+1}", mkb(rows))
 
+def _pay_method_label(p: dict) -> str:
+    """Способ оплаты для истории: '💳 Рубли' или '🔺 USDT · TRC20 (Tron), 12.5 USDT'."""
+    method = p.get("method") or "rub"
+    if method == "rub":
+        return "💳 Рубли"
+    if method.startswith("usdt_"):
+        w = CRYPTO_WALLETS.get(method.split("_", 1)[1])
+        label = f"{w['icon']} {w['label']}" if w else method
+        if p.get("crypto_amount"):
+            label += f", {p['crypto_amount']} USDT"
+        return label
+    return method
+
 def render_client_detail(client_id: int) -> Optional[tuple[str, InlineKeyboardMarkup]]:
     c = _db.get_client_by_id(client_id)
     if not c: return None
@@ -2978,7 +2991,11 @@ def render_client_detail(client_id: int) -> Optional[tuple[str, InlineKeyboardMa
 
     # История пополнений
     payments = _db.get_client_payments(client_id)
-    hist_lines = [f"{fmt_msk(p['created_at'], '%Y-%m-%d')} {p['tariff']} {p['amount']}₽" for p in payments]
+    def _hist_line(p: dict) -> str:
+        mark = {"pending": "⏳ ", "rejected": "❌ "}.get(p.get("status"), "")
+        return (f"{mark}{fmt_msk(p['created_at'], '%Y-%m-%d')} {p['tariff']} {p['amount']}₽ · "
+                f"{_pay_method_label(p)}")
+    hist_lines = [_hist_line(p) for p in payments]
     hist_block = "<blockquote>" + "\n".join(hist_lines) + "</blockquote>" if hist_lines else "<i>нет</i>"
 
     text = (
