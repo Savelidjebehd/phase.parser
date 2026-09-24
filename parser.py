@@ -3,7 +3,7 @@ phase.parser — агрегатор публичных вакансий из Tel
 Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 """
 from __future__ import annotations
-import asyncio, html, json, logging, os, re, sqlite3, time
+import asyncio, difflib, html, json, logging, os, re, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-23 12:48"
+BOT_VERSION    = "2026-09-24 07:26"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -67,6 +67,10 @@ CRYPTO_WALLETS   = {
 CRYPTO_RATE_BUFFER = float(os.getenv("CRYPTO_RATE_BUFFER", "1.5"))  # % запаса на случай расхождения курса с BingX
 MSK = timezone(timedelta(hours=3))  # Москва — фикс. UTC+3, без перехода на летнее/зимнее
 FREE_DAYS        = int(os.getenv("FREE_DAYS", "3"))
+# Нечёткая дедупликация вакансий: порог похожести текстов (0..1) и глубина
+# поиска в днях. 0.9 — ловит репост с правкой смайлика/опечатки/контакта.
+DUP_SIMILARITY   = float(os.getenv("DUP_SIMILARITY", "0.9"))
+DUP_WINDOW_DAYS  = int(os.getenv("DUP_WINDOW_DAYS", "14"))
 REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус купившему рефералу
 REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
 FREE_NUDGE_THRESHOLD = int(os.getenv("FREE_NUDGE_THRESHOLD", "8"))  # после скольки закрытых вакансий слать разовую скидку никогда не платившим
@@ -597,8 +601,40 @@ class Database:
         except Exception as e:
             log.error(f"save_vacancy: {e}"); return None
 
+    def find_duplicate(self, text: str) -> Optional[tuple]:
+        """Ищет уже виденную вакансию: сначала точное совпадение текста, потом
+        нечёткое — среди вакансий за последние DUP_WINDOW_DAYS дней.
+        Возвращает (id_вакансии, похожесть 0..1) или None.
+        Похожесть считается по нормализованному тексту (см. norm_for_dup);
+        совсем короткие тексты (<40 знаков) сравниваются только на полное
+        совпадение — иначе разные короткие объявления легко принять за одно."""
+        row = self._c().execute("SELECT id FROM vacancies WHERE text=?", (text,)).fetchone()
+        if row: return (row["id"], 1.0)
+        norm = norm_for_dup(text)[:2000]
+        if not norm: return None
+        n = len(norm)
+        threshold = 1.0 if n < 40 else DUP_SIMILARITY
+        words = set(norm.split())
+        since = (datetime.now(timezone.utc) - timedelta(days=DUP_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self._c().execute(
+            "SELECT id, text FROM vacancies WHERE created_at >= ? ORDER BY id DESC LIMIT 3000",
+            (since,)).fetchall()
+        raw_len = len(text)
+        for r in rows:
+            cand_raw = r["text"] or ""
+            # Дешёвые предфильтры — чтобы не гонять тяжёлое сравнение по всей базе
+            if min(raw_len, len(cand_raw)) < 0.6 * max(raw_len, len(cand_raw)): continue
+            cand = norm_for_dup(cand_raw)[:2000]
+            if not cand: continue
+            if min(n, len(cand)) < 0.85 * max(n, len(cand)): continue
+            cw = set(cand.split())
+            if len(words & cw) < 0.5 * len(words | cw): continue
+            ratio = difflib.SequenceMatcher(None, norm, cand, autojunk=False).ratio()
+            if ratio >= threshold: return (r["id"], ratio)
+        return None
+
     def is_duplicate(self, text: str) -> bool:
-        return bool(self._c().execute("SELECT id FROM vacancies WHERE text=?", (text,)).fetchone())
+        return self.find_duplicate(text) is not None
 
     def set_block_reason(self, vid: int, reason: str) -> None:
         """Помечает вакансию как отсеянную ДО DeepSeek (чёрным списком и т.п.),
@@ -902,6 +938,7 @@ async def get_usdt_rub_rate() -> Optional[float]:
 # DEEPSEEK
 # ═══════════════════════════════════════════════════════════════
 _DS_FAIL = DeepSeekResult(suitable=False, reason="ИИ недоступен — не проверено", contact="")
+_DS_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 async def _upgrade_old_deliveries(bot: Bot, cl: dict) -> None:
     """После оформления/продления подписки — старые вакансии, которые пришли
@@ -953,18 +990,37 @@ async def call_deepseek(text: str, author_username: str, db: Database) -> DeepSe
     }
     log.debug(f"DeepSeek запрос: url={DEEPSEEK_URL} model={DEEPSEEK_MODEL} key={DEEPSEEK_KEY[:8]}...")
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                DEEPSEEK_URL, json=payload,
-                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                body = await resp.text()
-                log.debug(f"DeepSeek ответ HTTP {resp.status}: {body[:300]}")
-                if resp.status != 200:
-                    log.error(f"DeepSeek HTTP {resp.status}: {body[:300]}")
-                    db.stat_inc("ai_errors"); return _DS_FAIL
-                data = json.loads(body)
+        # Один мгновенный повтор при разовом сбое (таймаут, обрыв соединения,
+        # 429/5xx "Service is too busy") — раньше такая вакансия сразу уходила
+        # в "не проверено" и ждала следующей плановой проверки. Ошибки вида
+        # 400/401/402 (неверный запрос/ключ/нет денег) НЕ повторяем — бессмысленно.
+        data = None
+        for attempt in (1, 2):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(
+                        DEEPSEEK_URL, json=payload,
+                        headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        body = await resp.text()
+                        log.debug(f"DeepSeek ответ HTTP {resp.status}: {body[:300]}")
+                        if resp.status != 200:
+                            log.error(f"DeepSeek HTTP {resp.status}: {body[:300]}")
+                            if attempt == 1 and resp.status in _DS_RETRY_STATUSES:
+                                db.add_log("WARNING", f"⚠️ DeepSeek HTTP {resp.status} — повторяю запрос")
+                                await asyncio.sleep(1.5)
+                                continue
+                            db.stat_inc("ai_errors"); return _DS_FAIL
+                        data = json.loads(body)
+                break
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if attempt == 1:
+                    log.warning(f"DeepSeek: разовый сбой сети ({type(e).__name__}: {e}) — повторяю запрос")
+                    db.add_log("WARNING", f"⚠️ DeepSeek: сбой сети ({type(e).__name__}) — повторяю запрос")
+                    await asyncio.sleep(1.5)
+                    continue
+                raise
         usage = data.get("usage", {}) or {}
         # Реальные названия полей из официального API DeepSeek (api-docs.deepseek.com):
         # prompt_tokens/completion_tokens/total_tokens — плоские поля верхнего уровня,
@@ -1122,6 +1178,17 @@ async def _fetch_deepseek_status() -> str:
 # ═══════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════
+def norm_for_dup(s: str) -> str:
+    """Нормализация текста для поиска дубликатов: без регистра, ё=е, без
+    ссылок, @упоминаний, эмодзи и знаков препинания, пробелы схлопнуты.
+    Так репост с добавленным смайликом, другой пунктуацией, другим контактом
+    или опечаткой в пару букв всё равно распознаётся как тот же текст."""
+    s = norm_yo(s.lower())
+    s = re.sub(r"https?://\S+|t\.me/\S+", " ", s)
+    s = re.sub(r"@\w+", " ", s)
+    s = re.sub(r"[\W_]+", " ", s)
+    return " ".join(s.split())
+
 def norm_yo(s: str) -> str:
     """Приводит 'ё'→'е' (и 'Ё'→'Е'), чтобы сравнение ключевых слов/чёрного
     списка с текстом сообщения не зависело от того, как автор написал букву."""
@@ -1459,8 +1526,13 @@ class VacancyPipeline:
             log.info(f"✅ КС: {found_kw}"); self.db.add_log("INFO", f"КС: {found_kw}")
 
             # Дубликат
-            if self.db.is_duplicate(text):
-                log.info("🔁 Дубликат"); self.db.add_log("INFO", "🔁 Дубликат (уже была такая вакансия)"); return
+            dup = self.db.find_duplicate(text)
+            if dup:
+                dup_id, dup_sim = dup
+                how = "точная копия" if dup_sim >= 1.0 else f"похожа на {dup_sim:.0%}"
+                log.info(f"🔁 Дубликат ({how}, вакансия #{dup_id})")
+                self.db.add_log("INFO", f"🔁 Дубликат (уже была такая вакансия: {how}, #{dup_id})")
+                return
 
             # Слишком часто от одного отправителя (не чаще 1 вакансии в N минут)
             cooldown_min = int(self.db.get_setting("sender_cooldown_min", "30") or "30")
@@ -3840,9 +3912,23 @@ async def admin_src_recheck_cb(call: CallbackQuery):
 # CLIENT BOT
 # ═══════════════════════════════════════════════════════════════
 
+def _free_days_phrase(n: int) -> str:
+    """'3 бесплатных дня' / '1 бесплатный день' / '5 бесплатных дней' —
+    склонение по числу, чтобы текст не врал, если FREE_DAYS поменяют
+    через переменную окружения."""
+    n = int(n)
+    last2, last1 = n % 100, n % 10
+    if last1 == 1 and last2 != 11:
+        word = "бесплатный день"
+    elif 2 <= last1 <= 4 and not (12 <= last2 <= 14):
+        word = "бесплатных дня"
+    else:
+        word = "бесплатных дней"
+    return f"{n} {word}"
+
 def _client_main_text(cl: dict, is_new: bool = False) -> str:
     sub   = fmt_date(cl.get("sub_until"))
-    bonus = "\n<b>Тебе начислено +3 бесплатных дня</b>" if is_new else ""
+    bonus = f"\n<b>Тебе начислено +{_free_days_phrase(FREE_DAYS)}</b>" if is_new else ""
     # Вакансий за сегодня — только те, что прошли проверку ИИ
     today = datetime.now().strftime("%Y-%m-%d")
     vac_today = 0
