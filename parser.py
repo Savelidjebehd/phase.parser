@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-24 22:31"
+BOT_VERSION    = "2026-09-24 22:37"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -75,12 +75,17 @@ REF_DAYS         = int(os.getenv("REF_DAYS", "5"))          # бонус куп�
 REF_BONUS_DAYS   = int(os.getenv("REF_BONUS_DAYS", "15"))   # бонус пригласившему
 FREE_NUDGE_THRESHOLD = int(os.getenv("FREE_NUDGE_THRESHOLD", "8"))  # после скольки закрытых вакансий слать разовую скидку никогда не платившим
 
-# Цены: до первой оплаты (скидка) / после
+# Цены: full — обычная цена; sale — цена со скидкой 15% (первая оплата / win-back).
+# sale ВСЕГДА считается от full (15%), а не задаётся вручную — чтобы не разъехалось.
+# Скидки НЕ суммируются: дешевле, чем full × 0.85, клиент не заплатит ни при каких условиях.
+DISCOUNT_PCT = 15
 PRICES = {
-    "week":   {"label": "1 нед.",  "name": "Неделя",   "days": 7,   "sale": 169,  "full": 199},
-    "month":  {"label": "1 мес.",  "name": "Месяц",    "days": 30,  "sale": 424,  "full": 499},
-    "3month": {"label": "3 мес.",  "name": "3 месяца", "days": 90,  "sale": 1019, "full": 1119},
+    "week":   {"label": "1 нед.",  "name": "Неделя",   "days": 7,   "full": 199},
+    "month":  {"label": "1 мес.",  "name": "Месяц",    "days": 30,  "full": 499},
+    "3month": {"label": "3 мес.",  "name": "3 месяца", "days": 90,  "full": 1199},
 }
+for _p in PRICES.values():
+    _p["sale"] = round(_p["full"] * (100 - DISCOUNT_PCT) / 100)
 
 def _tariff_btn_label(key: str, price: int, fire: str = "") -> str:
     """Текст кнопки тарифа: 'Неделя 199₽ • 28 ₽/день' (цена в день — округлённо)."""
@@ -4235,14 +4240,11 @@ def _tariffs_kb(cl: dict) -> InlineKeyboardMarkup:
 
 def _winback_price(cl: dict, tariff: str) -> int:
     """Цена тарифа со скидкой 15% для win-back сообщения (напоминание после
-    окончания подписки, см. _check_expired_subs) — считается от той цены,
-    которая обычно была бы у этого клиента (full/sale), а не от фиксированной
-    базы, чтобы не давать двойную скидку новым клиентам поверх их и так
-    сниженной первой цены."""
-    p = PRICES[tariff]
-    has_paid = bool(cl.get("first_payment"))
-    base = p["full"] if has_paid else p["sale"]
-    return round(base * 0.85)
+    окончания подписки, см. _check_expired_subs). Скидки не суммируются:
+    это всегда full − 15% (= sale), одинаково для новых и для платившего
+    клиента. Клиенту, который ещё не платил, это та же цена, что и так у него
+    на кнопках, — ниже неё не бывает."""
+    return PRICES[tariff]["sale"]
 
 def _tariffs_kb_winback(cl: dict) -> InlineKeyboardMarkup:
     """Тарифы со скидкой 15% — специально для win-back напоминания клиентам,
