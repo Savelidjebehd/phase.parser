@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-24 22:37"
+BOT_VERSION    = "2026-09-25 13:18"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -242,6 +242,9 @@ class Database:
                 photo_file_id TEXT, segment TEXT NOT NULL,
                 sent_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS free_pack_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, file_id TEXT NOT NULL,
+                file_name TEXT NOT NULL, added_at TEXT DEFAULT (datetime('now')));
             CREATE TABLE IF NOT EXISTS feedback (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -292,6 +295,11 @@ class Database:
         # без подписки — для воронки конверсии (напоминание с накопленным
         # числом пропущенного, разовый пуш со скидкой после N вакансий)
         try: self._c().execute("ALTER TABLE clients ADD COLUMN free_vacancies_seen INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: когда клиент забрал бесплатный пак исходников (лид-магнит
+        # при /start) — чтобы не предлагать повторно и считать конверсию
+        try: self._c().execute("ALTER TABLE clients ADD COLUMN free_pack_claimed_at TEXT")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -455,6 +463,28 @@ class Database:
     def get_client_by_id(self, client_id: int) -> Optional[dict]:
         row = self._c().execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
         return dict(row) if row else None
+
+    # ── Бесплатный пак исходников (лид-магнит при /start) ────
+    def add_free_pack_file(self, file_id: str, file_name: str) -> None:
+        self._c().execute("INSERT INTO free_pack_files(file_id, file_name) VALUES(?,?)", (file_id, file_name))
+        self._c().commit()
+
+    def list_free_pack_files(self) -> list[dict]:
+        return [dict(r) for r in self._c().execute(
+            "SELECT * FROM free_pack_files ORDER BY id").fetchall()]
+
+    def delete_free_pack_file(self, file_id: int) -> None:
+        self._c().execute("DELETE FROM free_pack_files WHERE id=?", (file_id,))
+        self._c().commit()
+
+    def mark_free_pack_claimed(self, client_id: int) -> None:
+        self._c().execute("UPDATE clients SET free_pack_claimed_at=? WHERE id=?",
+                           (now_sql(), client_id))
+        self._c().commit()
+
+    def count_free_pack_claims(self) -> int:
+        return self._c().execute(
+            "SELECT COUNT(*) FROM clients WHERE free_pack_claimed_at IS NOT NULL").fetchone()[0]
 
     def get_client_by_username(self, username: str) -> Optional[dict]:
         row = self._c().execute(
@@ -3287,6 +3317,7 @@ async def admin_settings_cb(call: CallbackQuery):
         [(f"📵 Вакансии без юзернейма: {'пропускаем' if skip_nouser else 'присылаем'}",
           "admin_settings_toggle:skip_no_username")],
         [("📣 Оповещения", "admin_notifications")],
+        [("🎁 Бесплатный пак", "admin_free_pack")],
         [("✉️ Тексты сообщений","admin_msg_texts"), ("📨 Рассылки","admin_broadcast_settings")],
         [("💱 Резервный курс USDT","admin_usdt_rate")],
         [("🗑 Очистить логи", "admin_clear_logs"), ("🌐 Удалить все правила", "admin_clear_ds_rules")],
@@ -3397,6 +3428,17 @@ CLIENT_MSG_TEMPLATES = {
             "от того, как часто публикуют подходящие вакансии — просто ждите 🙂"
         ),
     },
+    "msg_free_pack_offer": {
+        "label": "🎁 Предложение бесплатного пака при /start",
+        "default": (
+            "🎁 <b>Дарим бесплатный пак для монтажа</b> — LUT'ы, пресеты и "
+            "проектные файлы.\n\nЗаберите, пока настраиваем поиск вакансий под вас:"
+        ),
+    },
+    "msg_free_pack_caption": {
+        "label": "🎁 Подпись к файлам бесплатного пака",
+        "default": "🎁 Ваш бесплатный пак — держите! Пользуйтесь на здоровье 🙌",
+    },
 }
 
 @admin_router.callback_query(F.data == "admin_msg_texts")
@@ -3446,6 +3488,43 @@ async def admin_msg_test_cb(call: CallbackQuery):
         await call.answer("✅ Отправлено вам в личку")
     except Exception as e:
         await call.answer(f"Ошибка: {e}", show_alert=True)
+
+@admin_router.callback_query(F.data == "admin_free_pack")
+async def admin_free_pack_cb(call: CallbackQuery):
+    on      = _db.get_setting("free_pack_enabled", "1") == "1"
+    files   = _db.list_free_pack_files()
+    claims  = _db.count_free_pack_claims()
+    rows = [[(f"🎁 Предложение при /start: {'включено' if on else 'выключено'}",
+              "admin_settings_toggle:free_pack_enabled")]]
+    for f in files:
+        rows.append([(f"📄 {f['file_name']}"[:40], "noop"),
+                     ("🗑", f"admin_freepack_del:{f['id']}")])
+    rows.append([("➕ Добавить файл", "admin_freepack_add")])
+    rows.append([("✉️ Тексты (предложение / подпись)", "admin_msg_texts")])
+    rows.append([("◀️ Назад", "admin_settings")])
+    files_txt = "\n".join(f"• {f['file_name']}" for f in files) or "— пока пусто —"
+    await safe_edit(call,
+        f"<b>🎁 Бесплатный пак</b>\n\n"
+        f"Предлагается новым клиентам при /start, до старта воронки подписки "
+        f"(LUT'ы, пресеты, проектные файлы — что загрузите, то и отправится).\n\n"
+        f"<b>Файлы в паке:</b>\n{files_txt}\n\n"
+        f"Забрали пак: <b>{claims}</b> клиентов.",
+        mkb(rows))
+
+@admin_router.callback_query(F.data == "admin_freepack_add")
+async def admin_freepack_add_cb(call: CallbackQuery):
+    _admin_pending[call.from_user.id] = "add_free_pack_file"
+    await safe_edit(call,
+        "📎 Пришлите файл (LUT, пресет, проектный файл — любым документом, "
+        "не как фото) — он добавится в пак.",
+        kb_back("admin_free_pack"))
+
+@admin_router.callback_query(F.data.startswith("admin_freepack_del:"))
+async def admin_freepack_del_cb(call: CallbackQuery):
+    fid = int(call.data.split(":")[1])
+    _db.delete_free_pack_file(fid)
+    await call.answer("Удалено")
+    await admin_free_pack_cb(call)
 
 @admin_router.callback_query(F.data == "admin_notifications")
 async def admin_notifications_cb(call: CallbackQuery):
@@ -3497,7 +3576,10 @@ async def admin_settings_confirm_cb(call: CallbackQuery):
     newval = "0" if cur == "1" else "1"
     _db.set_setting(key, newval)
     await call.answer("Настройка изменена")
-    await admin_settings_cb(call)
+    if key == "free_pack_enabled":
+        await admin_free_pack_cb(call)
+    else:
+        await admin_settings_cb(call)
 
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ОШИБКИ В ОТКЛИКЕ / УДАЛЕНИЕ
@@ -3583,6 +3665,22 @@ async def admin_manual_approve_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "noop")
 async def noop_cb(call: CallbackQuery): await call.answer()
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — ОБРАБОТЧИК ДОКУМЕНТОВ (бесплатный пак)
+# ═══════════════════════════════════════════════════════════════
+@admin_router.message(F.document)
+async def admin_document_handler(msg: Message):
+    uid    = msg.from_user.id
+    action = _admin_pending.pop(uid, None)
+    if action == "add_free_pack_file":
+        doc = msg.document
+        _db.add_free_pack_file(doc.file_id, doc.file_name or "файл")
+        await safe_answer(msg, f"✅ Добавлено: {doc.file_name or 'файл'}",
+                           kb_back("admin_free_pack"))
+        return
+    if action:
+        _admin_pending[uid] = action  # вернуть — этот файл не по теме, ждём дальше
+
 # ═══════════════════════════════════════════════════════════════
 # ADMIN — ОБРАБОТЧИК ФОТО (только для настроек рассылки)
 # ═══════════════════════════════════════════════════════════════
@@ -4049,6 +4147,14 @@ async def client_start(msg: Message):
 
     await msg.answer(_client_main_text(cl, is_new), reply_markup=kb_client_main())
     if is_new:
+        # Лид-магнит: бесплатный пак исходников (LUT'ы/пресеты/проекты) —
+        # предлагаем ДО воронки подписки, чтобы новый клиент получил
+        # ценность сразу, а не только после того как захочет платить.
+        if _db.get_setting("free_pack_enabled", "1") == "1" and _db.list_free_pack_files():
+            offer = _db.get_setting("msg_free_pack_offer",
+                                     CLIENT_MSG_TEMPLATES["msg_free_pack_offer"]["default"])
+            await msg.answer(offer, parse_mode=ParseMode.HTML,
+                              reply_markup=mkb([[("🎁 Забрать бесплатный пак","client_freepack_claim")]]))
         # Между приветствием и сообщением "поиск запущен" — предложение
         # пройти короткое обучение по функциям бота. Часть новых
         # пользователей засыпает вопросами в личку вместо того, чтобы
@@ -4116,6 +4222,30 @@ def _onboarding_markup(idx: int) -> InlineKeyboardMarkup:
     next_btn = ("🏁 Завершить обучение", "client_onb_finish") if is_last \
                else ("➡️ Следующий шаг", f"client_onb_next:{idx + 1}")
     return mkb([[next_btn], [("🚪 Выйти из обучения","client_onb_finish")]])
+
+@client_router.callback_query(F.data == "client_freepack_claim")
+async def client_freepack_claim_cb(call: CallbackQuery):
+    cl = _db.get_client_by_tg(call.from_user.id)
+    if not cl: await call.answer(); return
+    files = _db.list_free_pack_files()
+    if not files:
+        await call.answer("Пак сейчас пуст, загляните позже 🙂", show_alert=True)
+        return
+    await call.answer()
+    caption = _db.get_setting("msg_free_pack_caption",
+                               CLIENT_MSG_TEMPLATES["msg_free_pack_caption"]["default"])
+    try:
+        for i, f in enumerate(files):
+            await call.bot.send_document(
+                call.from_user.id, f["file_id"],
+                caption=caption if i == 0 else None,
+                parse_mode=ParseMode.HTML if i == 0 else None)
+        if not cl.get("free_pack_claimed_at"):
+            _db.mark_free_pack_claimed(cl["id"])
+        await safe_edit(call, "🎁 <b>Пак отправлен выше!</b>", None)
+    except Exception as e:
+        log.warning(f"Отправка бесплатного пака клиенту {call.from_user.id}: {e}")
+        await call.message.answer("⚠️ Не получилось отправить пак, напишите нам в поддержку.")
 
 @client_router.callback_query(F.data == "client_onb_start")
 async def client_onb_start_cb(call: CallbackQuery):
