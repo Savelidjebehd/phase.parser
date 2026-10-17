@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-10-17 21:19"
+BOT_VERSION    = "2026-10-17 21:32"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -245,13 +245,6 @@ class Database:
             CREATE TABLE IF NOT EXISTS free_pack_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, file_id TEXT NOT NULL,
                 file_name TEXT NOT NULL, added_at TEXT DEFAULT (datetime('now')));
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-                tg_id INTEGER NOT NULL, username TEXT,
-                broadcast_id INTEGER REFERENCES broadcasts(id) ON DELETE SET NULL,
-                text TEXT NOT NULL, is_read INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now')));
         """)
         self._c().commit()
         # Миграция: добавляем поля для крипто-оплаты в уже существующую БД
@@ -547,25 +540,6 @@ class Database:
                 "UPDATE clients SET last_broadcast_id=? WHERE id=?",
                 [(broadcast_id, cid) for cid in recipient_client_ids])
         self._c().commit()
-
-    def save_feedback(self, client_id: int, tg_id: int, username: Optional[str],
-                       broadcast_id: Optional[int], text: str) -> None:
-        self._c().execute(
-            "INSERT INTO feedback(client_id,tg_id,username,broadcast_id,text) VALUES(?,?,?,?,?)",
-            (client_id, tg_id, username, broadcast_id, text))
-        self._c().commit()
-
-    def get_feedback(self, limit: int = 30) -> list[dict]:
-        return [dict(r) for r in self._c().execute(
-            "SELECT f.*, b.text AS broadcast_text FROM feedback f "
-            "LEFT JOIN broadcasts b ON b.id=f.broadcast_id "
-            "ORDER BY f.id DESC LIMIT ?", (limit,)).fetchall()]
-
-    def count_unread_feedback(self) -> int:
-        return self._c().execute("SELECT COUNT(*) FROM feedback WHERE is_read=0").fetchone()[0]
-
-    def mark_feedback_read(self) -> None:
-        self._c().execute("UPDATE feedback SET is_read=1 WHERE is_read=0"); self._c().commit()
 
     def set_subscription(self, client_id: int, until: datetime, is_payment: bool = False) -> None:
         self._c().execute("UPDATE clients SET sub_until=? WHERE id=?", (until.isoformat(), client_id))
@@ -2886,38 +2860,15 @@ async def admin_clients_cb(call: CallbackQuery):
     ]
     if pending:
         lines.append(f"🔴 Ожидают подтверждения: <b>{len(pending)}</b>")
-    unread_fb = _db.count_unread_feedback()
-    if unread_fb:
-        lines.append(f"💬 Новая обратная связь: <b>{unread_fb}</b>")
     rows = []
     if pending:
         rows.append([("🔴 Подтвердить оплаты", "admin_pending_payments")])
     rows.append([("📋 Список (текстом)", "admin_clients_grouped"), ("⚙️ Управление", "admin_clients_list")])
     rows.append([("➕ Выдать подписку", "admin_give_sub"), ("🔍 Найти клиента", "admin_find_client")])
     rows.append([("🎁 Выдать подписку всем", "admin_give_sub_all")])
-    rows.append([("📤 Рассылка", "admin_broadcast"),
-                 (f"💬 Обратная связь{' 🔴' if unread_fb else ''}", "admin_feedback")])
+    rows.append([("📤 Рассылка", "admin_broadcast")])
     rows.append([("◀️ Главное меню", "admin_main")])
     await safe_edit(call, "\n".join(lines), mkb(rows))
-
-@admin_router.callback_query(F.data == "admin_feedback")
-async def admin_feedback_cb(call: CallbackQuery):
-    fb = _db.get_feedback(30)
-    _db.mark_feedback_read()
-    if not fb:
-        await safe_edit(call, "💬 <b>Обратная связь</b>\n\nПока пусто — ответов от клиентов не было.",
-                         kb_back("admin_clients"))
-        return
-    lines = [f"💬 <b>Обратная связь</b> — последние {len(fb)}\n"]
-    for f in fb:
-        who = f"@{f['username']}" if f.get("username") else str(f["tg_id"])
-        when = fmt_msk(f["created_at"], "%d.%m %H:%M")
-        on_bc = f"\n<i>↳ на рассылку: {(f['broadcast_text'] or '')[:60]}</i>" if f.get("broadcast_text") else ""
-        lines.append(f"<b>{who}</b> · {when}{on_bc}\n{f['text']}\n")
-    text = "\n".join(lines)
-    # Telegram режет сообщение по 4096 символов — на всякий случай подрежем
-    if len(text) > 3900: text = text[:3900] + "\n\n… (обрежьте период, слишком много)"
-    await safe_edit(call, text, kb_back("admin_clients"))
 
 @admin_router.callback_query(F.data == "admin_find_client")
 async def admin_find_client_cb(call: CallbackQuery):
@@ -4732,19 +4683,25 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
 
 # ── Настройки клиента ──────────────────────────────────────────
 async def _show_client_settings(msg_or_call, cl: dict) -> None:
-    frozen = bool(cl.get("frozen_at"))
+    frozen      = bool(cl.get("frozen_at"))
+    has_sub     = bool(cl.get("sub_until")) and cl["sub_until"] > datetime.now().isoformat()
+    freeze_line = ""
+    freeze_btn  = None
     if frozen:
+        # Подписка уже была активна в момент заморозки — кнопка нужна
+        # независимо от текущего sub_until (он не двигается, пока заморожено).
         freeze_line = "\n❄️ Подписка заморожена — вакансии не приходят"
         freeze_btn  = ("🔥 Разморозить подписку", "client_unfreeze")
-    else:
+    elif has_sub:
         freeze_line = f"\n⏳ Осталось: {fmt_remaining(cl.get('sub_until'))}"
         freeze_btn  = ("❄️ Заморозить подписку", "client_freeze_confirm")
+    # Если подписки нет/закончилась и она не заморожена — кнопки заморозки
+    # нет вообще: замораживать нечего, пока не куплена или не выдана новая.
     text   = f"Настройки <b>phase.parser</b>\n{freeze_line}"
-    markup = mkb([
-        [("🚫 Стоп-слова","client_stopwords")],
-        [freeze_btn],
-        [("◀️ Главное меню","client_main")],
-    ])
+    rows   = [[("🚫 Стоп-слова","client_stopwords")]]
+    if freeze_btn: rows.append([freeze_btn])
+    rows.append([("◀️ Главное меню","client_main")])
+    markup = mkb(rows)
     if isinstance(msg_or_call, CallbackQuery):
         await safe_edit(msg_or_call, text, markup)
     else:
@@ -4848,20 +4805,10 @@ async def client_text_handler(msg: Message):
             mkb([[("🚫 К списку","client_stopwords")]]))
         return
 
-    # Свободное сообщение, не относящееся ни к одному сценарию — считаем это
-    # обратной связью (в т.ч. ответом на рассылку) и показываем админу в
-    # «Клиенты → 💬 Обратная связь», плюс сразу дублируем ему в личку.
-    _db.save_feedback(cl["id"], uid, uname, cl.get("last_broadcast_id"), msg.text)
-    try:
-        who = f"@{uname}" if uname else str(uid)
-        await msg.bot.send_message(
-            ADMIN_ID,
-            f"💬 <b>Сообщение от клиента</b> {who}:\n\n{html.escape(msg.text)}",
-            parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning(f"Пересылка обратной связи админу: {e}")
-    await msg.answer("💬 Спасибо, ваше сообщение передано.")
-    await msg.answer(_client_main_text(cl), reply_markup=kb_client_main())
+    # Свободное сообщение, не относящееся ни к одному сценарию — функция
+    # "обратная связь" убрана по просьбе владельца бота: такие сообщения
+    # больше никуда не сохраняются и не пересылаются админу, бот их просто
+    # игнорирует (клиенту ничего отвечать не нужно).
 # ═══════════════════════════════════════════════════════════════
 # USERBOT
 # ═══════════════════════════════════════════════════════════════
