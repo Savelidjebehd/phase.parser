@@ -49,7 +49,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-09-25 13:18"
+BOT_VERSION    = "2026-10-17 21:19"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -300,6 +300,16 @@ class Database:
         # Миграция: когда клиент забрал бесплатный пак исходников (лид-магнит
         # при /start) — чтобы не предлагать повторно и считать конверсию
         try: self._c().execute("ALTER TABLE clients ADD COLUMN free_pack_claimed_at TEXT")
+        except sqlite3.OperationalError: pass
+        self._c().commit()
+        # Миграция: заморозка подписки. frozen_at — когда клиент поставил
+        # подписку на паузу (NULL = не заморожена). Формат тот же, что и у
+        # sub_until (datetime.now().isoformat(), БЕЗ now_sql()!) — это
+        # намеренно: разница frozen_at/sub_until считается как обычная
+        # разница datetime, и обе колонки должны быть в одной и той же
+        # "системе отсчёта", иначе получим тот же баг с несовпадением
+        # форматов дат, что уже был в истории проекта.
+        try: self._c().execute("ALTER TABLE clients ADD COLUMN frozen_at TEXT")
         except sqlite3.OperationalError: pass
         self._c().commit()
         # Сидинг мягких корней/триггеров — только если их ещё нет (не перезатирает правки админа)
@@ -607,6 +617,32 @@ class Database:
         new_val = 0 if (row and row["search_active"]) else 1
         self._c().execute("UPDATE clients SET search_active=? WHERE id=?", (new_val, client_id))
         self._c().commit(); return bool(new_val)
+
+    def freeze_subscription(self, client_id: int) -> None:
+        """Ставит подписку на паузу: вакансии переставай приходить
+        (search_active=0, как и раньше), а отсчёт времени до sub_until
+        фиксируется — см. unfreeze_subscription, где он сдвигается вперёд
+        на длительность заморозки."""
+        self._c().execute(
+            "UPDATE clients SET search_active=0, frozen_at=? WHERE id=?",
+            (datetime.now().isoformat(), client_id))
+        self._c().commit()
+
+    def unfreeze_subscription(self, client_id: int) -> None:
+        """Снимает паузу: sub_until сдвигается вперёд ровно на то время, что
+        клиент был заморожен — оплаченные/бесплатные дни не теряются."""
+        row = self._c().execute(
+            "SELECT frozen_at, sub_until FROM clients WHERE id=?", (client_id,)).fetchone()
+        if row and row["frozen_at"]:
+            frozen_since = datetime.fromisoformat(row["frozen_at"])
+            paused_for   = datetime.now() - frozen_since
+            if row["sub_until"]:
+                new_until = datetime.fromisoformat(row["sub_until"]) + paused_for
+                self._c().execute("UPDATE clients SET sub_until=? WHERE id=?",
+                                  (new_until.isoformat(), client_id))
+        self._c().execute(
+            "UPDATE clients SET search_active=1, frozen_at=NULL WHERE id=?", (client_id,))
+        self._c().commit()
 
     def get_client_stopwords(self, client_id: int) -> list[str]:
         return [r["word"] for r in self._c().execute(
@@ -1349,6 +1385,25 @@ def fmt_date(iso: Optional[str]) -> str:
     if not iso: return "—"
     try: return (datetime.fromisoformat(iso) + timedelta(hours=3)).strftime("%d.%m.%Y")
     except Exception: return iso[:10]
+
+def fmt_remaining(iso: Optional[str]) -> str:
+    """Остаток времени до sub_until в днях/часах/минутах — для настроек
+    клиента (там нужна точность до минуты, не просто дата, как на главном
+    экране). '3 дн 5 ч 12 мин' / '5 ч 12 мин' / '12 мин' / '—' если нет
+    подписки или она уже закончилась."""
+    if not iso: return "—"
+    try: until = datetime.fromisoformat(iso)
+    except Exception: return "—"
+    delta = until - datetime.now()
+    total_min = int(delta.total_seconds() // 60)
+    if total_min <= 0: return "подписка закончилась"
+    days, rem = divmod(total_min, 24 * 60)
+    hours, minutes = divmod(rem, 60)
+    parts = []
+    if days: parts.append(f"{days} дн")
+    if hours or days: parts.append(f"{hours} ч")
+    parts.append(f"{minutes} мин")
+    return " ".join(parts)
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD BUILDER
@@ -4095,7 +4150,8 @@ def _free_days_phrase(n: int) -> str:
     return f"{n} {word}"
 
 def _client_main_text(cl: dict, is_new: bool = False) -> str:
-    sub   = fmt_date(cl.get("sub_until"))
+    sub = (f"❄️ <b>Заморожена</b> (перейдите в настройки)" if cl.get("frozen_at")
+           else f"📅 Срок действия подписки: {fmt_date(cl.get('sub_until'))}")
     bonus = f"\n<b>Тебе начислено +{_free_days_phrase(FREE_DAYS)}</b>" if is_new else ""
     # Вакансий за сегодня — только те, что прошли проверку ИИ
     today = datetime.now().strftime("%Y-%m-%d")
@@ -4116,7 +4172,7 @@ def _client_main_text(cl: dict, is_new: bool = False) -> str:
         f"Вы используете <b>phase.parser</b>👔{bonus}\n\n"
         f"Вакансий за сегодня: <b>{vac_today}</b>\n"
         f"Ваши стоп слова: <b>{len(stop_words)}</b>\n\n"
-        f"📅 Срок действия подписки: {sub}"
+        f"{sub}"
     )
 
 @client_router.message(Command("start"))
@@ -4338,7 +4394,7 @@ async def client_invite_inline_query(iq: InlineQuery):
     text = (
         f"Привет. Получай клиентов с помощью <b>phase.parser</b>\n\n"
         f"{ref_link}\n\n"
-        f"20+ вакансий для монтажа в день. Работает быстро и стабильно."
+        f"30+ вакансий для монтажа в день. Работает быстро и стабильно."
     )
     result = InlineQueryResultArticle(
         id=f"invite_{ref_uid}",
@@ -4676,12 +4732,17 @@ async def admin_confirm_pay_cb(call: CallbackQuery):
 
 # ── Настройки клиента ──────────────────────────────────────────
 async def _show_client_settings(msg_or_call, cl: dict) -> None:
-    search_on = bool(cl.get("search_active", 1))
-    icon      = "🟢" if search_on else "🔴"
-    text      = f"Настройки <b>phase.parser</b>\n"
-    markup    = mkb([
+    frozen = bool(cl.get("frozen_at"))
+    if frozen:
+        freeze_line = "\n❄️ Подписка заморожена — вакансии не приходят"
+        freeze_btn  = ("🔥 Разморозить подписку", "client_unfreeze")
+    else:
+        freeze_line = f"\n⏳ Осталось: {fmt_remaining(cl.get('sub_until'))}"
+        freeze_btn  = ("❄️ Заморозить подписку", "client_freeze_confirm")
+    text   = f"Настройки <b>phase.parser</b>\n{freeze_line}"
+    markup = mkb([
         [("🚫 Стоп-слова","client_stopwords")],
-        [(f"🔍 Поиск: {'Активен' if search_on else 'Выключен'}{icon}", "client_toggle_search")],
+        [freeze_btn],
         [("◀️ Главное меню","client_main")],
     ])
     if isinstance(msg_or_call, CallbackQuery):
@@ -4694,25 +4755,29 @@ async def client_settings_cb(call: CallbackQuery):
     cl = _db.get_or_create_client(call.from_user.id, call.from_user.username)
     await _show_client_settings(call, cl)
 
-@client_router.callback_query(F.data == "client_toggle_search")
-async def client_toggle_search_cb(call: CallbackQuery):
-    cl       = _db.get_or_create_client(call.from_user.id, call.from_user.username)
-    is_on    = bool(cl.get("search_active", 1))
-    action   = "отключить" if is_on else "включить"
-    freeze   = "\n❄️<b>Подписка будет заморожена</b>❄️" if is_on else ""
-    markup   = mkb([
-        [("✅ Да",f"client_toggle_search_confirm:{1 if not is_on else 0}"),
-         ("❌ Нет","client_settings")],
+@client_router.callback_query(F.data == "client_freeze_confirm")
+async def client_freeze_confirm_cb(call: CallbackQuery):
+    markup = mkb([
+        [("✅ Да","client_freeze_do"), ("❌ Нет","client_settings")],
+        [("◀️ Назад","client_settings")],
     ])
-    await safe_edit(call, f"Вы уверены что хотите {action} поиск?{freeze}", markup)
+    await safe_edit(call,
+        "Выключить уведомление о вакансиях?\n"
+        "Новые вакансии не будут приходить до разморозки подписки",
+        markup)
 
-@client_router.callback_query(F.data.startswith("client_toggle_search_confirm:"))
-async def client_toggle_search_confirm_cb(call: CallbackQuery):
-    val = int(call.data.split(":")[1])
-    cl  = _db.get_or_create_client(call.from_user.id, call.from_user.username)
-    _db._c().execute("UPDATE clients SET search_active=? WHERE id=?", (val, cl["id"]))
-    _db._c().commit()
-    cl  = _db.get_client_by_tg(call.from_user.id)
+@client_router.callback_query(F.data == "client_freeze_do")
+async def client_freeze_do_cb(call: CallbackQuery):
+    cl = _db.get_or_create_client(call.from_user.id, call.from_user.username)
+    _db.freeze_subscription(cl["id"])
+    cl = _db.get_client_by_tg(call.from_user.id)
+    await _show_client_settings(call, cl)
+
+@client_router.callback_query(F.data == "client_unfreeze")
+async def client_unfreeze_cb(call: CallbackQuery):
+    cl = _db.get_or_create_client(call.from_user.id, call.from_user.username)
+    _db.unfreeze_subscription(cl["id"])
+    cl = _db.get_client_by_tg(call.from_user.id)
     await _show_client_settings(call, cl)
 
 # ── Стоп-слова клиента ─────────────────────────────────────────
@@ -5027,7 +5092,8 @@ async def _check_expired_subs(bot: Bot) -> None:
             now  = datetime.now()
             week = (now - timedelta(days=7)).isoformat()
             rows = _db._c().execute(
-                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until < ? AND sub_until > ?",
+                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until < ? AND sub_until > ? "
+                "AND frozen_at IS NULL",
                 (now.isoformat(), week)).fetchall()
             for row in rows:
                 cl = dict(row)
@@ -5060,7 +5126,8 @@ async def _send_expiry_reminders(bot: Bot) -> None:
             now  = datetime.now()
             soon = (now + timedelta(hours=hours_before)).isoformat()
             rows = _db._c().execute(
-                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND sub_until <= ?",
+                "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND sub_until <= ? "
+                "AND frozen_at IS NULL",
                 (now.isoformat(), soon)).fetchall()
             for row in rows:
                 cl = dict(row)
@@ -5092,7 +5159,7 @@ async def _send_mid_trial_reminders(bot: Bot) -> None:
             soon = (now + timedelta(hours=midpoint_hours)).isoformat()
             rows = _db._c().execute(
                 "SELECT * FROM clients WHERE sub_until IS NOT NULL AND sub_until > ? AND sub_until <= ? "
-                "AND (first_payment IS NULL OR first_payment=0)",
+                "AND (first_payment IS NULL OR first_payment=0) AND frozen_at IS NULL",
                 (now.isoformat(), soon)).fetchall()
             for row in rows:
                 cl = dict(row)
