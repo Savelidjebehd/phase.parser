@@ -40,7 +40,12 @@ from telethon.tl.types import (
 
 # ── Конфигурация ──────────────────────────────────────────────
 load_dotenv()
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "8729193907:AAFn1D41mUgFIIa_pmcUdN37llLSGOwcMg4")
+_BOT_TOKEN_FALLBACK = "8729193907:AAFn1D41mUgFIIa_pmcUdN37llLSGOwcMg4"
+# os.getenv(key, default) подставляет default ТОЛЬКО если переменной нет вовсе —
+# если BOT_TOKEN объявлена в окружении (например, на Ботхосте), но пустая
+# строка, getenv вернёт именно "", а не запасное значение. "or" ниже добивает
+# именно этот случай: пустая/отсутствующая переменная — используем запасной токен.
+BOT_TOKEN      = os.getenv("BOT_TOKEN") or _BOT_TOKEN_FALLBACK
 API_ID         = int(os.getenv("API_ID", "0"))
 API_HASH       = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
@@ -49,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-10-18 13:27"
+BOT_VERSION    = "2026-10-18 13:31"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
