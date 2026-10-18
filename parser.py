@@ -54,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-10-18 13:31"
+BOT_VERSION    = "2026-10-18 13:42"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1947,7 +1947,18 @@ _client_pending: dict[int, str] = {}
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
 _broadcast_draft: dict[int, dict] = {}  # uid -> {"text": str, "photo": Optional[str]}
-_give_sub_all_draft: dict[int, dict] = {}  # uid -> {"days": int, "comment": str}
+# Черновик "выдать подписку всем" хранится В БАЗЕ (settings), а не просто в
+# памяти процесса — раньше лежал в обычном dict и слетал при любом перезапуске
+# бота между вводом дней и нажатием "Выдать всем" ("Сессия истекла, начните
+# заново" даже когда админ ничего не делал неправильно).
+def _give_sub_all_draft_get(uid: int) -> Optional[dict]:
+    raw = _db.get_setting(f"give_sub_all_draft_{uid}", "")
+    if not raw: return None
+    try: return json.loads(raw)
+    except Exception: return None
+
+def _give_sub_all_draft_set(uid: int, draft: Optional[dict]) -> None:
+    _db.set_setting(f"give_sub_all_draft_{uid}", json.dumps(draft) if draft else "")
 _payment_drafts: dict[str, dict] = {}  # ticket -> детали платежа до подтверждения клиентом
 
 admin_router  = Router()
@@ -3153,7 +3164,7 @@ async def admin_give_sub_cb(call: CallbackQuery):
 @admin_router.callback_query(F.data == "admin_give_sub_all")
 async def admin_give_sub_all_cb(call: CallbackQuery):
     uid = call.from_user.id
-    _give_sub_all_draft.pop(uid, None)
+    _give_sub_all_draft_set(uid, None)
     _admin_pending[uid] = "give_sub_all_days"
     total = len(_db.get_all_clients())
     await safe_edit(call,
@@ -3161,7 +3172,7 @@ async def admin_give_sub_all_cb(call: CallbackQuery):
         kb_back("admin_clients"))
 
 async def _show_give_sub_all_preview(bot: Bot, uid: int) -> None:
-    draft = _give_sub_all_draft.get(uid)
+    draft = _give_sub_all_draft_get(uid)
     if not draft: return
     days    = draft["days"]
     comment = draft.get("comment", "")
@@ -3180,7 +3191,8 @@ async def _show_give_sub_all_preview(bot: Bot, uid: int) -> None:
 @admin_router.callback_query(F.data == "admin_give_sub_all_send")
 async def admin_give_sub_all_send_cb(call: CallbackQuery):
     uid   = call.from_user.id
-    draft = _give_sub_all_draft.pop(uid, None)
+    draft = _give_sub_all_draft_get(uid)
+    _give_sub_all_draft_set(uid, None)
     if not draft:
         await call.answer("Сессия истекла, начните заново", show_alert=True); return
     days    = draft["days"]; comment = draft.get("comment","")
@@ -3200,7 +3212,7 @@ async def admin_give_sub_all_send_cb(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "admin_give_sub_all_cancel")
 async def admin_give_sub_all_cancel_cb(call: CallbackQuery):
-    _give_sub_all_draft.pop(call.from_user.id, None)
+    _give_sub_all_draft_set(call.from_user.id, None)
     await safe_edit(call, "❌ Отменено", kb_back("admin_clients"))
 
 
@@ -4025,7 +4037,7 @@ async def admin_text_handler(msg: Message):
         if not text.strip().isdigit() or int(text.strip()) <= 0:
             await safe_answer(msg, "❌ Введите положительное число дней")
             _admin_pending[uid] = "give_sub_all_days"; return
-        _give_sub_all_draft[uid] = {"days": int(text.strip())}
+        _give_sub_all_draft_set(uid, {"days": int(text.strip())})
         _admin_pending[uid] = "give_sub_all_comment"
         await safe_answer(msg,
             "💬 Прикрепить комментарий к уведомлению? Пришлите текст, или отправьте <code>-</code> чтобы без комментария:")
@@ -4033,10 +4045,11 @@ async def admin_text_handler(msg: Message):
 
     # ── Выдача подписки всем: шаг 2 — комментарий → предпросмотр ──
     if action == "give_sub_all_comment":
-        draft = _give_sub_all_draft.get(uid)
+        draft = _give_sub_all_draft_get(uid)
         if not draft:
             await safe_answer(msg, "Сессия истекла, начните заново", kb_back("admin_clients")); return
         draft["comment"] = "" if text.strip() == "-" else msg.html_text
+        _give_sub_all_draft_set(uid, draft)
         await _show_give_sub_all_preview(msg.bot, uid)
         return
 
@@ -4106,8 +4119,13 @@ def _free_days_phrase(n: int) -> str:
     return f"{n} {word}"
 
 def _client_main_text(cl: dict, is_new: bool = False) -> str:
-    sub = (f"❄️ <b>Заморожена</b> (перейдите в настройки)" if cl.get("frozen_at")
-           else f"📅 Срок действия подписки: {fmt_date(cl.get('sub_until'))}")
+    has_sub = bool(cl.get("sub_until")) and cl["sub_until"] > datetime.now().isoformat()
+    if cl.get("frozen_at"):
+        sub = "❄️ <b>Заморожена</b> (перейдите в настройки)"
+    elif has_sub:
+        sub = f"📅 Срок действия подписки: {fmt_date(cl.get('sub_until'))}"
+    else:
+        sub = "📅 Срок действия подписки: <b>Истекла</b>"
     bonus = f"\n<b>Тебе начислено +{_free_days_phrase(FREE_DAYS)}</b>" if is_new else ""
     # Вакансий за сегодня — только те, что прошли проверку ИИ
     today = datetime.now().strftime("%Y-%m-%d")
