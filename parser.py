@@ -54,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-10-18 13:42"
+BOT_VERSION    = "2026-11-10 21:47"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -1942,8 +1942,31 @@ class VacancyPipeline:
 _db:       Optional[Database]        = None
 _pipeline: Optional[VacancyPipeline] = None
 _userbot:  Optional[TelegramClient]  = None
-_admin_pending:  dict[int, str] = {}
-_client_pending: dict[int, str] = {}
+class _PersistentPendingDict:
+    """Ведёт себя как dict[int, str] (только [] для записи и .pop для чтения —
+    больше нигде в коде с этими двумя словарями ничего другого не делают), но
+    хранит значения в БД (settings), а не только в памяти процесса.
+
+    Раньше _admin_pending/_client_pending были обычными dict — и именно это
+    было настоящей причиной "Сессия истекла, начните заново" при выдаче
+    подписки всем (и потенциально в любом другом многошаговом сценарии: ввёл
+    число → ответил на вопрос → подтвердил): сам факт "жду от админа дни
+    подписки" терялся при перезапуске бота между первым и вторым сообщением,
+    ПЕРЕД тем как успевал создаться черновик в _give_sub_all_draft — тот уже
+    был переведён на БД, но это не помогало, если до него дело не доходило.
+    Если бот перезапускается часто — это стоит отдельно смотреть в логах
+    Ботхоста (эта правка лечит симптом, а не причину частых рестартов)."""
+    def __init__(self, prefix: str):
+        self._prefix = prefix
+    def __setitem__(self, uid: int, value: str) -> None:
+        _db.set_setting(f"{self._prefix}_{uid}", value)
+    def pop(self, uid: int, default=None):
+        val = _db.get_setting(f"{self._prefix}_{uid}", "")
+        if val: _db.set_setting(f"{self._prefix}_{uid}", "")
+        return val if val else default
+
+_admin_pending:  _PersistentPendingDict = _PersistentPendingDict("admin_pending")
+_client_pending: _PersistentPendingDict = _PersistentPendingDict("client_pending")
 _auth_state: dict = {}
 _src_picker: dict[int, dict] = {}
 _broadcast_draft: dict[int, dict] = {}  # uid -> {"text": str, "photo": Optional[str]}
