@@ -3,7 +3,7 @@ phase.parser — агрегатор публичных вакансий из Tel
 Telethon (UserBot) + Aiogram 3.x (Bot) + SQLite + DeepSeek API
 """
 from __future__ import annotations
-import asyncio, difflib, html, json, logging, os, re, sqlite3, time
+import asyncio, difflib, html, json, logging, os, random, re, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
@@ -54,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-11-10 21:47"
+BOT_VERSION    = "2026-11-15 ads-2"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -2906,6 +2906,7 @@ async def admin_clients_cb(call: CallbackQuery):
     rows.append([("➕ Выдать подписку", "admin_give_sub"), ("🔍 Найти клиента", "admin_find_client")])
     rows.append([("🎁 Выдать подписку всем", "admin_give_sub_all")])
     rows.append([("📤 Рассылка", "admin_broadcast")])
+    rows.append([("📣 Реклама", "ad_menu")])
     rows.append([("◀️ Главное меню", "admin_main")])
     await safe_edit(call, "\n".join(lines), mkb(rows))
 
@@ -3758,6 +3759,9 @@ async def admin_text_handler(msg: Message):
     uid    = msg.from_user.id
     action = _admin_pending.pop(uid, None)
     if not action: return
+    if action.startswith("ad:"):
+        await ad_text_input(msg, action)
+        return
     text = msg.text.strip()
 
     # ── Авторизация UserBot ────────────────────────────────────
@@ -4197,6 +4201,9 @@ async def client_start(msg: Message):
                     _db._c().execute("UPDATE clients SET ref_by=? WHERE id=?", (ref_cl["id"], cl["id"]))
                     _db._c().commit()
             except Exception as e: log.warning(f"Реферал: {e}")
+
+    try: _ad_track_start(msg, cl, is_new)
+    except Exception as e: log.warning(f"ad_track_start: {e}")
 
     await msg.answer(_client_main_text(cl, is_new), reply_markup=kb_client_main())
     if is_new:
@@ -5242,6 +5249,1721 @@ async def _set_bot_commands(bot: Bot) -> None:
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# РЕКЛАМА — привлечение новых пользователей (Клиенты → 📣 Реклама)
+# ───────────────────────────────────────────────────────────────
+# Кампания = пул ваших текстов + чаты + аккаунты + расписание.
+# Тексты публикуются без изменений (кроме подстановки {переменных}),
+# выбираются случайно и не повторяются в одном чате заданное число дней.
+# Через заданное время пост удаляется. Все лимиты настраиваются:
+# общие / на аккаунт / на чат / на кампанию (см. AD_FIELDS).
+# ═══════════════════════════════════════════════════════════════
+AD_DAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+# поле: (короткое имя, подсказка, min, max, области, значение по умолчанию)
+# области: g — общие, a — аккаунт, c — чат, k — кампания.
+# Приоритет при расчёте: чат → кампания → аккаунт → общие → умолчание.
+AD_FIELDS: dict[str, tuple] = {
+    "acc_per_day":      ("Постов/сутки с аккаунта", "Сколько постов может сделать один аккаунт за последние 24 часа. 0 — без лимита.", 0, 10000, "ga", 5),
+    "acc_per_hour":     ("Постов/час с аккаунта", "Лимит постов аккаунта за последний час. 0 — без лимита.", 0, 1000, "ga", 0),
+    "acc_gap_min":      ("Пауза аккаунта, мин", "Минимум минут между двумя постами одного аккаунта (в любые чаты). 0 — без паузы.", 0, 100000, "ga", 30),
+    "hour_from":        ("Окно: с часа (МСК)", "Начало окна публикаций, час по Москве 0–23.", 0, 23, "gak", 0),
+    "hour_to":          ("Окно: до часа (МСК)", "Конец окна публикаций, 1–24. Если «до» меньше «с», окно переходит через полночь.", 1, 24, "gak", 24),
+    "chat_interval_min": ("Пауза в чате, мин", "Минимум минут между нашими постами в одном чате. 0 — без паузы.", 0, 1000000, "gck", 120),
+    "chat_per_day":     ("Постов/сутки в чате", "Сколько постов можно сделать в одном чате за 24 часа. 0 — без лимита.", 0, 1000, "gck", 1),
+    "jitter_min":       ("Случайная добавка, мин", "К паузе в чате добавляется случайное число минут от 0 до этого значения.", 0, 100000, "gck", 0),
+    "delete_after_h":   ("Удалять через, часов", "Через сколько часов после публикации пост удаляется (можно дробное, например 0.5). 0 — не удалять.", 0, 100000, "gck", 24),
+    "no_repeat_days":   ("Не повторять текст, дней", "Один и тот же текст не публикуется повторно в том же чате раньше, чем через столько дней. 0 — можно повторять.", 0, 3650, "gck", 7),
+    "link_preview":     ("Превью ссылок (1/0)", "1 — показывать превью ссылок в посте, 0 — не показывать.", 0, 1, "gk", 0),
+    "silent":           ("Без звука (1/0)", "1 — отправлять без уведомления участникам, 0 — обычная отправка.", 0, 1, "gk", 0),
+    "flood_extra_s":    ("Запас после FloodWait, сек", "Сколько секунд добавить к ожиданию, которое требует Telegram.", 0, 86400, "g", 30),
+    "del_retry_max":    ("Попыток удаления", "Сколько раз пробовать удалить пост, прежде чем признать неудачей.", 1, 100, "g", 5),
+    "tick_s":           ("Проверка расписания, сек", "Как часто планировщик ищет, что пора публиковать.", 5, 3600, "g", 30),
+}
+AD_SCOPE_TABLE = {"a": "ad_accounts", "c": "ad_chats", "k": "ad_campaigns"}
+AD_SCOPE_NAME = {"g": "Общие настройки", "a": "Аккаунт", "c": "Чат", "k": "Кампания"}
+
+AD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ad_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, session TEXT, tg_id INTEGER,
+    username TEXT, name TEXT, status TEXT NOT NULL DEFAULT 'active', last_error TEXT,
+    cool_until TEXT, cfg TEXT NOT NULL DEFAULT '{}', created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS ad_chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT NOT NULL, title TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1, next_post_at TEXT, cfg TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS ad_chat_access (
+    chat_id INTEGER NOT NULL, account_id INTEGER NOT NULL, peer TEXT,
+    can_write INTEGER, slowmode INTEGER DEFAULT 0, note TEXT, checked_at TEXT,
+    PRIMARY KEY (chat_id, account_id));
+CREATE TABLE IF NOT EXISTS ad_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+    days TEXT NOT NULL DEFAULT '1111111', cfg TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS ad_campaign_chats (
+    campaign_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, PRIMARY KEY (campaign_id, chat_id));
+CREATE TABLE IF NOT EXISTS ad_campaign_accounts (
+    campaign_id INTEGER NOT NULL, account_id INTEGER NOT NULL, PRIMARY KEY (campaign_id, account_id));
+CREATE TABLE IF NOT EXISTS ad_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL, title TEXT, text TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS ad_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, template_id INTEGER,
+    account_id INTEGER, chat_id INTEGER, msg_id INTEGER,
+    posted_at TEXT NOT NULL DEFAULT (datetime('now')), delete_at TEXT, deleted_at TEXT,
+    status TEXT NOT NULL DEFAULT 'posted', del_attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS ad_starts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT (datetime('now')),
+    tg_id INTEGER, campaign_id INTEGER, chat_id INTEGER, account_id INTEGER, template_id INTEGER,
+    is_new INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS ad_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT (datetime('now')),
+    level TEXT NOT NULL DEFAULT 'info', kind TEXT NOT NULL DEFAULT 'info',
+    account_id INTEGER, chat_id INTEGER, campaign_id INTEGER, text TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ad_posts_chat  ON ad_posts(chat_id, posted_at);
+CREATE INDEX IF NOT EXISTS ad_posts_acc   ON ad_posts(account_id, posted_at);
+CREATE INDEX IF NOT EXISTS ad_posts_tpl   ON ad_posts(template_id, chat_id, posted_at);
+CREATE INDEX IF NOT EXISTS ad_posts_del   ON ad_posts(status, delete_at);
+CREATE INDEX IF NOT EXISTS ad_log_ts      ON ad_log(ts);
+CREATE INDEX IF NOT EXISTS ad_starts_ts   ON ad_starts(ts);
+"""
+
+_ad_clients: dict[int, "TelegramClient"] = {}   # account_id -> подключённый клиент
+_ad_client_locks: dict[int, asyncio.Lock] = {}
+_ad_auth: dict[int, dict] = {}                  # admin_uid -> состояние входа в аккаунт
+_ad_state: dict = {"bot_username": ""}
+
+
+def _ad_init_tables(db: "Database") -> None:
+    db._c().executescript(AD_SCHEMA)
+    db._c().commit()
+    try: db._c().execute("ALTER TABLE clients ADD COLUMN ad_source TEXT")
+    except sqlite3.OperationalError: pass
+    db._c().execute("INSERT OR IGNORE INTO settings(key,value) VALUES('ad_enabled','0')")
+    db._c().commit()
+
+
+# ── Время / БД-хелперы ─────────────────────────────────────────
+def _ad_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _ad_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def _ad_msk() -> datetime:
+    return _ad_now() + timedelta(hours=3)
+
+def _ad_one(sql: str, args: tuple = ()) -> Optional[dict]:
+    r = _db._c().execute(sql, args).fetchone()
+    return dict(r) if r else None
+
+def _ad_all(sql: str, args: tuple = ()) -> list[dict]:
+    return [dict(r) for r in _db._c().execute(sql, args).fetchall()]
+
+def _ad_exec(sql: str, args: tuple = ()) -> int:
+    cur = _db._c().execute(sql, args)
+    _db._c().commit()
+    return cur.lastrowid
+
+def ad_log_add(kind: str, text: str, level: str = "info",
+               acc: Optional[int] = None, chat: Optional[int] = None,
+               camp: Optional[int] = None) -> None:
+    try:
+        _ad_exec("INSERT INTO ad_log(level,kind,account_id,chat_id,campaign_id,text) VALUES(?,?,?,?,?,?)",
+                 (level, kind, acc, chat, camp, text[:1500]))
+    except Exception as e:
+        log.warning(f"ad_log_add: {e}")
+
+async def _ad_notify(bot: Optional["Bot"], text: str, key: str = "", every_min: int = 60) -> None:
+    """Сообщение админу; один и тот же key — не чаще раза в every_min минут."""
+    if not bot: return
+    if key:
+        k = f"ad_notify_{key}"
+        last = _db.get_setting(k, "")
+        if last and last > _ad_ts(_ad_now() - timedelta(minutes=every_min)): return
+        _db.set_setting(k, _ad_ts(_ad_now()))
+    try: await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML)
+    except Exception as e: log.warning(f"ad_notify: {e}")
+
+
+# ── Настройки (общие / аккаунт / чат / кампания) ───────────────
+def _ad_cfg(row: Optional[dict]) -> dict:
+    if not row: return {}
+    try:
+        d = json.loads(row.get("cfg") or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _ad_fmt(v) -> str:
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else f"{f:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v)
+
+def _ad_global(field: str) -> float:
+    raw = _db.get_setting(f"ad_g_{field}", "")
+    if raw != "":
+        try: return float(raw)
+        except ValueError: pass
+    return AD_FIELDS[field][5]
+
+def ad_val(field: str, *cfgs: Optional[dict]) -> float:
+    """Первое заданное значение из cfgs (по приоритету), иначе общее, иначе умолчание."""
+    for c in cfgs:
+        if c and c.get(field) is not None:
+            try: return float(c[field])
+            except (TypeError, ValueError): pass
+    return _ad_global(field)
+
+def _ad_set_cfg(scope: str, obj_id: int, field: str, value: Optional[float]) -> None:
+    if scope == "g":
+        if value is None: _ad_exec("DELETE FROM settings WHERE key=?", (f"ad_g_{field}",))
+        else: _db.set_setting(f"ad_g_{field}", _ad_fmt(value))
+        return
+    table = AD_SCOPE_TABLE[scope]
+    row = _ad_one(f"SELECT cfg FROM {table} WHERE id=?", (obj_id,))
+    cfg = _ad_cfg(row)
+    if value is None: cfg.pop(field, None)
+    else: cfg[field] = value
+    _ad_exec(f"UPDATE {table} SET cfg=? WHERE id=?", (json.dumps(cfg), obj_id))
+
+def _ad_in_hours(h: int, a: int, b: int) -> bool:
+    if a == b: return True
+    if a < b: return a <= h < b
+    return h >= a or h < b
+
+
+# ── Переменные в текстах ───────────────────────────────────────
+def ad_vars() -> dict[str, str]:
+    try:
+        d = json.loads(_db.get_setting("ad_vars", "{}") or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def ad_set_vars(d: dict) -> None:
+    _db.set_setting("ad_vars", json.dumps(d, ensure_ascii=False))
+
+def ad_tag(camp_id: int = 0, chat_id: int = 0, acc_id: int = 0, tpl_id: int = 0) -> str:
+    return f"ad_{camp_id}_{chat_id}_{acc_id}_{tpl_id}"
+
+def ad_bot_link(camp_id=0, chat_id=0, acc_id=0, tpl_id=0) -> str:
+    uname = _ad_state.get("bot_username") or "bot"
+    return f"https://t.me/{uname}?start={ad_tag(camp_id, chat_id, acc_id, tpl_id)}"
+
+def ad_render(text: str, camp: Optional[dict] = None, chat: Optional[dict] = None,
+              acc: Optional[dict] = None, tpl: Optional[dict] = None) -> str:
+    m: dict[str, str] = dict(ad_vars())
+    m["bot_link"] = ad_bot_link(camp["id"] if camp else 0, chat["id"] if chat else 0,
+                                acc["id"] if acc else 0, tpl["id"] if tpl else 0)
+    m["bot_username"] = _ad_state.get("bot_username") or ""
+    m["chat"] = html.escape((chat or {}).get("title") or "") if chat else ""
+    m["campaign"] = html.escape((camp or {}).get("name") or "") if camp else ""
+    m["account"] = ("@" + acc["username"]) if acc and acc.get("username") else (acc or {}).get("name") or ""
+    return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda mo: m.get(mo.group(1), mo.group(0)), text)
+
+def ad_plain(text: str, n: int = 40) -> str:
+    s = html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip().replace("\n", " ")
+    return (s[:n] + "…") if len(s) > n else s
+
+
+# ── Ссылки на чаты ─────────────────────────────────────────────
+def ad_parse_link(raw: str) -> Optional[tuple[str, str]]:
+    """('user', username) | ('invite', hash) | None (некорректная ссылка)."""
+    s = (raw or "").strip()
+    s = re.sub(r"^(?:https?://)?(?:t\.me|telegram\.me)/", "", s, flags=re.I)
+    s = s.lstrip("@").split("?")[0].strip("/")
+    if not s: return None
+    if s.startswith("+"): return ("invite", s[1:]) if len(s) > 5 else None
+    if s.lower().startswith("joinchat/"): return ("invite", s.split("/", 1)[1])
+    s = s.split("/")[0]
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", s): return ("user", s)
+    return None
+
+def ad_norm_link(kind: str, val: str) -> str:
+    return f"https://t.me/{val}" if kind == "user" else f"https://t.me/+{val}"
+
+
+# ── Подключение аккаунтов ──────────────────────────────────────
+async def ad_get_client(acc_id: int) -> Optional["TelegramClient"]:
+    acc = _ad_one("SELECT * FROM ad_accounts WHERE id=?", (acc_id,))
+    if not acc or not acc.get("session"): return None
+    lock = _ad_client_locks.setdefault(acc_id, asyncio.Lock())
+    async with lock:
+        cl = _ad_clients.get(acc_id)
+        if cl is not None and cl.is_connected(): return cl
+        cl = TelegramClient(StringSession(acc["session"]), API_ID, API_HASH)
+        try:
+            await cl.connect()
+            if not await cl.is_user_authorized():
+                await cl.disconnect()
+                _ad_exec("UPDATE ad_accounts SET status='error', last_error=? WHERE id=?",
+                         ("Сессия недействительна — добавьте аккаунт заново", acc_id))
+                ad_log_add("account", "Сессия недействительна", "error", acc=acc_id)
+                return None
+        except Exception as e:
+            try: await cl.disconnect()
+            except Exception: pass
+            _ad_exec("UPDATE ad_accounts SET last_error=? WHERE id=?", (f"Подключение: {str(e)[:200]}", acc_id))
+            ad_log_add("account", f"Не удалось подключиться: {str(e)[:200]}", "error", acc=acc_id)
+            return None
+        _ad_clients[acc_id] = cl
+        return cl
+
+async def ad_drop_client(acc_id: int) -> None:
+    cl = _ad_clients.pop(acc_id, None)
+    if cl:
+        try: await cl.disconnect()
+        except Exception: pass
+
+def ad_acc_label(acc: dict) -> str:
+    if acc.get("username"): return "@" + acc["username"]
+    return acc.get("name") or acc.get("phone") or f"№{acc['id']}"
+
+async def ad_finish_auth(msg: "Message", st: dict) -> None:
+    cl = st["client"]
+    me = await cl.get_me()
+    session = cl.session.save()
+    name = " ".join(x for x in (me.first_name, me.last_name) if x) or ""
+    old = _ad_one("SELECT id FROM ad_accounts WHERE tg_id=?", (me.id,))
+    if old:
+        _ad_exec("UPDATE ad_accounts SET session=?, phone=?, username=?, name=?, status='active', last_error=NULL WHERE id=?",
+                 (session, st["phone"], me.username, name, old["id"]))
+        acc_id = old["id"]
+    else:
+        acc_id = _ad_exec("INSERT INTO ad_accounts(phone,session,tg_id,username,name) VALUES(?,?,?,?,?)",
+                          (st["phone"], session, me.id, me.username, name))
+    await ad_drop_client(acc_id)
+    _ad_clients[acc_id] = cl
+    _ad_auth.pop(msg.from_user.id, None)
+    ad_log_add("account", f"Аккаунт подключён: {name} @{me.username or '—'}", acc=acc_id)
+    await safe_answer(msg, f"✅ Аккаунт подключён: <b>{html.escape(name)}</b> "
+                           f"{'@' + me.username if me.username else ''}",
+                      mkb([[("👤 К аккаунту", f"ad_acc_v:{acc_id}")], [("◀️ Аккаунты", "ad_acc")]]))
+
+
+# ── Доступ аккаунта к чату ─────────────────────────────────────
+class _AdNeedJoin(Exception):
+    pass
+
+def _ad_peer_to_json(peer) -> Optional[str]:
+    if hasattr(peer, "channel_id"):
+        return json.dumps({"k": "ch", "id": peer.channel_id, "h": peer.access_hash})
+    if hasattr(peer, "chat_id"):
+        return json.dumps({"k": "chat", "id": peer.chat_id})
+    return None
+
+def _ad_peer_from_json(raw: str):
+    from telethon.tl.types import InputPeerChannel, InputPeerChat
+    d = json.loads(raw)
+    if d.get("k") == "ch": return InputPeerChannel(d["id"], d["h"])
+    if d.get("k") == "chat": return InputPeerChat(d["id"])
+    return None
+
+def _ad_access(chat_id: int, acc_id: int) -> Optional[dict]:
+    return _ad_one("SELECT * FROM ad_chat_access WHERE chat_id=? AND account_id=?", (chat_id, acc_id))
+
+def _ad_save_access(chat_id: int, acc_id: int, peer_json: Optional[str], can_write: Optional[int],
+                    slowmode: int, note: str) -> None:
+    old = _ad_access(chat_id, acc_id)
+    if old:
+        if peer_json is None: peer_json = old.get("peer")
+        if can_write is None: can_write = old.get("can_write")
+    _ad_exec("INSERT OR REPLACE INTO ad_chat_access(chat_id,account_id,peer,can_write,slowmode,note,checked_at) "
+             "VALUES(?,?,?,?,?,?,?)", (chat_id, acc_id, peer_json, can_write, slowmode, note[:300], _ad_ts(_ad_now())))
+
+async def _ad_resolve_peer(client, chat: dict, acc_id: int, join: bool = False):
+    """InputPeer чата для этого аккаунта. Сохраняется в ad_chat_access (access_hash), чтобы
+    после перезапуска не резолвить заново — резолв по username имеет жёсткие лимиты Telegram."""
+    acc_row = _ad_access(chat["id"], acc_id)
+    if acc_row and acc_row.get("peer"):
+        p = _ad_peer_from_json(acc_row["peer"])
+        if p is not None: return p
+    parsed = ad_parse_link(chat["link"])
+    if not parsed: raise ValueError("некорректная ссылка на чат")
+    kind, val = parsed
+    ent = None
+    if kind == "user":
+        ent = await client.get_entity(val)
+    else:
+        info = await client(CheckChatInviteRequest(val))
+        if isinstance(info, ChatInviteAlready):
+            ent = info.chat
+        elif join:
+            upd = await client(ImportChatInviteRequest(val))
+            ent = upd.chats[0]
+        else:
+            raise _AdNeedJoin()
+    from telethon import utils as tl_utils
+    peer = tl_utils.get_input_peer(ent)
+    pj = _ad_peer_to_json(peer)
+    if pj:
+        _ad_save_access(chat["id"], acc_id, pj, None, 0, "peer сохранён")
+    if getattr(ent, "title", None) and not chat.get("title"):
+        _ad_exec("UPDATE ad_chats SET title=? WHERE id=?", (ent.title, chat["id"]))
+        chat["title"] = ent.title
+    return peer
+
+async def ad_check_chat(chat_id: int, acc_id: int, join: bool = False) -> dict:
+    """Проверка: аккаунт состоит в чате и может ли писать. Возвращает {ok, member, can_write, slowmode, note}."""
+    chat = _ad_one("SELECT * FROM ad_chats WHERE id=?", (chat_id,))
+    res = {"ok": False, "member": False, "can_write": False, "slowmode": 0, "note": ""}
+    if not chat: res["note"] = "чат не найден"; return res
+    client = await ad_get_client(acc_id)
+    if client is None:
+        res["note"] = "аккаунт не подключён"; return res
+    try:
+        try:
+            peer = await _ad_resolve_peer(client, chat, acc_id, join=join)
+        except _AdNeedJoin:
+            res["note"] = "приватная ссылка: аккаунт ещё не вступил в чат"
+            _ad_save_access(chat_id, acc_id, None, 0, 0, res["note"])
+            return res
+        ent = await client.get_entity(peer)
+        if getattr(ent, "title", None):
+            _ad_exec("UPDATE ad_chats SET title=? WHERE id=?", (ent.title, chat_id))
+        member = not getattr(ent, "left", False)
+        if not member and join:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            await client(JoinChannelRequest(ent))
+            member = True
+            ent = await client.get_entity(peer)
+        res["member"] = member
+        admin = bool(getattr(ent, "admin_rights", None) or getattr(ent, "creator", False))
+        drb = getattr(ent, "default_banned_rights", None)
+        br = getattr(ent, "banned_rights", None)
+        muted = bool(drb and getattr(drb, "send_messages", False))
+        banned = bool(br and getattr(br, "send_messages", False))
+        broadcast = bool(getattr(ent, "broadcast", False))
+        slow = 0
+        try:
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            full = await client(GetFullChannelRequest(ent))
+            slow = int(getattr(full.full_chat, "slowmode_seconds", 0) or 0)
+        except Exception:
+            pass
+        res["slowmode"] = slow
+        if not member:
+            res["note"] = "аккаунт не состоит в чате (нужно вступить)"
+        elif broadcast and not admin:
+            res["note"] = "это канал: публиковать могут только админы"
+        elif banned:
+            res["note"] = "аккаунту запрещено писать в этом чате"
+        elif muted and not admin:
+            res["note"] = "в чате запрещено писать обычным участникам"
+        else:
+            res["can_write"] = True
+            res["note"] = "можно публиковать" + (f" (медленный режим {slow} с)" if slow else "")
+        res["ok"] = res["can_write"]
+        _ad_save_access(chat_id, acc_id, None, 1 if res["can_write"] else 0, slow, res["note"])
+    except FloodWaitError as e:
+        res["note"] = f"FloodWait {e.seconds} с — попробуйте позже"
+    except Exception as e:
+        res["note"] = f"{type(e).__name__}: {str(e)[:160]}"
+        _ad_save_access(chat_id, acc_id, None, 0, 0, res["note"])
+    ad_log_add("chat", f"Проверка доступа: {res['note']}", "info" if res["ok"] else "warn", acc=acc_id, chat=chat_id)
+    return res
+
+
+# ── Выбор текста (случайно, без повторов) ──────────────────────
+def ad_pick_template(camp_id: int, chat_id: int, chat_cfg: dict, camp_cfg: dict) -> tuple[Optional[dict], int, int]:
+    """(шаблон | None, всего включённых, доступных сейчас)."""
+    tpls = _ad_all("SELECT * FROM ad_templates WHERE campaign_id=? AND enabled=1", (camp_id,))
+    days = ad_val("no_repeat_days", chat_cfg, camp_cfg)
+    used: set[int] = set()
+    if days > 0:
+        since = _ad_ts(_ad_now() - timedelta(days=days))
+        used = {r["template_id"] for r in _ad_all(
+            "SELECT DISTINCT template_id FROM ad_posts WHERE chat_id=? AND posted_at>=?", (chat_id, since))}
+    avail = [t for t in tpls if t["id"] not in used]
+    return (random.choice(avail) if avail else None), len(tpls), len(avail)
+
+
+# ── Лимиты аккаунта ────────────────────────────────────────────
+def ad_account_block_reason(acc: dict, now: datetime, force: bool = False) -> Optional[str]:
+    if acc["status"] != "active": return f"статус «{acc['status']}»"
+    if acc.get("cool_until") and acc["cool_until"] > _ad_ts(now):
+        return f"ждёт до {fmt_msk(acc['cool_until'], '%H:%M')} МСК (ограничение Telegram)"
+    cfg = _ad_cfg(acc)
+    if not force and not _ad_in_hours(_ad_msk().hour, int(ad_val("hour_from", cfg)), int(ad_val("hour_to", cfg))):
+        return "вне окна часов аккаунта"
+    per_day = int(ad_val("acc_per_day", cfg))
+    if per_day > 0:
+        n = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=? AND posted_at>=?",
+                    (acc["id"], _ad_ts(now - timedelta(hours=24))))["c"]
+        if n >= per_day: return f"лимит {per_day} постов за 24 ч"
+    per_hour = int(ad_val("acc_per_hour", cfg))
+    if per_hour > 0:
+        n = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=? AND posted_at>=?",
+                    (acc["id"], _ad_ts(now - timedelta(hours=1))))["c"]
+        if n >= per_hour: return f"лимит {per_hour} постов за час"
+    gap = ad_val("acc_gap_min", cfg)
+    if gap > 0 and not force:
+        last = _ad_one("SELECT MAX(posted_at) m FROM ad_posts WHERE account_id=?", (acc["id"],))["m"]
+        if last and last > _ad_ts(now - timedelta(minutes=gap)): return "пауза между постами аккаунта"
+    return None
+
+
+# ── Публикация ─────────────────────────────────────────────────
+_AD_ACCOUNT_DEAD = {"AuthKeyUnregisteredError", "UserDeactivatedError", "UserDeactivatedBanError",
+                    "SessionRevokedError", "SessionExpiredError", "AuthKeyDuplicatedError"}
+_AD_CHAT_BLOCKED = {"ChatWriteForbiddenError", "UserBannedInChannelError", "ChatAdminRequiredError",
+                    "ChannelPrivateError", "ChannelInvalidError", "ChatIdInvalidError",
+                    "UserNotParticipantError", "ChatRestrictedError", "ChatSendPlainForbiddenError",
+                    "PeerIdInvalidError", "InputUserDeactivatedError"}
+
+async def ad_publish_one(bot, camp: dict, chat: dict, acc: dict, tpl: dict) -> tuple[bool, str]:
+    cfg_c, cfg_k = _ad_cfg(chat), _ad_cfg(camp)
+    client = await ad_get_client(acc["id"])
+    if client is None:
+        return False, "аккаунт не подключён"
+    try:
+        peer = await _ad_resolve_peer(client, chat, acc["id"])
+        text = ad_render(tpl["text"], camp, chat, acc, tpl)
+        sent = await client.send_message(
+            peer, text, parse_mode="html",
+            link_preview=bool(ad_val("link_preview", cfg_c, cfg_k)),
+            silent=bool(ad_val("silent", cfg_c, cfg_k)))
+    except FloodWaitError as e:
+        wait = int(e.seconds) + int(_ad_global("flood_extra_s"))
+        _ad_exec("UPDATE ad_accounts SET cool_until=? WHERE id=?",
+                 (_ad_ts(_ad_now() + timedelta(seconds=wait)), acc["id"]))
+        ad_log_add("error", f"FloodWait {e.seconds} с — аккаунт на паузе", "warn", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+        if wait > 600:
+            await _ad_notify(bot, f"⚠️ Реклама: {html.escape(ad_acc_label(acc))} получил FloodWait на "
+                                  f"{wait // 60} мин. Аккаунт временно не публикует.", f"flood_{acc['id']}", 120)
+        return False, f"FloodWait {e.seconds} с"
+    except _AdNeedJoin:
+        _ad_save_access(chat["id"], acc["id"], None, 0, 0, "приватная ссылка: нужно вступить")
+        ad_log_add("error", "Аккаунт не состоит в приватном чате — нажмите «Проверить доступ» → «Вступить»",
+                   "error", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+        return False, "нужно вступить в чат"
+    except Exception as e:
+        name = type(e).__name__
+        if name == "SlowModeWaitError":
+            sec = int(getattr(e, "seconds", 60)) + 10
+            _ad_exec("UPDATE ad_chats SET next_post_at=? WHERE id=?",
+                     (_ad_ts(_ad_now() + timedelta(seconds=sec)), chat["id"]))
+            ad_log_add("error", f"Медленный режим чата: ждать {sec} с", "warn", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+            return False, "медленный режим"
+        if name in _AD_ACCOUNT_DEAD:
+            _ad_exec("UPDATE ad_accounts SET status='error', last_error=? WHERE id=?", (f"{name}: сессия/аккаунт недоступны", acc["id"]))
+            await ad_drop_client(acc["id"])
+            ad_log_add("account", f"Аккаунт отключён: {name}", "error", acc=acc["id"])
+            await _ad_notify(bot, f"🔴 Реклама: аккаунт {html.escape(ad_acc_label(acc))} отключён ({name}). "
+                                  f"Добавьте его заново в 📣 Реклама → Аккаунты.", f"dead_{acc['id']}", 360)
+            return False, name
+        if name == "PeerFloodError":
+            _ad_exec("UPDATE ad_accounts SET cool_until=?, last_error=? WHERE id=?",
+                     (_ad_ts(_ad_now() + timedelta(hours=6)), "PeerFlood — Telegram ограничил аккаунт", acc["id"]))
+            ad_log_add("error", "PeerFlood: аккаунт на паузе 6 ч", "error", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+            await _ad_notify(bot, f"⚠️ Реклама: {html.escape(ad_acc_label(acc))} получил PeerFlood "
+                                  f"(ограничение спама). Пауза 6 ч.", f"pf_{acc['id']}", 360)
+            return False, name
+        if name in _AD_CHAT_BLOCKED:
+            _ad_save_access(chat["id"], acc["id"], None, 0, 0, f"{name}")
+            ad_log_add("error", f"Нет прав публиковать в чате ({name}). Пара аккаунт–чат отключена до проверки доступа",
+                       "error", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+            return False, name
+        _ad_exec("UPDATE ad_chats SET next_post_at=? WHERE id=?",
+                 (_ad_ts(_ad_now() + timedelta(minutes=10)), chat["id"]))
+        ad_log_add("error", f"Ошибка публикации: {name}: {str(e)[:200]}", "error", acc=acc["id"], chat=chat["id"], camp=camp["id"])
+        return False, f"{name}"
+
+    now = _ad_now()
+    dh = ad_val("delete_after_h", cfg_c, cfg_k)
+    delete_at = _ad_ts(now + timedelta(hours=dh)) if dh > 0 else None
+    _ad_exec("INSERT INTO ad_posts(campaign_id,template_id,account_id,chat_id,msg_id,posted_at,delete_at) VALUES(?,?,?,?,?,?,?)",
+             (camp["id"], tpl["id"], acc["id"], chat["id"], sent.id, _ad_ts(now), delete_at))
+    interval = ad_val("chat_interval_min", cfg_c, cfg_k)
+    jitter = ad_val("jitter_min", cfg_c, cfg_k)
+    wait_min = interval + (random.uniform(0, jitter) if jitter > 0 else 0)
+    nxt = _ad_ts(now + timedelta(minutes=wait_min)) if wait_min > 0 else None
+    _ad_exec("UPDATE ad_chats SET next_post_at=? WHERE id=?", (nxt, chat["id"]))
+    ad_log_add("post", f"Опубликовано: «{ad_plain(tpl['text'], 50)}» ({ad_acc_label(acc)} → {chat.get('title') or chat['link']})"
+                       + (f", удалится {fmt_msk(delete_at, '%d.%m %H:%M')}" if delete_at else ""),
+               acc=acc["id"], chat=chat["id"], camp=camp["id"])
+    return True, "ok"
+
+
+def ad_campaign_open(camp: dict, now_msk: Optional[datetime] = None) -> bool:
+    now_msk = now_msk or _ad_msk()
+    days = (camp.get("days") or "1111111").ljust(7, "1")
+    if days[now_msk.weekday()] != "1": return False
+    cfg = _ad_cfg(camp)
+    return _ad_in_hours(now_msk.hour, int(ad_val("hour_from", cfg)), int(ad_val("hour_to", cfg)))
+
+async def ad_try_chat(bot, camp: dict, chat: dict, force: bool = False) -> str:
+    """Одна попытка публикации кампании в чат. Возвращает код результата (для журнала/кнопки)."""
+    now = _ad_now()
+    cfg_c, cfg_k = _ad_cfg(chat), _ad_cfg(camp)
+    if not force:
+        if chat.get("next_post_at") and chat["next_post_at"] > _ad_ts(now): return "wait"
+        per_day = int(ad_val("chat_per_day", cfg_c, cfg_k))
+        if per_day > 0:
+            n = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE chat_id=? AND posted_at>=?",
+                        (chat["id"], _ad_ts(now - timedelta(hours=24))))["c"]
+            if n >= per_day: return "chat_limit"
+        interval = ad_val("chat_interval_min", cfg_c, cfg_k)
+        if interval > 0:
+            last = _ad_one("SELECT MAX(posted_at) m FROM ad_posts WHERE chat_id=?", (chat["id"],))["m"]
+            if last and last > _ad_ts(now - timedelta(minutes=interval)): return "wait"
+    accs = _ad_all("SELECT a.* FROM ad_accounts a JOIN ad_campaign_accounts ca ON ca.account_id=a.id "
+                   "WHERE ca.campaign_id=?", (camp["id"],))
+    ready = []
+    for a in accs:
+        acc_row = _ad_access(chat["id"], a["id"])
+        if acc_row and acc_row.get("can_write") == 0: continue
+        if ad_account_block_reason(a, now, force) is None:
+            n = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=? AND posted_at>=?",
+                        (a["id"], _ad_ts(now - timedelta(hours=24))))["c"]
+            ready.append((n, random.random(), a))
+    if not ready: return "no_account"
+    ready.sort(key=lambda x: (x[0], x[1]))
+    acc = ready[0][2]
+    tpl, total, avail = ad_pick_template(camp["id"], chat["id"], cfg_c, cfg_k)
+    if tpl is None:
+        reason = "в кампании нет включённых текстов" if total == 0 else \
+                 f"все {total} текст(ов) уже были в этом чате за последние {_ad_fmt(ad_val('no_repeat_days', cfg_c, cfg_k))} дн. — добавьте новые"
+        key = f"notext_{camp['id']}_{chat['id']}"
+        last = _db.get_setting("ad_" + key, "")
+        if not last or last < _ad_ts(now - timedelta(hours=12)):
+            _db.set_setting("ad_" + key, _ad_ts(now))
+            ad_log_add("error", f"Нечего публиковать в «{chat.get('title') or chat['link']}»: {reason}",
+                       "warn", chat=chat["id"], camp=camp["id"])
+            await _ad_notify(bot, f"⚠️ Реклама, кампания «{html.escape(camp['name'])}»: {html.escape(reason)}.",
+                             key, 720)
+        return "no_text"
+    ok, note = await ad_publish_one(bot, camp, chat, acc, tpl)
+    return "posted" if ok else f"fail:{note}"
+
+async def ad_run_cycle(bot) -> None:
+    camps = _ad_all("SELECT * FROM ad_campaigns WHERE enabled=1")
+    for camp in camps:
+        if not ad_campaign_open(camp): continue
+        chats = _ad_all("SELECT c.* FROM ad_chats c JOIN ad_campaign_chats cc ON cc.chat_id=c.id "
+                        "WHERE cc.campaign_id=? AND c.enabled=1", (camp["id"],))
+        random.shuffle(chats)
+        for chat in chats:
+            try: await ad_try_chat(bot, camp, chat)
+            except Exception as e:
+                ad_log_add("error", f"Сбой цикла: {type(e).__name__}: {str(e)[:200]}", "error", chat=chat["id"], camp=camp["id"])
+            await asyncio.sleep(1)
+
+
+# ── Автоудаление ───────────────────────────────────────────────
+async def ad_delete_post(p: dict, bot=None) -> bool:
+    acc = _ad_one("SELECT * FROM ad_accounts WHERE id=?", (p["account_id"],))
+    chat = _ad_one("SELECT * FROM ad_chats WHERE id=?", (p["chat_id"],))
+    max_try = int(_ad_global("del_retry_max"))
+    def _fail(reason: str, retry_min: int = 10) -> bool:
+        n = p["del_attempts"] + 1
+        if n >= max_try:
+            _ad_exec("UPDATE ad_posts SET status='delete_failed', del_attempts=? WHERE id=?", (n, p["id"]))
+            ad_log_add("error", f"Не удалось удалить пост №{p['id']} после {n} попыток: {reason}", "error",
+                       acc=p["account_id"], chat=p["chat_id"], camp=p["campaign_id"])
+        else:
+            _ad_exec("UPDATE ad_posts SET del_attempts=?, delete_at=? WHERE id=?",
+                     (n, _ad_ts(_ad_now() + timedelta(minutes=retry_min * n)), p["id"]))
+        return False
+    if not acc or not chat: return _fail("аккаунт или чат удалены из системы", 1)
+    if acc["status"] == "paused": return False          # ждём, пока аккаунт снимут с паузы
+    client = await ad_get_client(acc["id"])
+    if client is None: return _fail("аккаунт не подключён")
+    try:
+        peer = await _ad_resolve_peer(client, chat, acc["id"])
+        await client.delete_messages(peer, [p["msg_id"]])
+    except FloodWaitError as e:
+        _ad_exec("UPDATE ad_posts SET delete_at=? WHERE id=?",
+                 (_ad_ts(_ad_now() + timedelta(seconds=int(e.seconds) + 30)), p["id"]))
+        return False
+    except Exception as e:
+        name = type(e).__name__
+        if name in ("MessageIdInvalidError",):
+            pass                                          # уже удалено — считаем успехом
+        else:
+            return _fail(f"{name}")
+    _ad_exec("UPDATE ad_posts SET status='deleted', deleted_at=? WHERE id=?", (_ad_ts(_ad_now()), p["id"]))
+    ad_log_add("delete", f"Удалён пост №{p['id']} в «{chat.get('title') or chat['link']}»",
+               acc=p["account_id"], chat=p["chat_id"], camp=p["campaign_id"])
+    return True
+
+async def ad_delete_due(bot=None, limit: int = 40) -> int:
+    rows = _ad_all("SELECT * FROM ad_posts WHERE status='posted' AND delete_at IS NOT NULL AND delete_at<=? "
+                   "ORDER BY delete_at LIMIT ?", (_ad_ts(_ad_now()), limit))
+    done = 0
+    for p in rows:
+        if await ad_delete_post(p, bot): done += 1
+        await asyncio.sleep(1.5)
+    return done
+
+
+# ── Фоновые циклы (не должны ронять основной процесс) ──────────
+async def ad_scheduler_loop(bot) -> None:
+    await asyncio.sleep(15)
+    try:
+        _ad_state["bot_username"] = (await bot.get_me()).username or ""
+    except Exception as e:
+        log.warning(f"ad: bot.get_me: {e}")
+    while True:
+        tick = 30
+        try:
+            if not _ad_state["bot_username"]:
+                try: _ad_state["bot_username"] = (await bot.get_me()).username or ""
+                except Exception: pass
+            if _db.get_setting("ad_enabled", "0") == "1":
+                await ad_run_cycle(bot)
+            tick = max(5, int(_ad_global("tick_s")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"ad_scheduler_loop: {e}", exc_info=True)
+            try: ad_log_add("error", f"Сбой планировщика: {type(e).__name__}: {str(e)[:200]}", "error")
+            except Exception: pass
+        await asyncio.sleep(tick)
+
+async def ad_cleanup_loop(bot) -> None:
+    await asyncio.sleep(25)
+    while True:
+        try:
+            await ad_delete_due(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"ad_cleanup_loop: {e}", exc_info=True)
+        await asyncio.sleep(60)
+
+
+# ── Метки в /start ─────────────────────────────────────────────
+def _ad_track_start(msg: "Message", cl: dict, is_new: bool) -> None:
+    args = (msg.text or "").split()
+    if len(args) < 2 or not args[1].startswith("ad_"): return
+    m = re.fullmatch(r"ad_(\d+)_(\d+)_(\d+)_(\d+)", args[1])
+    if not m: return
+    camp, chat, acc, tpl = (int(x) or None for x in m.groups())
+    _ad_exec("INSERT INTO ad_starts(tg_id,campaign_id,chat_id,account_id,template_id,is_new) VALUES(?,?,?,?,?,?)",
+             (msg.from_user.id, camp, chat, acc, tpl, 1 if is_new else 0))
+    if is_new:
+        _ad_exec("UPDATE clients SET ad_source=? WHERE id=?", (args[1], cl["id"]))
+    ad_log_add("start", f"/start по рекламной ссылке ({'новый' if is_new else 'уже был'} пользователь)",
+               acc=acc, chat=chat, camp=camp)
+
+
+# ── Админ-интерфейс раздела «Реклама» ──────────────────────────
+_AD_ROUTES: dict = {}
+AD_PAGE = 10
+
+def _ad_route(name: str):
+    def deco(fn):
+        _AD_ROUTES[name] = fn
+        return fn
+    return deco
+
+@admin_router.callback_query(F.data.startswith("ad_"))
+async def ad_dispatch(call: CallbackQuery):
+    parts = (call.data or "").split(":")
+    fn = _AD_ROUTES.get(parts[0])
+    toast = None
+    if fn is None:
+        toast = "Неизвестная кнопка"
+    else:
+        try:
+            toast = await fn(call, parts[1:])
+        except Exception as e:
+            log.error(f"ad UI {call.data}: {e}", exc_info=True)
+            ad_log_add("error", f"Ошибка интерфейса ({call.data}): {type(e).__name__}: {str(e)[:150]}", "error")
+            toast = f"Ошибка: {type(e).__name__}"
+    try: await call.answer((toast or "")[:190])
+    except Exception: pass
+
+async def _ad_show(call: CallbackQuery, text: str, rows: list) -> None:
+    if len(text) > 3900: text = text[:3900] + "…"
+    await safe_edit(call, text, mkb(rows))
+
+def _ad_icon_acc(a: dict) -> str:
+    if a["status"] == "active":
+        if a.get("cool_until") and a["cool_until"] > _ad_ts(_ad_now()): return "🟡"
+        return "🟢"
+    return "⏸" if a["status"] == "paused" else "🔴"
+
+def _ad_page(items: list, page: int, size: int = AD_PAGE) -> tuple[list, int]:
+    pages = max(1, (len(items) + size - 1) // size)
+    page = max(0, min(page, pages - 1))
+    return items[page * size:(page + 1) * size], pages
+
+def _ad_nav(prefix_fmt: str, page: int, pages: int) -> list:
+    nav = []
+    if page > 0: nav.append(("◀️", prefix_fmt.format(p=page - 1)))
+    if pages > 1: nav.append((f"{page + 1}/{pages}", "ad_noop"))
+    if page < pages - 1: nav.append(("▶️", prefix_fmt.format(p=page + 1)))
+    return nav
+
+@_ad_route("ad_noop")
+async def _ad_noop(call, a): return None
+
+
+# ── Главное меню ───────────────────────────────────────────────
+def _ad_menu_text() -> str:
+    on = _db.get_setting("ad_enabled", "0") == "1"
+    accs = _ad_all("SELECT status FROM ad_accounts")
+    act = sum(1 for x in accs if x["status"] == "active")
+    chats = _ad_one("SELECT COUNT(*) c FROM ad_chats WHERE enabled=1")["c"]
+    camps = _ad_one("SELECT COUNT(*) c, COALESCE(SUM(enabled),0) e FROM ad_campaigns")
+    since = _ad_ts(_ad_now() - timedelta(hours=24))
+    p24 = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE posted_at>=?", (since,))["c"]
+    live = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE status='posted'")["c"]
+    st24 = _ad_one("SELECT COUNT(*) c, COALESCE(SUM(is_new),0) n FROM ad_starts WHERE ts>=?", (since,))
+    return (
+        "📣 <b>Реклама</b>\n\n"
+        f"Публикации: {'🟢 <b>включены</b>' if on else '🔴 <b>выключены</b>'}\n"
+        f"👤 Аккаунтов: <b>{len(accs)}</b> (активных {act})\n"
+        f"💬 Чатов: <b>{chats}</b>\n"
+        f"📣 Кампаний: <b>{camps['c']}</b> (включено {camps['e']})\n\n"
+        f"За 24 ч: постов <b>{p24}</b> · стартов бота <b>{st24['c']}</b> (новых {st24['n']})\n"
+        f"Сейчас висит постов: <b>{live}</b>"
+    )
+
+def _ad_menu_rows() -> list:
+    on = _db.get_setting("ad_enabled", "0") == "1"
+    return [
+        [("⏸ Выключить публикации" if on else "▶️ Включить публикации", "ad_toggle")],
+        [("👤 Аккаунты", "ad_acc"), ("💬 Чаты", "ad_chats")],
+        [("📣 Кампании", "ad_camps"), ("📊 Статистика", "ad_stats:camp:7")],
+        [("📋 Посты", "ad_posts:all:0:0"), ("📜 Журнал", "ad_log:all:0")],
+        [("⚙️ Общие лимиты", "ad_cfg:g:0"), ("🔤 Переменные", "ad_vars")],
+        [("◀️ Клиенты", "admin_clients")],
+    ]
+
+@_ad_route("ad_menu")
+async def _ad_menu(call, a):
+    await _ad_show(call, _ad_menu_text(), _ad_menu_rows())
+
+@_ad_route("ad_toggle")
+async def _ad_toggle(call, a):
+    on = _db.get_setting("ad_enabled", "0") == "1"
+    _db.set_setting("ad_enabled", "0" if on else "1")
+    ad_log_add("setting", "Публикации " + ("выключены" if on else "включены"))
+    await _ad_show(call, _ad_menu_text(), _ad_menu_rows())
+    return "Публикации " + ("выключены" if on else "включены")
+
+
+# ── Аккаунты ───────────────────────────────────────────────────
+@_ad_route("ad_acc")
+async def _ad_acc_list(call, a):
+    accs = _ad_all("SELECT * FROM ad_accounts ORDER BY id")
+    text = "👤 <b>Рекламные аккаунты</b>\n\n" + ("Пока нет аккаунтов. Добавьте первый." if not accs else
+           "🟢 работает · 🟡 ждёт (ограничение Telegram) · ⏸ пауза · 🔴 ошибка")
+    rows = [[(f"{_ad_icon_acc(x)} {ad_acc_label(x)}", f"ad_acc_v:{x['id']}")] for x in accs]
+    rows.append([("➕ Добавить по номеру", "ad_acc_add"), ("📥 Добавить по сессии", "ad_acc_sess")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    await _ad_show(call, text, rows)
+
+@_ad_route("ad_acc_add")
+async def _ad_acc_add(call, a):
+    if not API_ID or not API_HASH:
+        return "Не заданы API_ID / API_HASH в окружении"
+    _admin_pending[call.from_user.id] = "ad:acc_phone"
+    await _ad_show(call,
+        "➕ <b>Новый рекламный аккаунт</b>\n\nВведите номер телефона в формате <code>+79991234567</code>.\n\n"
+        "⚠️ Не используйте аккаунт, на котором работает мониторинг вакансий.\n"
+        "Код из Telegram вводите <b>с разделителями</b> (например <code>1-2-3-4-5</code>) — "
+        "иначе Telegram может счесть код «слитым» и отменить вход.\n"
+        "Сессия сохраняется в базе; пароль 2FA и коды не сохраняются.",
+        [[("◀️ Отмена", "ad_acc")]])
+
+@_ad_route("ad_acc_sess")
+async def _ad_acc_sess(call, a):
+    if not API_ID or not API_HASH:
+        return "Не заданы API_ID / API_HASH в окружении"
+    _admin_pending[call.from_user.id] = "ad:acc_session"
+    await _ad_show(call,
+        "📥 <b>Добавить аккаунт по сессии</b>\n\n"
+        "Пришлите строку сессии <b>Telethon</b> (StringSession) одним сообщением. "
+        "Сообщение с сессией бот удалит сразу после чтения.\n\n"
+        "⚠️ Строка сессии — это полный доступ к аккаунту. Присылайте только сессии своих аккаунтов.\n"
+        "⚠️ Одна сессия не должна одновременно работать в другом месте (другом боте, скрипте, на другом сервере): "
+        "Telegram в таком случае отзывает её. Не присылайте сюда сессию основного аккаунта мониторинга.",
+        [[("◀️ Отмена", "ad_acc")]])
+
+def _ad_acc_text(x: dict) -> str:
+    now = _ad_now()
+    d = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=? AND posted_at>=?",
+                (x["id"], _ad_ts(now - timedelta(hours=24))))["c"]
+    tot = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=?", (x["id"],))["c"]
+    cfg = _ad_cfg(x)
+    lim = int(ad_val("acc_per_day", cfg))
+    reason = ad_account_block_reason(x, now)
+    return (
+        f"{_ad_icon_acc(x)} <b>{html.escape(ad_acc_label(x))}</b>\n"
+        f"Имя: {html.escape(x.get('name') or '—')}\n"
+        f"Телефон: <code>{html.escape(x.get('phone') or '—')}</code>\n"
+        f"Статус: <b>{x['status']}</b>\n"
+        f"Постов за 24 ч: <b>{d}</b>{f' из {lim}' if lim else ''} · всего: {tot}\n"
+        + (f"Сейчас не публикует: {html.escape(reason)}\n" if reason and x["status"] == "active" else "")
+        + (f"⚠️ Последняя ошибка: {html.escape(x['last_error'])}\n" if x.get("last_error") else "")
+    )
+
+@_ad_route("ad_acc_v")
+async def _ad_acc_view(call, a):
+    x = _ad_one("SELECT * FROM ad_accounts WHERE id=?", (int(a[0]),))
+    if not x: return "Аккаунт не найден"
+    i = x["id"]
+    rows = [
+        [("▶️ Возобновить", f"ad_acc_st:{i}:active")] if x["status"] != "active" else [("⏸ Пауза", f"ad_acc_st:{i}:paused")],
+        [("🔁 Проверить подключение", f"ad_acc_chk:{i}"), ("⚙️ Лимиты аккаунта", f"ad_cfg:a:{i}")],
+        [("🗑 Удалить из системы", f"ad_acc_del:{i}")],
+        [("◀️ Аккаунты", "ad_acc")],
+    ]
+    await _ad_show(call, _ad_acc_text(x), rows)
+
+@_ad_route("ad_acc_st")
+async def _ad_acc_set_status(call, a):
+    i, st = int(a[0]), a[1]
+    if st not in ("active", "paused"): return None
+    _ad_exec("UPDATE ad_accounts SET status=?, last_error=NULL WHERE id=?", (st, i))
+    if st == "paused": await ad_drop_client(i)
+    ad_log_add("account", "Аккаунт " + ("на паузе" if st == "paused" else "возобновлён"), acc=i)
+    return await _ad_acc_view(call, [str(i)]) or ("Пауза" if st == "paused" else "Возобновлён")
+
+@_ad_route("ad_acc_chk")
+async def _ad_acc_check(call, a):
+    i = int(a[0])
+    await safe_edit(call, "⏳ Проверяю подключение…", None)
+    cl = await ad_get_client(i)
+    if cl is None:
+        x = _ad_one("SELECT last_error FROM ad_accounts WHERE id=?", (i,))
+        msg = (x or {}).get("last_error") or "не удалось подключиться"
+        await _ad_show(call, f"🔴 Подключение не удалось: {html.escape(msg)}",
+                       [[("◀️ К аккаунту", f"ad_acc_v:{i}")]])
+        return
+    me = await cl.get_me()
+    _ad_exec("UPDATE ad_accounts SET status=CASE WHEN status='error' THEN 'active' ELSE status END, "
+             "last_error=NULL, username=?, name=? WHERE id=?",
+             (me.username, " ".join(x for x in (me.first_name, me.last_name) if x), i))
+    await _ad_show(call, f"🟢 Подключение работает: {html.escape(me.first_name or '')} "
+                         f"{'@' + me.username if me.username else ''}", [[("◀️ К аккаунту", f"ad_acc_v:{i}")]])
+
+@_ad_route("ad_acc_del")
+async def _ad_acc_del(call, a):
+    i = int(a[0])
+    live = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE account_id=? AND status='posted'", (i,))["c"]
+    await _ad_show(call,
+        "🗑 <b>Удалить аккаунт из системы?</b>\n\nСессия будет забыта, аккаунт уберётся из кампаний. "
+        "В самом Telegram сессия останется активной — завершить её можно в Настройки → Устройства."
+        + (f"\n\n⚠️ Сейчас висит постов этого аккаунта: <b>{live}</b>. После удаления бот не сможет их удалить сам." if live else ""),
+        [[("✅ Да, удалить", f"ad_acc_del2:{i}")], [("◀️ Отмена", f"ad_acc_v:{i}")]])
+
+@_ad_route("ad_acc_del2")
+async def _ad_acc_del2(call, a):
+    i = int(a[0])
+    await ad_drop_client(i)
+    _ad_exec("DELETE FROM ad_campaign_accounts WHERE account_id=?", (i,))
+    _ad_exec("DELETE FROM ad_chat_access WHERE account_id=?", (i,))
+    _ad_exec("DELETE FROM ad_accounts WHERE id=?", (i,))
+    ad_log_add("account", f"Аккаунт №{i} удалён из системы")
+    await _ad_acc_list(call, [])
+    return "Удалён"
+
+
+# ── Чаты ───────────────────────────────────────────────────────
+@_ad_route("ad_chats")
+async def _ad_chats(call, a):
+    page = int(a[0]) if a else 0
+    chats = _ad_all("SELECT * FROM ad_chats ORDER BY id")
+    chunk, pages = _ad_page(chats, page)
+    text = "💬 <b>Рекламные чаты</b>\n\n" + ("Чатов пока нет. Добавьте ссылки на чаты, где разрешена реклама." if not chats else
+            f"Всего: {len(chats)}. Включённые ✅, отключённые ⛔.")
+    rows = [[(f"{'✅' if c['enabled'] else '⛔'} {c.get('title') or c['link']}"[:60], f"ad_chat_v:{c['id']}")] for c in chunk]
+    nav = _ad_nav("ad_chats:{p}", page if chats else 0, pages)
+    if nav: rows.append(nav)
+    rows.append([("➕ Добавить чаты", "ad_chat_add:0")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    await _ad_show(call, text, rows)
+
+@_ad_route("ad_chat_add")
+async def _ad_chat_add(call, a):
+    camp = int(a[0]) if a else 0
+    _admin_pending[call.from_user.id] = f"ad:chat_add:{camp}"
+    back = f"ad_kc:{camp}:0:0" if camp else "ad_chats"
+    await _ad_show(call,
+        "➕ <b>Добавить чаты</b>\n\nПришлите ссылки или @username, по одной на строку:\n"
+        "<code>https://t.me/chatname\n@another_chat\nhttps://t.me/+AbCdEf123</code>\n\n"
+        "Добавляйте только чаты, где реклама разрешена правилами.",
+        [[("◀️ Отмена", back)]])
+
+def _ad_chat_text(c: dict) -> str:
+    cfg = _ad_cfg(c)
+    now = _ad_now()
+    n24 = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE chat_id=? AND posted_at>=?", (c["id"], _ad_ts(now - timedelta(hours=24))))["c"]
+    tot = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE chat_id=?", (c["id"],))["c"]
+    camps = _ad_all("SELECT k.name FROM ad_campaigns k JOIN ad_campaign_chats cc ON cc.campaign_id=k.id WHERE cc.chat_id=?", (c["id"],))
+    acc_lines = []
+    for r in _ad_all("SELECT x.*, a.username, a.name, a.phone FROM ad_chat_access x JOIN ad_accounts a ON a.id=x.account_id WHERE x.chat_id=? LIMIT 8", (c["id"],)):
+        ic = "✅" if r["can_write"] == 1 else ("⛔" if r["can_write"] == 0 else "❔")
+        acc_lines.append(f"{ic} {html.escape(ad_acc_label(r))}: {html.escape(r.get('note') or '—')}")
+    own = ", ".join(f"{AD_FIELDS[k][0]} = {_ad_fmt(v)}" for k, v in cfg.items() if k in AD_FIELDS) or "общие"
+    return (
+        f"{'✅' if c['enabled'] else '⛔'} <b>{html.escape(c.get('title') or c['link'])}</b>\n"
+        f"{html.escape(c['link'])}\n\n"
+        f"Кампании: {html.escape(', '.join(k['name'] for k in camps)) or '—'}\n"
+        f"Постов за 24 ч: <b>{n24}</b> · всего: {tot}\n"
+        + (f"Следующий пост не раньше: {fmt_msk(c['next_post_at'], '%d.%m %H:%M')} МСК\n" if c.get("next_post_at") and c["next_post_at"] > _ad_ts(now) else "")
+        + f"Свои настройки: {html.escape(own)}\n"
+        + ("\nДоступ аккаунтов:\n" + "\n".join(acc_lines) if acc_lines else "\nДоступ не проверялся.")
+    )
+
+@_ad_route("ad_chat_v")
+async def _ad_chat_view(call, a):
+    c = _ad_one("SELECT * FROM ad_chats WHERE id=?", (int(a[0]),))
+    if not c: return "Чат не найден"
+    i = c["id"]
+    rows = [
+        [("⛔ Отключить" if c["enabled"] else "✅ Включить", f"ad_chat_tgl:{i}")],
+        [("🔎 Проверить доступ", f"ad_chat_pick:{i}"), ("⚙️ Настройки чата", f"ad_cfg:c:{i}")],
+        [("📋 Посты в чате", f"ad_posts:chat:{i}:0"), ("🗑 Удалить чат", f"ad_chat_del:{i}")],
+        [("◀️ Чаты", "ad_chats")],
+    ]
+    await _ad_show(call, _ad_chat_text(c), rows)
+
+@_ad_route("ad_chat_tgl")
+async def _ad_chat_toggle(call, a):
+    i = int(a[0])
+    _ad_exec("UPDATE ad_chats SET enabled=1-enabled WHERE id=?", (i,))
+    ad_log_add("chat", "Чат включён/отключён", chat=i)
+    await _ad_chat_view(call, [str(i)])
+
+@_ad_route("ad_chat_pick")
+async def _ad_chat_pick(call, a):
+    i = int(a[0])
+    accs = _ad_all("SELECT * FROM ad_accounts WHERE status!='error' ORDER BY id")
+    if not accs: return "Сначала добавьте аккаунт"
+    rows = [[(f"{_ad_icon_acc(x)} {ad_acc_label(x)}", f"ad_chat_chk:{i}:{x['id']}:0")] for x in accs]
+    rows.append([("◀️ Назад", f"ad_chat_v:{i}")])
+    await _ad_show(call, "🔎 <b>Проверить доступ</b>\n\nС какого аккаунта проверить чат?", rows)
+
+@_ad_route("ad_chat_chk")
+async def _ad_chat_check(call, a):
+    i, acc_id, join = int(a[0]), int(a[1]), a[2] == "1"
+    await safe_edit(call, "⏳ " + ("Вступаю в чат и проверяю…" if join else "Проверяю доступ…"), None)
+    res = await ad_check_chat(i, acc_id, join=join)
+    rows = []
+    if not res["member"] and not join and res["note"] and "FloodWait" not in res["note"]:
+        rows.append([("➕ Вступить этим аккаунтом", f"ad_chat_chk:{i}:{acc_id}:1")])
+    rows.append([("◀️ К чату", f"ad_chat_v:{i}")])
+    await _ad_show(call, ("✅ " if res["ok"] else "⚠️ ") + html.escape(res["note"]), rows)
+
+@_ad_route("ad_chat_del")
+async def _ad_chat_del(call, a):
+    i = int(a[0])
+    await _ad_show(call, "🗑 <b>Удалить чат из системы?</b>\nИстория постов останется.",
+                   [[("✅ Да", f"ad_chat_del2:{i}")], [("◀️ Отмена", f"ad_chat_v:{i}")]])
+
+@_ad_route("ad_chat_del2")
+async def _ad_chat_del2(call, a):
+    i = int(a[0])
+    _ad_exec("DELETE FROM ad_campaign_chats WHERE chat_id=?", (i,))
+    _ad_exec("DELETE FROM ad_chat_access WHERE chat_id=?", (i,))
+    _ad_exec("DELETE FROM ad_chats WHERE id=?", (i,))
+    ad_log_add("chat", f"Чат №{i} удалён")
+    await _ad_chats(call, [])
+
+
+# ── Кампании ───────────────────────────────────────────────────
+@_ad_route("ad_camps")
+async def _ad_camps(call, a):
+    camps = _ad_all("SELECT * FROM ad_campaigns ORDER BY id")
+    text = "📣 <b>Кампании</b>\n\nКампания — это набор ваших текстов, чатов и аккаунтов с расписанием." + \
+           ("\n\nКампаний пока нет." if not camps else "")
+    rows = [[(f"{'🟢' if k['enabled'] else '⚪️'} {k['name']}"[:60], f"ad_camp_v:{k['id']}")] for k in camps]
+    rows.append([("➕ Новая кампания", "ad_camp_add")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    await _ad_show(call, text, rows)
+
+@_ad_route("ad_camp_add")
+async def _ad_camp_add(call, a):
+    _admin_pending[call.from_user.id] = "ad:camp_add"
+    await _ad_show(call, "➕ <b>Новая кампания</b>\n\nВведите название (например «Монтажёры — основная»):",
+                   [[("◀️ Отмена", "ad_camps")]])
+
+def _ad_camp_text(k: dict) -> str:
+    cfg = _ad_cfg(k)
+    nt = _ad_one("SELECT COUNT(*) c, COALESCE(SUM(enabled),0) e FROM ad_templates WHERE campaign_id=?", (k["id"],))
+    nc = _ad_one("SELECT COUNT(*) c FROM ad_campaign_chats WHERE campaign_id=?", (k["id"],))["c"]
+    na = _ad_one("SELECT COUNT(*) c FROM ad_campaign_accounts WHERE campaign_id=?", (k["id"],))["c"]
+    n24 = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE campaign_id=? AND posted_at>=?", (k["id"], _ad_ts(_ad_now() - timedelta(hours=24))))["c"]
+    live = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE campaign_id=? AND status='posted'", (k["id"],))["c"]
+    hf, ht = int(ad_val("hour_from", cfg)), int(ad_val("hour_to", cfg))
+    nr = _ad_fmt(ad_val("no_repeat_days", cfg)); da = _ad_fmt(ad_val("delete_after_h", cfg))
+    ci = _ad_fmt(ad_val("chat_interval_min", cfg)); cd = _ad_fmt(ad_val("chat_per_day", cfg))
+    state = "🟢 включена" if k["enabled"] else "⚪️ выключена"
+    master = "" if _db.get_setting("ad_enabled", "0") == "1" else "\n⚠️ Общий выключатель публикаций сейчас ВЫКЛ (📣 Реклама → «Включить публикации»)."
+    return (
+        f"📣 <b>{html.escape(k['name'])}</b> — {state}{master}\n\n"
+        f"📝 Текстов: <b>{nt['c']}</b> (включено {nt['e']}) · 💬 Чатов: <b>{nc}</b> · 👤 Аккаунтов: <b>{na}</b>\n"
+        f"🕐 Окно: {hf:02d}:00–{ht:02d}:00 МСК · дни: " + " ".join(
+            (AD_DAYS_RU[i] if k["days"].ljust(7, "1")[i] == "1" else "·") for i in range(7)) + "\n"
+        f"Пауза в чате: {ci} мин · постов/сутки в чате: {cd} · без повтора текста: {nr} дн. · удаление через: {da} ч\n"
+        f"Постов за 24 ч: <b>{n24}</b> · сейчас висит: {live}"
+    )
+
+@_ad_route("ad_camp_v")
+async def _ad_camp_view(call, a):
+    k = _ad_one("SELECT * FROM ad_campaigns WHERE id=?", (int(a[0]),))
+    if not k: return "Кампания не найдена"
+    i = k["id"]
+    days = k["days"].ljust(7, "1")
+    rows = [
+        [("⏸ Выключить" if k["enabled"] else "▶️ Включить", f"ad_camp_tgl:{i}")],
+        [("📝 Тексты", f"ad_tpls:{i}:0"), ("💬 Чаты", f"ad_kc:{i}:0:0"), ("👤 Аккаунты", f"ad_ka:{i}:0")],
+        [((AD_DAYS_RU[d] + ("✅" if days[d] == "1" else "⬜")), f"ad_day:{i}:{d}") for d in range(7)],
+        [("⚙️ Лимиты и часы", f"ad_cfg:k:{i}"), ("✏️ Название", f"ad_camp_ren:{i}")],
+        [("📋 Посты", f"ad_posts:camp:{i}:0"), ("🚀 Опубликовать 1 пост сейчас", f"ad_camp_now:{i}")],
+        [("🗑 Удалить кампанию", f"ad_camp_del:{i}")],
+        [("◀️ Кампании", "ad_camps")],
+    ]
+    await _ad_show(call, _ad_camp_text(k), rows)
+
+@_ad_route("ad_camp_tgl")
+async def _ad_camp_toggle(call, a):
+    i = int(a[0])
+    k = _ad_one("SELECT * FROM ad_campaigns WHERE id=?", (i,))
+    if not k: return "Не найдена"
+    if not k["enabled"]:
+        if not _ad_one("SELECT 1 FROM ad_campaign_chats WHERE campaign_id=?", (i,)) or \
+           not _ad_one("SELECT 1 FROM ad_campaign_accounts WHERE campaign_id=?", (i,)) or \
+           not _ad_one("SELECT 1 FROM ad_templates WHERE campaign_id=? AND enabled=1", (i,)):
+            return "Нужны хотя бы 1 текст, 1 чат и 1 аккаунт"
+    _ad_exec("UPDATE ad_campaigns SET enabled=1-enabled WHERE id=?", (i,))
+    ad_log_add("campaign", f"Кампания «{k['name']}» {'выключена' if k['enabled'] else 'включена'}", camp=i)
+    await _ad_camp_view(call, [str(i)])
+
+@_ad_route("ad_day")
+async def _ad_day(call, a):
+    i, d = int(a[0]), int(a[1])
+    k = _ad_one("SELECT days FROM ad_campaigns WHERE id=?", (i,))
+    days = list(k["days"].ljust(7, "1"))
+    days[d] = "0" if days[d] == "1" else "1"
+    _ad_exec("UPDATE ad_campaigns SET days=? WHERE id=?", ("".join(days), i))
+    await _ad_camp_view(call, [str(i)])
+
+@_ad_route("ad_camp_ren")
+async def _ad_camp_rename(call, a):
+    i = int(a[0])
+    _admin_pending[call.from_user.id] = f"ad:camp_ren:{i}"
+    await _ad_show(call, "✏️ Введите новое название кампании:", [[("◀️ Отмена", f"ad_camp_v:{i}")]])
+
+@_ad_route("ad_camp_del")
+async def _ad_camp_del(call, a):
+    i = int(a[0])
+    live = _ad_one("SELECT COUNT(*) c FROM ad_posts WHERE campaign_id=? AND status='posted'", (i,))["c"]
+    await _ad_show(call, "🗑 <b>Удалить кампанию вместе с её текстами?</b>\nИстория постов останется."
+                         + (f"\nУже опубликованные посты ({live}) всё равно будут удалены по таймеру." if live else ""),
+                   [[("✅ Да", f"ad_camp_del2:{i}")], [("◀️ Отмена", f"ad_camp_v:{i}")]])
+
+@_ad_route("ad_camp_del2")
+async def _ad_camp_del2(call, a):
+    i = int(a[0])
+    for t in ("ad_campaign_chats", "ad_campaign_accounts"):
+        _ad_exec(f"DELETE FROM {t} WHERE campaign_id=?", (i,))
+    _ad_exec("DELETE FROM ad_templates WHERE campaign_id=?", (i,))
+    _ad_exec("DELETE FROM ad_campaigns WHERE id=?", (i,))
+    ad_log_add("campaign", f"Кампания №{i} удалена")
+    await _ad_camps(call, [])
+
+@_ad_route("ad_camp_now")
+async def _ad_camp_now(call, a):
+    i = int(a[0])
+    k = _ad_one("SELECT * FROM ad_campaigns WHERE id=?", (i,))
+    chats = _ad_all("SELECT c.* FROM ad_chats c JOIN ad_campaign_chats cc ON cc.chat_id=c.id WHERE cc.campaign_id=? AND c.enabled=1", (i,))
+    random.shuffle(chats)
+    await safe_edit(call, "⏳ Публикую…", None)
+    results = []
+    for c in chats:
+        r = await ad_try_chat(call.bot, k, c, force=True)
+        results.append(f"{html.escape(c.get('title') or c['link'])}: {r}")
+        if r == "posted": break
+    human = {"posted": "✅ опубликовано", "no_account": "нет доступного аккаунта", "no_text": "нет свободных текстов"}
+    lines = [x.rsplit(": ", 1)[0] + ": " + human.get(x.rsplit(": ", 1)[1], x.rsplit(": ", 1)[1]) for x in results] or ["нет включённых чатов"]
+    await _ad_show(call, "🚀 <b>Результат</b>\n\n" + "\n".join(lines) +
+                   "\n\nРучная публикация игнорирует окно часов и паузу в чате, но не лимиты аккаунта.",
+                   [[("◀️ К кампании", f"ad_camp_v:{i}")]])
+
+def _ad_toggle_rows(items: list[dict], chosen: set, cb_fmt: str, label) -> list:
+    return [[(("✅ " if it["id"] in chosen else "⬜ ") + label(it), cb_fmt.format(id=it["id"]))] for it in items]
+
+@_ad_route("ad_kc")
+async def _ad_camp_chats(call, a):
+    i, page = int(a[0]), int(a[1])
+    chats = _ad_all("SELECT * FROM ad_chats ORDER BY id")
+    chosen = {r["chat_id"] for r in _ad_all("SELECT chat_id FROM ad_campaign_chats WHERE campaign_id=?", (i,))}
+    chunk, pages = _ad_page(chats, page)
+    rows = _ad_toggle_rows(chunk, chosen, f"ad_kct:{i}:{page}:" + "{id}", lambda c: (c.get("title") or c["link"])[:50])
+    nav = _ad_nav(f"ad_kc:{i}:" + "{p}", page, pages)
+    if nav: rows.append(nav)
+    rows.append([("➕ Добавить чаты", f"ad_chat_add:{i}")])
+    rows.append([("✅ Выбрать все", f"ad_kcall:{i}:1"), ("⬜ Снять все", f"ad_kcall:{i}:0")])
+    rows.append([("◀️ К кампании", f"ad_camp_v:{i}")])
+    await _ad_show(call, f"💬 <b>Чаты кампании</b>\nВыбрано: <b>{len(chosen)}</b> из {len(chats)}\n"
+                         "Нажмите на чат, чтобы добавить или убрать.", rows)
+
+@_ad_route("ad_kct")
+async def _ad_camp_chat_toggle(call, a):
+    i, page, c = int(a[0]), int(a[1]), int(a[2])
+    if _ad_one("SELECT 1 FROM ad_campaign_chats WHERE campaign_id=? AND chat_id=?", (i, c)):
+        _ad_exec("DELETE FROM ad_campaign_chats WHERE campaign_id=? AND chat_id=?", (i, c))
+    else:
+        _ad_exec("INSERT OR IGNORE INTO ad_campaign_chats VALUES(?,?)", (i, c))
+    await _ad_camp_chats(call, [str(i), str(page)])
+
+@_ad_route("ad_kcall")
+async def _ad_camp_chat_all(call, a):
+    i, on = int(a[0]), a[1] == "1"
+    _ad_exec("DELETE FROM ad_campaign_chats WHERE campaign_id=?", (i,))
+    if on: _ad_exec("INSERT OR IGNORE INTO ad_campaign_chats SELECT ?, id FROM ad_chats", (i,))
+    await _ad_camp_chats(call, [str(i), "0"])
+
+@_ad_route("ad_ka")
+async def _ad_camp_accs(call, a):
+    i = int(a[0])
+    accs = _ad_all("SELECT * FROM ad_accounts ORDER BY id")
+    chosen = {r["account_id"] for r in _ad_all("SELECT account_id FROM ad_campaign_accounts WHERE campaign_id=?", (i,))}
+    rows = _ad_toggle_rows(accs, chosen, f"ad_kat:{i}:" + "{id}", lambda x: f"{_ad_icon_acc(x)} {ad_acc_label(x)}")
+    rows.append([("◀️ К кампании", f"ad_camp_v:{i}")])
+    await _ad_show(call, f"👤 <b>Аккаунты кампании</b>\nВыбрано: <b>{len(chosen)}</b> из {len(accs)}\n"
+                         "Кампания публикует только с отмеченных аккаунтов." +
+                   ("\n\nАккаунтов нет — добавьте их в разделе «Аккаунты»." if not accs else ""), rows)
+
+@_ad_route("ad_kat")
+async def _ad_camp_acc_toggle(call, a):
+    i, x = int(a[0]), int(a[1])
+    if _ad_one("SELECT 1 FROM ad_campaign_accounts WHERE campaign_id=? AND account_id=?", (i, x)):
+        _ad_exec("DELETE FROM ad_campaign_accounts WHERE campaign_id=? AND account_id=?", (i, x))
+    else:
+        _ad_exec("INSERT OR IGNORE INTO ad_campaign_accounts VALUES(?,?)", (i, x))
+    await _ad_camp_accs(call, [str(i)])
+
+
+# ── Тексты (шаблоны) ───────────────────────────────────────────
+@_ad_route("ad_tpls")
+async def _ad_tpls(call, a):
+    i, page = int(a[0]), int(a[1])
+    tpls = _ad_all("SELECT * FROM ad_templates WHERE campaign_id=? ORDER BY id", (i,))
+    chunk, pages = _ad_page(tpls, page, 8)
+    rows = [[(f"{'✅' if t['enabled'] else '⬜'} №{t['id']} {t.get('title') or ad_plain(t['text'], 28)}"[:60], f"ad_tpl_v:{t['id']}")] for t in chunk]
+    nav = _ad_nav(f"ad_tpls:{i}:" + "{p}", page, pages)
+    if nav: rows.append(nav)
+    rows.append([("➕ Добавить тексты", f"ad_tpl_add:{i}")])
+    rows.append([("◀️ К кампании", f"ad_camp_v:{i}")])
+    en = sum(t["enabled"] for t in tpls)
+    await _ad_show(call, f"📝 <b>Тексты кампании</b>\nВсего: {len(tpls)}, включено: {en}\n\n"
+                         "Тексты выбираются случайно и не повторяются в чате "
+                         f"{_ad_fmt(ad_val('no_repeat_days', _ad_cfg(_ad_one('SELECT cfg FROM ad_campaigns WHERE id=?', (i,)))))} дн. "
+                         "(настраивается в «Лимиты»). Чем больше текстов, тем реже придётся ждать.", rows)
+
+@_ad_route("ad_tpl_add")
+async def _ad_tpl_add(call, a):
+    i = int(a[0])
+    _admin_pending[call.from_user.id] = f"ad:tpl_add:{i}"
+    await _ad_show(call,
+        "➕ <b>Добавление текстов</b>\n\nПрисылайте тексты — каждое сообщение станет отдельным текстом. "
+        "Можно прислать сразу несколько в одном сообщении, разделив строкой <code>---</code>.\n"
+        "Форматирование (жирный, ссылки, курсив) сохраняется.\n\n"
+        "Переменные: <code>{bot_link}</code> — ссылка на бота с меткой источника, <code>{chat}</code>, "
+        "<code>{account}</code>, <code>{campaign}</code> и ваши (🔤 Переменные).\n\n"
+        "Когда закончите — нажмите «Готово».",
+        [[("✅ Готово", f"ad_tpls:{i}:0")]])
+
+def _ad_tpl_text(t: dict) -> str:
+    n = _ad_one("SELECT COUNT(*) c, MAX(posted_at) m FROM ad_posts WHERE template_id=?", (t["id"],))
+    body = t["text"]
+    cut = body if len(body) < 1800 else body[:1800] + "…"
+    return (f"📝 <b>Текст №{t['id']}</b> {'✅ включён' if t['enabled'] else '⬜ выключен'}\n"
+            f"Публикаций: {n['c']}" + (f" · последняя {fmt_msk(n['m'], '%d.%m %H:%M')}" if n["m"] else "") +
+            f" · длина {len(body)}\n\n" + cut)
+
+@_ad_route("ad_tpl_v")
+async def _ad_tpl_view(call, a):
+    t = _ad_one("SELECT * FROM ad_templates WHERE id=?", (int(a[0]),))
+    if not t: return "Текст не найден"
+    i = t["id"]
+    rows = [
+        [("⬜ Выключить" if t["enabled"] else "✅ Включить", f"ad_tpl_tgl:{i}"), ("👁 Предпросмотр", f"ad_tpl_prev:{i}")],
+        [("✏️ Изменить", f"ad_tpl_edit:{i}"), ("📄 Копия", f"ad_tpl_copy:{i}")],
+        [("🗑 Удалить", f"ad_tpl_del:{i}")],
+        [("◀️ Тексты", f"ad_tpls:{t['campaign_id']}:0")],
+    ]
+    try:
+        await _ad_show(call, _ad_tpl_text(t), rows)
+    except Exception:
+        await _ad_show(call, html.escape(_ad_tpl_text(t)), rows)
+
+@_ad_route("ad_tpl_tgl")
+async def _ad_tpl_toggle(call, a):
+    _ad_exec("UPDATE ad_templates SET enabled=1-enabled WHERE id=?", (int(a[0]),))
+    await _ad_tpl_view(call, a)
+
+@_ad_route("ad_tpl_copy")
+async def _ad_tpl_copy(call, a):
+    t = _ad_one("SELECT * FROM ad_templates WHERE id=?", (int(a[0]),))
+    nid = _ad_exec("INSERT INTO ad_templates(campaign_id,title,text,enabled) VALUES(?,?,?,?)",
+                   (t["campaign_id"], t.get("title"), t["text"], t["enabled"]))
+    ad_log_add("template", f"Текст №{t['id']} скопирован в №{nid}", camp=t["campaign_id"])
+    await _ad_tpl_view(call, [str(nid)])
+    return "Копия создана"
+
+@_ad_route("ad_tpl_edit")
+async def _ad_tpl_edit(call, a):
+    i = int(a[0])
+    _admin_pending[call.from_user.id] = f"ad:tpl_edit:{i}"
+    await _ad_show(call, "✏️ Пришлите новый текст (заменит старый, форматирование сохранится):",
+                   [[("◀️ Отмена", f"ad_tpl_v:{i}")]])
+
+@_ad_route("ad_tpl_del")
+async def _ad_tpl_del(call, a):
+    i = int(a[0])
+    await _ad_show(call, "🗑 Удалить этот текст?", [[("✅ Да", f"ad_tpl_del2:{i}")], [("◀️ Отмена", f"ad_tpl_v:{i}")]])
+
+@_ad_route("ad_tpl_del2")
+async def _ad_tpl_del2(call, a):
+    t = _ad_one("SELECT * FROM ad_templates WHERE id=?", (int(a[0]),))
+    if t:
+        _ad_exec("DELETE FROM ad_templates WHERE id=?", (t["id"],))
+        ad_log_add("template", f"Текст №{t['id']} удалён", camp=t["campaign_id"])
+        await _ad_tpls(call, [str(t["campaign_id"]), "0"])
+
+@_ad_route("ad_tpl_prev")
+async def _ad_tpl_preview(call, a):
+    t = _ad_one("SELECT * FROM ad_templates WHERE id=?", (int(a[0]),))
+    k = _ad_one("SELECT * FROM ad_campaigns WHERE id=?", (t["campaign_id"],))
+    chat = _ad_one("SELECT c.* FROM ad_chats c JOIN ad_campaign_chats cc ON cc.chat_id=c.id WHERE cc.campaign_id=? LIMIT 1", (k["id"],))
+    acc = _ad_one("SELECT x.* FROM ad_accounts x JOIN ad_campaign_accounts ca ON ca.account_id=x.id WHERE ca.campaign_id=? LIMIT 1", (k["id"],))
+    if not _ad_state["bot_username"]:
+        try: _ad_state["bot_username"] = (await call.bot.get_me()).username or ""
+        except Exception: pass
+    out = ad_render(t["text"], k, chat, acc, t)
+    try:
+        await call.message.answer("👁 <b>Так увидят в чате:</b>\n\n" + out, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        await call.message.answer("⚠️ Telegram не принял разметку этого текста: " + html.escape(str(e)[:150]) +
+                                  "\n\nТекст как есть:\n" + html.escape(out))
+
+
+# ── История постов ─────────────────────────────────────────────
+def _ad_posts_filter(kind: str, oid: int) -> tuple[str, tuple]:
+    col = {"camp": "campaign_id", "chat": "chat_id", "acc": "account_id"}.get(kind)
+    return (f"WHERE {col}=?", (oid,)) if col else ("", ())
+
+@_ad_route("ad_posts")
+async def _ad_posts(call, a):
+    kind, oid, page = a[0], int(a[1]), int(a[2])
+    w, args = _ad_posts_filter(kind, oid)
+    total = _ad_one(f"SELECT COUNT(*) c FROM ad_posts {w}", args)["c"]
+    pages = max(1, (total + 9) // 10); page = max(0, min(page, pages - 1))
+    rows_db = _ad_all(f"SELECT p.*, c.title ct, c.link cl, a.username au, a.name an FROM ad_posts p "
+                      f"LEFT JOIN ad_chats c ON c.id=p.chat_id LEFT JOIN ad_accounts a ON a.id=p.account_id "
+                      f"{w.replace('WHERE ', 'WHERE p.') if w else ''} ORDER BY p.id DESC LIMIT 10 OFFSET ?", args + (page * 10,))
+    st_ic = {"posted": "🟢", "deleted": "🗑", "delete_failed": "⚠️"}
+    lines = []
+    for p in rows_db:
+        extra = ""
+        if p["status"] == "posted" and p["delete_at"]: extra = f" · удалится {fmt_msk(p['delete_at'], '%d.%m %H:%M')}"
+        if p["status"] == "deleted": extra = f" · удалён {fmt_msk(p['deleted_at'], '%d.%m %H:%M')}"
+        lines.append(f"{st_ic.get(p['status'], '•')} <b>№{p['id']}</b> {fmt_msk(p['posted_at'], '%d.%m %H:%M')} · "
+                     f"{html.escape((p['ct'] or p['cl'] or '?')[:28])} · "
+                     f"{html.escape(('@' + p['au']) if p['au'] else (p['an'] or '?'))} · текст №{p['template_id']}{extra}")
+    back = {"camp": f"ad_camp_v:{oid}", "chat": f"ad_chat_v:{oid}", "acc": f"ad_acc_v:{oid}"}.get(kind, "ad_menu")
+    live = _ad_one(f"SELECT COUNT(*) c FROM ad_posts {w + ' AND' if w else 'WHERE'} status='posted'", args)["c"]
+    rows = []
+    nav = _ad_nav(f"ad_posts:{kind}:{oid}:" + "{p}", page, pages)
+    if nav: rows.append(nav)
+    if live: rows.append([(f"🗑 Удалить все висящие сейчас ({live})", f"ad_delall:{kind}:{oid}")])
+    rows.append([("◀️ Назад", back)])
+    await _ad_show(call, f"📋 <b>Опубликованные посты</b> ({total})\n\n" + ("\n".join(lines) or "Пока ничего."), rows)
+
+@_ad_route("ad_delall")
+async def _ad_delall(call, a):
+    kind, oid = a[0], int(a[1])
+    w, args = _ad_posts_filter(kind, oid)
+    n = _ad_one(f"SELECT COUNT(*) c FROM ad_posts {w + ' AND' if w else 'WHERE'} status='posted'", args)["c"]
+    await _ad_show(call, f"🗑 Удалить прямо сейчас все висящие посты ({n})?\nУдаление идёт с паузой, это займёт время.",
+                   [[("✅ Да, удалить", f"ad_delall2:{kind}:{oid}")], [("◀️ Отмена", f"ad_posts:{kind}:{oid}:0")]])
+
+@_ad_route("ad_delall2")
+async def _ad_delall2(call, a):
+    kind, oid = a[0], int(a[1])
+    w, args = _ad_posts_filter(kind, oid)
+    _ad_exec(f"UPDATE ad_posts SET delete_at=?, del_attempts=0 {w + ' AND' if w else 'WHERE'} status='posted'",
+             (_ad_ts(_ad_now()),) + args)
+    ad_log_add("delete", "Запущено ручное удаление всех висящих постов")
+    asyncio.create_task(ad_delete_due(call.bot, limit=500))
+    await _ad_posts(call, [kind, str(oid), "0"])
+    return "Удаление запущено"
+
+
+# ── Журнал ─────────────────────────────────────────────────────
+_AD_LOG_FILTERS = {
+    "all": ("Все", ""), "err": ("Ошибки", "AND level IN ('warn','error')"),
+    "post": ("Посты", "AND kind IN ('post','delete')"),
+    "set": ("Настройки", "AND kind IN ('account','chat','campaign','template','setting')"),
+    "start": ("Старты", "AND kind='start'"),
+}
+_AD_LOG_ICON = {"info": "ℹ️", "warn": "⚠️", "error": "🔴"}
+
+def _ad_log_lines(rows: list[dict]) -> str:
+    return "\n".join(f"{_AD_LOG_ICON.get(r['level'], '•')} <code>{fmt_msk(r['ts'], '%d.%m %H:%M')}</code> {html.escape(r['text'][:220])}"
+                     for r in rows) or "Пусто."
+
+@_ad_route("ad_log")
+async def _ad_log_view(call, a):
+    flt, page = a[0], int(a[1])
+    cond = _AD_LOG_FILTERS.get(flt, _AD_LOG_FILTERS["all"])[1]
+    total = _ad_one(f"SELECT COUNT(*) c FROM ad_log WHERE 1=1 {cond}")["c"]
+    pages = max(1, (total + 11) // 12); page = max(0, min(page, pages - 1))
+    rows_db = _ad_all(f"SELECT * FROM ad_log WHERE 1=1 {cond} ORDER BY id DESC LIMIT 12 OFFSET ?", (page * 12,))
+    rows = [[((("• " if k == flt else "") + v[0]), f"ad_log:{k}:0") for k, v in list(_AD_LOG_FILTERS.items())[:3]],
+            [((("• " if k == flt else "") + v[0]), f"ad_log:{k}:0") for k, v in list(_AD_LOG_FILTERS.items())[3:]]]
+    nav = _ad_nav(f"ad_log:{flt}:" + "{p}", page, pages)
+    if nav: rows.append(nav)
+    rows.append([("🔎 Поиск", "ad_logq"), ("🧹 Очистить старше 30 дн.", "ad_logclr")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    await _ad_show(call, f"📜 <b>Журнал</b> — {_AD_LOG_FILTERS.get(flt, _AD_LOG_FILTERS['all'])[0]} ({total})\n\n" + _ad_log_lines(rows_db), rows)
+
+@_ad_route("ad_logq")
+async def _ad_log_search_prompt(call, a):
+    _admin_pending[call.from_user.id] = "ad:log_search"
+    await _ad_show(call, "🔎 Введите слово или фразу для поиска по журналу:", [[("◀️ Отмена", "ad_log:all:0")]])
+
+@_ad_route("ad_logclr")
+async def _ad_log_clear(call, a):
+    _ad_exec("DELETE FROM ad_log WHERE ts<?", (_ad_ts(_ad_now() - timedelta(days=30)),))
+    await _ad_log_view(call, ["all", "0"])
+    return "Старые записи удалены"
+
+
+# ── Настройки / лимиты ─────────────────────────────────────────
+def _ad_cfg_back(scope: str, oid: int) -> str:
+    return {"g": "ad_menu", "a": f"ad_acc_v:{oid}", "c": f"ad_chat_v:{oid}", "k": f"ad_camp_v:{oid}"}[scope]
+
+@_ad_route("ad_cfg")
+async def _ad_cfg_screen(call, a):
+    scope, oid = a[0], int(a[1])
+    cfg = {} if scope == "g" else _ad_cfg(_ad_one(f"SELECT cfg FROM {AD_SCOPE_TABLE[scope]} WHERE id=?", (oid,)))
+    rows = []
+    for key, (short, hint, mn, mx, scopes, dflt) in AD_FIELDS.items():
+        if scope not in scopes: continue
+        if scope == "g":
+            custom = _db.get_setting(f"ad_g_{key}", "") != ""
+            val = f"{_ad_fmt(_ad_global(key))}{'' if custom else ' (умолч.)'}"
+        elif cfg.get(key) is not None:
+            val = _ad_fmt(cfg[key])
+        else:
+            val = f"({_ad_fmt(_ad_global(key))})"
+        rows.append([(f"{short}: {val}", f"ad_cf:{scope}:{oid}:{key}")])
+    rows.append([("◀️ Назад", _ad_cfg_back(scope, oid))])
+    legend = ("Значения в скобках берутся из общих настроек. Нажмите на параметр, чтобы изменить; "
+              "«-» вернёт значение по умолчанию.\n"
+              "Приоритет: чат → кампания → аккаунт → общие.") if scope != "g" else \
+             "Эти значения действуют везде, где не заданы свои (на аккаунте, чате или кампании)."
+    await _ad_show(call, f"⚙️ <b>{AD_SCOPE_NAME[scope]}: лимиты и параметры</b>\n\n{legend}", rows)
+
+@_ad_route("ad_cf")
+async def _ad_cfg_field(call, a):
+    scope, oid, key = a[0], int(a[1]), a[2]
+    short, hint, mn, mx, scopes, dflt = AD_FIELDS[key]
+    _admin_pending[call.from_user.id] = f"ad:set:{scope}:{oid}:{key}"
+    await _ad_show(call, f"⚙️ <b>{short}</b>\n\n{hint}\n\nДопустимо: от {_ad_fmt(mn)} до {_ad_fmt(mx)}. "
+                         f"По умолчанию: {_ad_fmt(dflt)}.\n\nВведите число (или «-», чтобы сбросить):",
+                   [[("◀️ Отмена", f"ad_cfg:{scope}:{oid}")]])
+
+
+# ── Переменные ─────────────────────────────────────────────────
+_AD_RESERVED = {"bot_link", "bot_username", "chat", "campaign", "account"}
+
+@_ad_route("ad_vars")
+async def _ad_vars_screen(call, a):
+    v = ad_vars()
+    lines = "\n".join(f"<code>{{{html.escape(k)}}}</code> = {html.escape(val[:60])}" for k, val in v.items()) or "Своих переменных пока нет."
+    rows = [[(f"🗑 {k}", f"ad_vardel:{k}")] for k in list(v)[:20]]
+    rows.append([("➕ Добавить", "ad_varadd")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    await _ad_show(call,
+        "🔤 <b>Переменные</b>\n\nВстроенные: <code>{bot_link}</code> (ссылка на бота с меткой источника — "
+        "по ней считается статистика), <code>{bot_username}</code>, <code>{chat}</code>, <code>{account}</code>, "
+        f"<code>{{campaign}}</code>.\n\nВаши:\n{lines}", rows)
+
+@_ad_route("ad_varadd")
+async def _ad_var_add(call, a):
+    _admin_pending[call.from_user.id] = "ad:var_add"
+    await _ad_show(call, "➕ Пришлите переменные, по одной на строку в виде <code>имя=значение</code>\n"
+                         "Имя: латиница, цифры, подчёркивание. Пример: <code>channel=@mychannel</code>",
+                   [[("◀️ Отмена", "ad_vars")]])
+
+@_ad_route("ad_vardel")
+async def _ad_var_del(call, a):
+    v = ad_vars(); v.pop(a[0], None); ad_set_vars(v)
+    await _ad_vars_screen(call, [])
+
+
+# ── Статистика ─────────────────────────────────────────────────
+_AD_DIMS = {"camp": ("campaign_id", "Кампании", "ad_campaigns", "name"),
+            "acc": ("account_id", "Аккаунты", "ad_accounts", None),
+            "chat": ("chat_id", "Чаты", "ad_chats", None),
+            "tpl": ("template_id", "Тексты", "ad_templates", None)}
+_AD_PERIODS = {"1": "24 ч", "7": "7 дн.", "30": "30 дн.", "0": "всё время"}
+
+def _ad_stat_name(dim: str, key) -> str:
+    if key is None: return "—"
+    col, _, table, namecol = _AD_DIMS[dim]
+    r = _ad_one(f"SELECT * FROM {table} WHERE id=?", (key,))
+    if not r: return f"№{key} (удалён)"
+    if dim == "camp": return r["name"]
+    if dim == "acc": return ad_acc_label(r)
+    if dim == "chat": return r.get("title") or r["link"]
+    return f"№{r['id']} {ad_plain(r['text'], 24)}"
+
+@_ad_route("ad_stats")
+async def _ad_stats(call, a):
+    dim, per = a[0], a[1]
+    col = _AD_DIMS[dim][0]
+    since = _ad_ts(_ad_now() - timedelta(days=int(per))) if per != "0" else "0000"
+    posts = {r["k"]: r["c"] for r in _ad_all(f"SELECT {col} k, COUNT(*) c FROM ad_posts WHERE posted_at>=? GROUP BY {col}", (since,))}
+    starts = {r["k"]: (r["c"], r["n"]) for r in _ad_all(f"SELECT {col} k, COUNT(*) c, COALESCE(SUM(is_new),0) n FROM ad_starts WHERE ts>=? GROUP BY {col}", (since,))}
+    paid = {r["k"]: r["c"] for r in _ad_all(
+        f"SELECT s.{col} k, COUNT(DISTINCT s.tg_id) c FROM ad_starts s JOIN clients cl ON cl.tg_id=s.tg_id "
+        f"JOIN payments p ON p.client_id=cl.id WHERE s.is_new=1 AND p.status='confirmed' AND s.ts>=? GROUP BY s.{col}", (since,))}
+    tp = sum(posts.values()); ts_ = sum(v[0] for v in starts.values()); tn = sum(v[1] for v in starts.values()); tpd = sum(paid.values())
+    def pct(x, y): return f"{x * 100 / y:.1f}%" if y else "—"
+    keys = sorted(set(posts) | set(starts), key=lambda k: -(starts.get(k, (0, 0))[1] * 1000 + posts.get(k, 0)))
+    lines = []
+    for k in keys[:15]:
+        p = posts.get(k, 0); s, n = starts.get(k, (0, 0)); pd = paid.get(k, 0)
+        lines.append(f"<b>{html.escape(_ad_stat_name(dim, k))[:40]}</b>\n   постов {p} → стартов {s} (новых {n}) → оплат {pd} · конв. старт/пост {pct(s, p)}")
+    rows = [[((("• " if d == dim else "") + v[1]), f"ad_stats:{d}:{per}") for d, v in list(_AD_DIMS.items())[:2]],
+            [((("• " if d == dim else "") + v[1]), f"ad_stats:{d}:{per}") for d, v in list(_AD_DIMS.items())[2:]],
+            [((("• " if p_ == per else "") + n), f"ad_stats:{dim}:{p_}") for p_, n in _AD_PERIODS.items()],
+            [("◀️ Реклама", "ad_menu")]]
+    head = (f"📊 <b>Статистика — {_AD_DIMS[dim][1]}</b>, период: {_AD_PERIODS[per]}\n\n"
+            f"Воронка: постов <b>{tp}</b> → стартов бота <b>{ts_}</b> ({pct(ts_, tp)}) → новых пользователей <b>{tn}</b> "
+            f"→ оплат <b>{tpd}</b> ({pct(tpd, tn)})\n\n")
+    note = ("\n\n<i>«Старт» — нажатие Start по рекламной ссылке {bot_link} (Telegram не показывает клики до этого). "
+            "Оплаты считаются у новых пользователей, пришедших по ссылке.</i>").replace("{bot_link}", "")
+    await _ad_show(call, head + ("\n".join(lines) or "Данных за период нет.") + note, rows)
+
+
+# ── Ввод текста админом (вызывается из admin_text_handler) ─────
+async def ad_text_input(msg: "Message", action: str) -> None:
+    uid = msg.from_user.id
+    p = action.split(":")           # ["ad", "<cmd>", ...]
+    cmd = p[1]
+    text = (msg.text or "").strip()
+
+    if cmd == "acc_phone":
+        phone = re.sub(r"[^\d+]", "", text)
+        phone = phone if phone.startswith("+") else "+" + phone
+        if len(phone) < 8:
+            _admin_pending[uid] = "ad:acc_phone"
+            await safe_answer(msg, "❌ Похоже на неверный номер. Введите ещё раз (+79991234567):", kb_back("ad_acc")); return
+        old = _ad_auth.pop(uid, None)
+        if old:
+            try: await old["client"].disconnect()
+            except Exception: pass
+        cl = TelegramClient(StringSession(), API_ID, API_HASH)
+        try:
+            await cl.connect()
+            res = await cl.send_code_request(phone)
+        except Exception as e:
+            try: await cl.disconnect()
+            except Exception: pass
+            _admin_pending[uid] = "ad:acc_phone"
+            await safe_answer(msg, f"❌ Ошибка: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:150])}</code>\n\nВведите номер снова:", kb_back("ad_acc")); return
+        _ad_auth[uid] = {"client": cl, "phone": phone, "hash": res.phone_code_hash}
+        _admin_pending[uid] = "ad:acc_code"
+        await safe_answer(msg, f"📱 Код отправлен на <code>{phone}</code>.\nВведите его <b>с разделителями</b>, например <code>1-2-3-4-5</code>:", kb_back("ad_acc"))
+        return
+
+    if cmd == "acc_session":
+        sess = re.sub(r"\s+", "", text)
+        try: await msg.delete()
+        except Exception: pass
+        back = kb_back("ad_acc")
+        if len(sess) < 100 or not re.fullmatch(r"[A-Za-z0-9_\-=+/]+", sess):
+            _admin_pending[uid] = "ad:acc_session"
+            await safe_answer(msg, "❌ Это не похоже на строку сессии Telethon. Пришлите её ещё раз целиком "
+                                   "(сессии других библиотек, например Pyrogram, не подойдут):", back); return
+        if sess == STRING_SESSION or sess == _db.get_setting("string_session", ""):
+            await safe_answer(msg, "❌ Это сессия основного аккаунта мониторинга. Для рекламы нужен отдельный аккаунт.", back); return
+        cl = TelegramClient(StringSession(sess), API_ID, API_HASH)
+        try:
+            await cl.connect()
+            if not await cl.is_user_authorized():
+                await cl.disconnect()
+                _admin_pending[uid] = "ad:acc_session"
+                await safe_answer(msg, "❌ Сессия недействительна или отозвана. Пришлите другую:", back); return
+            me = await cl.get_me()
+        except Exception as e:
+            try: await cl.disconnect()
+            except Exception: pass
+            _admin_pending[uid] = "ad:acc_session"
+            await safe_answer(msg, f"❌ Не удалось войти: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:150])}</code>\n\nПришлите другую сессию:", back); return
+        phone = ("+" + me.phone) if getattr(me, "phone", None) else "—"
+        await ad_finish_auth(msg, {"client": cl, "phone": phone})
+        return
+
+    if cmd == "acc_code":
+        st = _ad_auth.get(uid)
+        if not st:
+            await safe_answer(msg, "Сессия входа истекла, начните заново.", kb_back("ad_acc")); return
+        code = re.sub(r"\D", "", text)
+        try: await msg.delete()
+        except Exception: pass
+        try:
+            await st["client"].sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
+            await ad_finish_auth(msg, st)
+        except SessionPasswordNeededError:
+            _admin_pending[uid] = "ad:acc_2fa"
+            await safe_answer(msg, "🔐 Введите пароль 2FA (сообщение с паролем будет удалено):")
+        except PhoneCodeInvalidError:
+            _admin_pending[uid] = "ad:acc_code"
+            await safe_answer(msg, "❌ Неверный код. Введите ещё раз:")
+        except PhoneCodeExpiredError:
+            _admin_pending[uid] = "ad:acc_phone"
+            await safe_answer(msg, "❌ Код устарел. Введите номер снова:")
+        except Exception as e:
+            await safe_answer(msg, f"❌ Ошибка: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:150])}</code>", kb_back("ad_acc"))
+        return
+
+    if cmd == "acc_2fa":
+        st = _ad_auth.get(uid)
+        if not st:
+            await safe_answer(msg, "Сессия входа истекла, начните заново.", kb_back("ad_acc")); return
+        try: await msg.delete()
+        except Exception: pass
+        try:
+            await st["client"].sign_in(password=text)
+            await ad_finish_auth(msg, st)
+        except PasswordHashInvalidError:
+            _admin_pending[uid] = "ad:acc_2fa"
+            await safe_answer(msg, "❌ Неверный пароль. Введите ещё раз:")
+        except Exception as e:
+            await safe_answer(msg, f"❌ Ошибка: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:150])}</code>", kb_back("ad_acc"))
+        return
+
+    if cmd == "chat_add":
+        camp = int(p[2]) if len(p) > 2 else 0
+        added, dup, bad = [], 0, []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line: continue
+            parsed = ad_parse_link(line)
+            if not parsed: bad.append(line[:40]); continue
+            link = ad_norm_link(*parsed)
+            ex = _ad_one("SELECT id FROM ad_chats WHERE lower(link)=lower(?)", (link,))
+            if ex:
+                dup += 1; cid = ex["id"]
+            else:
+                cid = _ad_exec("INSERT INTO ad_chats(link) VALUES(?)", (link,))
+                added.append(link)
+                ad_log_add("chat", f"Чат добавлен: {link}", chat=cid)
+            if camp: _ad_exec("INSERT OR IGNORE INTO ad_campaign_chats VALUES(?,?)", (camp, cid))
+        out = f"✅ Добавлено: <b>{len(added)}</b>" + (f"\nУже были: {dup}" if dup else "") + \
+              (("\n❌ Не распознаны:\n" + "\n".join(html.escape(b) for b in bad)) if bad else "")
+        out += "\n\nДальше: «💬 Чаты» → чат → «🔎 Проверить доступ» (для приватных ссылок аккаунт сначала должен вступить)."
+        await safe_answer(msg, out, mkb([[("💬 Чаты", "ad_chats")]] + ([[("◀️ К кампании", f"ad_camp_v:{camp}")]] if camp else [])))
+        return
+
+    if cmd == "camp_add":
+        if not text:
+            _admin_pending[uid] = "ad:camp_add"; await safe_answer(msg, "Введите название:"); return
+        cid = _ad_exec("INSERT INTO ad_campaigns(name) VALUES(?)", (text[:60],))
+        ad_log_add("campaign", f"Кампания создана: {text[:60]}", camp=cid)
+        await safe_answer(msg, f"✅ Кампания «{html.escape(text[:60])}» создана. Выключена, пока не добавите тексты, чаты и аккаунты.",
+                          mkb([[("📣 Открыть кампанию", f"ad_camp_v:{cid}")]]))
+        return
+
+    if cmd == "camp_ren":
+        i = int(p[2])
+        if text: _ad_exec("UPDATE ad_campaigns SET name=? WHERE id=?", (text[:60], i))
+        await safe_answer(msg, "✅ Название обновлено", mkb([[("📣 К кампании", f"ad_camp_v:{i}")]]))
+        return
+
+    if cmd in ("tpl_add", "tpl_edit"):
+        body = (msg.html_text or "").strip()
+        if not body:
+            _admin_pending[uid] = action
+            await safe_answer(msg, "Пришлите текст сообщением (без вложений)."); return
+        if cmd == "tpl_edit":
+            i = int(p[2])
+            if len(body) > 4000:
+                _admin_pending[uid] = action
+                await safe_answer(msg, "❌ Текст длиннее 4000 символов — Telegram не позволит его отправить. Сократите."); return
+            t = _ad_one("SELECT * FROM ad_templates WHERE id=?", (i,))
+            _ad_exec("UPDATE ad_templates SET text=?, title=NULL WHERE id=?", (body, i))
+            ad_log_add("template", f"Текст №{i} изменён", camp=t["campaign_id"] if t else None)
+            await safe_answer(msg, "✅ Текст обновлён", mkb([[("📝 К тексту", f"ad_tpl_v:{i}")]]))
+            return
+        camp = int(p[2])
+        parts = [x.strip() for x in re.split(r"\n\s*---+\s*\n", body) if x.strip()]
+        ok, long_ = 0, 0
+        for part in parts:
+            if len(part) > 4000: long_ += 1; continue
+            _ad_exec("INSERT INTO ad_templates(campaign_id,title,text) VALUES(?,?,?)", (camp, ad_plain(part, 40), part))
+            ok += 1
+        if ok: ad_log_add("template", f"Добавлено текстов: {ok}", camp=camp)
+        total = _ad_one("SELECT COUNT(*) c FROM ad_templates WHERE campaign_id=?", (camp,))["c"]
+        _admin_pending[uid] = action                      # режим «много текстов подряд»
+        await safe_answer(msg, f"✅ Добавлено: <b>{ok}</b> (всего в кампании {total})"
+                               + (f"\n⚠️ Пропущено слишком длинных (>4000 символов): {long_}" if long_ else "")
+                               + "\nПрисылайте следующие или нажмите «Готово».",
+                          mkb([[("✅ Готово", f"ad_tpls:{camp}:0")]]))
+        return
+
+    if cmd == "set":
+        scope, oid, key = p[2], int(p[3]), p[4]
+        short, hint, mn, mx, scopes, dflt = AD_FIELDS[key]
+        back = mkb([[("⚙️ К настройкам", f"ad_cfg:{scope}:{oid}")]])
+        if text in ("-", "—", "сброс"):
+            _ad_set_cfg(scope, oid, key, None)
+            ad_log_add("setting", f"{AD_SCOPE_NAME[scope]} №{oid}: «{short}» сброшено")
+            await safe_answer(msg, f"✅ «{short}» сброшено на значение по умолчанию.", back); return
+        try: v = float(text.replace(",", "."))
+        except ValueError:
+            _admin_pending[uid] = action
+            await safe_answer(msg, "❌ Нужно число. Попробуйте ещё раз (или «-» для сброса):", back); return
+        if not (mn <= v <= mx):
+            _admin_pending[uid] = action
+            await safe_answer(msg, f"❌ Допустимо от {_ad_fmt(mn)} до {_ad_fmt(mx)}. Попробуйте ещё раз:", back); return
+        _ad_set_cfg(scope, oid, key, v)
+        ad_log_add("setting", f"{AD_SCOPE_NAME[scope]} №{oid}: «{short}» = {_ad_fmt(v)}")
+        await safe_answer(msg, f"✅ «{short}» = <b>{_ad_fmt(v)}</b>", back)
+        return
+
+    if cmd == "var_add":
+        v = ad_vars(); ok, bad = 0, []
+        for line in (msg.html_text or "").splitlines():
+            if not line.strip(): continue
+            name, sep, val = line.partition("=")
+            name = name.strip()
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name in _AD_RESERVED:
+                bad.append(line[:40]); continue
+            v[name] = val.strip(); ok += 1
+        ad_set_vars(v)
+        if ok: ad_log_add("setting", f"Добавлено переменных: {ok}")
+        await safe_answer(msg, f"✅ Сохранено: {ok}" + (("\n❌ Не распознаны (или имя занято):\n" + "\n".join(html.escape(b) for b in bad)) if bad else ""),
+                          mkb([[("🔤 Переменные", "ad_vars")]]))
+        return
+
+    if cmd == "log_search":
+        q = text
+        rows_db = _ad_all("SELECT * FROM ad_log WHERE text LIKE ? ORDER BY id DESC LIMIT 25", (f"%{q}%",))
+        await safe_answer(msg, f"🔎 <b>«{html.escape(q)}»</b> — найдено {len(rows_db)} (последние 25)\n\n" + _ad_log_lines(rows_db),
+                          mkb([[("📜 Журнал", "ad_log:all:0")]]))
+        return
+
+    await safe_answer(msg, "Не понял, что делать с этим сообщением.", kb_back("ad_menu"))
+
+
 async def main() -> None:
     global _db, _pipeline, _userbot
 
@@ -5250,7 +6972,7 @@ async def main() -> None:
     log.info("=" * 60)
 
     # БД
-    _db = Database(DB_PATH); _db.connect(); _db.init_tables()
+    _db = Database(DB_PATH); _db.connect(); _db.init_tables(); _ad_init_tables(_db)
 
     # Bot
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -5375,6 +7097,8 @@ async def main() -> None:
         _check_ai_health(bot),
         _safe_userbot_run(),
         _webhook_guard(),
+        ad_scheduler_loop(bot),
+        ad_cleanup_loop(bot),
     )
 
 if __name__ == "__main__":
