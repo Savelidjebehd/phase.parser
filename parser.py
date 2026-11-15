@@ -54,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-11-15 ads-2"
+BOT_VERSION    = "2026-11-15 ads-3"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -6073,6 +6073,47 @@ async def _ad_acc_add(call, a):
         "Сессия сохраняется в базе; пароль 2FA и коды не сохраняются.",
         [[("◀️ Отмена", "ad_acc")]])
 
+_AD_CODE_TYPES = {
+    "SentCodeTypeApp": "в приложение Telegram — откройте служебный чат «Telegram» (с галочкой) на устройстве, где этот аккаунт уже авторизован",
+    "SentCodeTypeSms": "по SMS на этот номер",
+    "SentCodeTypeCall": "голосовым звонком на этот номер",
+    "SentCodeTypeFlashCall": "звонком-сбросом (код — последние цифры входящего номера)",
+    "SentCodeTypeMissedCall": "пропущенным звонком (код — последние цифры входящего номера)",
+    "SentCodeTypeEmailCode": "на привязанную к аккаунту почту",
+    "CodeTypeSms": "по SMS", "CodeTypeCall": "голосовым звонком",
+    "CodeTypeFlashCall": "звонком-сбросом", "CodeTypeMissedCall": "пропущенным звонком",
+}
+
+def _ad_code_where(res) -> str:
+    t = type(getattr(res, "type", None)).__name__
+    out = "Куда отправлен код: " + _AD_CODE_TYPES.get(t, t)
+    nt = getattr(res, "next_type", None)
+    if nt is not None:
+        out += "\nПри повторной отправке Telegram может переключить способ: " + _AD_CODE_TYPES.get(type(nt).__name__, type(nt).__name__)
+    return out
+
+def _ad_code_rows() -> list:
+    return [[("📩 Код не пришёл — отправить повторно", "ad_acc_resend")], [("◀️ Отмена", "ad_acc")]]
+
+@_ad_route("ad_acc_resend")
+async def _ad_acc_resend(call, a):
+    uid = call.from_user.id
+    st = _ad_auth.get(uid)
+    if not st: return "Вход истёк, начните заново"
+    from telethon.tl.functions.auth import ResendCodeRequest
+    try:
+        res = await st["client"](ResendCodeRequest(st["phone"], st["hash"]))
+    except FloodWaitError as e:
+        return f"Telegram просит подождать {e.seconds} с"
+    except Exception as e:
+        await _ad_show(call, f"❌ Не удалось отправить повторно: <code>{html.escape(type(e).__name__)}</code>\n"
+                             "Начните заново: Аккаунты → Добавить по номеру.", [[("◀️ Аккаунты", "ad_acc")]])
+        return
+    st["hash"] = res.phone_code_hash
+    _admin_pending[uid] = "ad:acc_code"
+    await _ad_show(call, f"📱 Код отправлен повторно на <code>{html.escape(st['phone'])}</code>.\n{_ad_code_where(res)}\n\n"
+                         "Введите код <b>с разделителями</b>, например <code>1-2-3-4-5</code>:", _ad_code_rows())
+
 @_ad_route("ad_acc_sess")
 async def _ad_acc_sess(call, a):
     if not API_ID or not API_HASH:
@@ -6780,7 +6821,8 @@ async def ad_text_input(msg: "Message", action: str) -> None:
             await safe_answer(msg, f"❌ Ошибка: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:150])}</code>\n\nВведите номер снова:", kb_back("ad_acc")); return
         _ad_auth[uid] = {"client": cl, "phone": phone, "hash": res.phone_code_hash}
         _admin_pending[uid] = "ad:acc_code"
-        await safe_answer(msg, f"📱 Код отправлен на <code>{phone}</code>.\nВведите его <b>с разделителями</b>, например <code>1-2-3-4-5</code>:", kb_back("ad_acc"))
+        await safe_answer(msg, f"📱 Код отправлен на <code>{phone}</code>.\n{_ad_code_where(res)}\n\n"
+                               "Введите его <b>с разделителями</b>, например <code>1-2-3-4-5</code>:", mkb(_ad_code_rows()))
         return
 
     if cmd == "acc_session":
