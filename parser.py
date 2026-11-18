@@ -54,7 +54,7 @@ ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-11-15 ads-3"
+BOT_VERSION    = "2026-11-18 22:10"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
@@ -5320,6 +5320,9 @@ CREATE TABLE IF NOT EXISTS ad_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT (datetime('now')),
     level TEXT NOT NULL DEFAULT 'info', kind TEXT NOT NULL DEFAULT 'info',
     account_id INTEGER, chat_id INTEGER, campaign_id INTEGER, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ad_dm_replied (
+    user_id INTEGER PRIMARY KEY, account_id INTEGER, status TEXT NOT NULL DEFAULT 'pending',
+    text_idx INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')), sent_at TEXT);
 CREATE INDEX IF NOT EXISTS ad_posts_chat  ON ad_posts(chat_id, posted_at);
 CREATE INDEX IF NOT EXISTS ad_posts_acc   ON ad_posts(account_id, posted_at);
 CREATE INDEX IF NOT EXISTS ad_posts_tpl   ON ad_posts(template_id, chat_id, posted_at);
@@ -5936,6 +5939,112 @@ async def ad_cleanup_loop(bot) -> None:
         await asyncio.sleep(60)
 
 
+# ── Автоответ в личку рекламным аккаунтам ──────────────────────
+# Человек написал рекламному аккаунту в ЛС → через случайную паузу «от…до»
+# ему уходит один из заготовленных текстов (случайный). Каждому человеку — один раз.
+AD_DM_MAX_TEXTS = 20
+_ad_dm_hooked: dict[int, "TelegramClient"] = {}   # account_id -> клиент, на который повешен обработчик
+_ad_dm_pause_until: dict[int, float] = {}         # account_id -> unix-время, до которого не отвечаем (FloodWait)
+
+def ad_dm_texts() -> list[str]:
+    try:
+        d = json.loads(_db.get_setting("ad_dm_texts", "[]") or "[]")
+        return [x for x in d if isinstance(x, str) and x.strip()] if isinstance(d, list) else []
+    except Exception:
+        return []
+
+def ad_dm_set_texts(lst: list[str]) -> None:
+    _db.set_setting("ad_dm_texts", json.dumps(lst, ensure_ascii=False))
+
+def ad_dm_delay() -> tuple[float, float]:
+    def g(k, d):
+        try: return max(0.0, float(_db.get_setting(k, "") or d))
+        except ValueError: return float(d)
+    lo, hi = g("ad_dm_delay_min", 30), g("ad_dm_delay_max", 120)
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+def _ad_dm_release(user_id: int) -> None:
+    """Снять «бронь» — человек сможет получить ответ при следующем сообщении."""
+    try: _ad_exec("DELETE FROM ad_dm_replied WHERE user_id=? AND status='pending'", (user_id,))
+    except Exception: pass
+
+async def _ad_dm_handle(cl, acc_id: int, event, bot) -> None:
+    from telethon.tl.types import User as TgUser
+    uid = None
+    try:
+        if _db.get_setting("ad_dm_enabled", "0") != "1" or not ad_dm_texts(): return
+        if _ad_dm_pause_until.get(acc_id, 0) > time.time(): return
+        sender = await event.get_sender()
+        if not isinstance(sender, TgUser) or sender.bot or getattr(sender, "is_self", False) \
+                or getattr(sender, "deleted", False) or sender.id == 777000 or sender.id == ADMIN_ID:
+            return
+        # не отвечаем нашим же рекламным аккаунтам (чтобы они не болтали друг с другом)
+        if _ad_one("SELECT id FROM ad_accounts WHERE tg_id=?", (sender.id,)): return
+        uid = sender.id
+        cur = _db._c().execute("INSERT OR IGNORE INTO ad_dm_replied(user_id,account_id,status) VALUES(?,?,'pending')",
+                               (uid, acc_id))
+        _db._c().commit()
+        if cur.rowcount == 0: return            # уже отвечали (или отвечаем прямо сейчас)
+        lo, hi = ad_dm_delay()
+        await asyncio.sleep(random.uniform(lo, hi))
+        texts = ad_dm_texts()                    # перечитываем: за время паузы настройки могли поменяться
+        if _db.get_setting("ad_dm_enabled", "0") != "1" or not texts:
+            _ad_dm_release(uid); return
+        acc = _ad_one("SELECT * FROM ad_accounts WHERE id=?", (acc_id,))
+        if not acc or acc["status"] != "active":
+            _ad_dm_release(uid); return
+        idx = random.randrange(len(texts))
+        text = ad_render(texts[idx], acc=acc)
+        try: await cl.send_read_acknowledge(event.chat_id, max_id=event.id)
+        except Exception: pass
+        try:
+            async with cl.action(event.chat_id, "typing"):
+                await asyncio.sleep(min(6.0, 1.0 + len(text) * 0.02))
+        except Exception: pass
+        await cl.send_message(sender, text, parse_mode="html", link_preview=False)
+        _ad_exec("UPDATE ad_dm_replied SET status='sent', text_idx=?, sent_at=datetime('now') WHERE user_id=?", (idx, uid))
+        ad_log_add("dm", f"Автоответ в ЛС отправлен (текст №{idx + 1})", acc=acc_id)
+    except asyncio.CancelledError:
+        if uid: _ad_dm_release(uid)
+        raise
+    except FloodWaitError as e:
+        if uid: _ad_dm_release(uid)
+        _ad_dm_pause_until[acc_id] = time.time() + int(e.seconds) + 30
+        ad_log_add("error", f"Автоответ: FloodWait {e.seconds} с — отвечать буду после паузы", "warn", acc=acc_id)
+        await _ad_notify(bot, f"⚠️ Автоответ в ЛС: FloodWait {e.seconds} с на аккаунте №{acc_id}", key=f"dm_flood_{acc_id}")
+    except Exception as e:
+        if uid: _ad_dm_release(uid)
+        log.warning(f"ad_dm_handle: {type(e).__name__}: {e}")
+        ad_log_add("error", f"Автоответ в ЛС не отправлен: {type(e).__name__}: {str(e)[:150]}", "warn", acc=acc_id)
+
+def _ad_dm_hook(cl, acc_id: int, bot) -> None:
+    @cl.on(events.NewMessage(incoming=True))
+    async def _on_msg(event):
+        if not event.is_private: return
+        asyncio.create_task(_ad_dm_handle(cl, acc_id, event, bot))
+
+async def ad_dm_loop(bot) -> None:
+    """Раз в минуту следит, чтобы у каждого активного рекламного аккаунта был подключённый клиент
+    с обработчиком входящих личных сообщений (пока автоответ включён)."""
+    await asyncio.sleep(40)
+    try: _ad_exec("DELETE FROM ad_dm_replied WHERE status='pending'")   # недоотвеченные до рестарта — освобождаем
+    except Exception as e: log.warning(f"ad_dm_loop init: {e}")
+    while True:
+        try:
+            if _db.get_setting("ad_dm_enabled", "0") == "1" and ad_dm_texts():
+                for acc in _ad_all("SELECT id FROM ad_accounts WHERE status='active'"):
+                    cl = await ad_get_client(acc["id"])
+                    if cl is None: continue
+                    if _ad_dm_hooked.get(acc["id"]) is not cl:
+                        _ad_dm_hook(cl, acc["id"], bot)
+                        _ad_dm_hooked[acc["id"]] = cl
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"ad_dm_loop: {e}", exc_info=True)
+        await asyncio.sleep(60)
+
+
 # ── Метки в /start ─────────────────────────────────────────────
 def _ad_track_start(msg: "Message", cl: dict, is_new: bool) -> None:
     args = (msg.text or "").split()
@@ -6022,7 +6131,8 @@ def _ad_menu_text() -> str:
         f"💬 Чатов: <b>{chats}</b>\n"
         f"📣 Кампаний: <b>{camps['c']}</b> (включено {camps['e']})\n\n"
         f"За 24 ч: постов <b>{p24}</b> · стартов бота <b>{st24['c']}</b> (новых {st24['n']})\n"
-        f"Сейчас висит постов: <b>{live}</b>"
+        f"Сейчас висит постов: <b>{live}</b>\n"
+        f"Автоответ в ЛС: {'🟢 включён' if _db.get_setting('ad_dm_enabled', '0') == '1' else '🔴 выключен'}"
     )
 
 def _ad_menu_rows() -> list:
@@ -6033,6 +6143,7 @@ def _ad_menu_rows() -> list:
         [("📣 Кампании", "ad_camps"), ("📊 Статистика", "ad_stats:camp:7")],
         [("📋 Посты", "ad_posts:all:0:0"), ("📜 Журнал", "ad_log:all:0")],
         [("⚙️ Общие лимиты", "ad_cfg:g:0"), ("🔤 Переменные", "ad_vars")],
+        [("💬 Автоответ в ЛС", "ad_dm")],
         [("◀️ Клиенты", "admin_clients")],
     ]
 
@@ -6747,6 +6858,102 @@ async def _ad_var_del(call, a):
     await _ad_vars_screen(call, [])
 
 
+# ── Автоответ в ЛС (экраны) ────────────────────────────────────
+def _ad_dm_text() -> str:
+    on = _db.get_setting("ad_dm_enabled", "0") == "1"
+    texts = ad_dm_texts()
+    lo, hi = ad_dm_delay()
+    since = _ad_ts(_ad_now() - timedelta(hours=24))
+    s24 = _ad_one("SELECT COUNT(*) c FROM ad_dm_replied WHERE status='sent' AND sent_at>=?", (since,))["c"]
+    tot = _ad_one("SELECT COUNT(*) c FROM ad_dm_replied WHERE status='sent'")["c"]
+    accs = _ad_one("SELECT COUNT(*) c FROM ad_accounts WHERE status='active'")["c"]
+    lines = "\n".join(f"<b>{i + 1}.</b> {html.escape(ad_plain(t, 70))}" for i, t in enumerate(texts)) or "Текстов пока нет."
+    warn = ""
+    if on and not texts: warn += "\n⚠️ Автоответ включён, но текстов нет — отвечать нечем."
+    if on and not accs: warn += "\n⚠️ Нет активных рекламных аккаунтов."
+    return (
+        "💬 <b>Автоответ в ЛС</b>\n\n"
+        "Когда человек пишет в личку <b>рекламному аккаунту</b>, через случайную паузу ему уходит один из ваших текстов "
+        "(выбирается случайно). Каждому человеку — только один раз.\n\n"
+        f"Статус: {'🟢 <b>включён</b>' if on else '🔴 <b>выключен</b>'}\n"
+        f"Пауза перед ответом: от <b>{_ad_fmt(lo)}</b> до <b>{_ad_fmt(hi)}</b> сек\n"
+        f"Ответов за 24 ч: <b>{s24}</b> · всего: <b>{tot}</b>\n\n"
+        f"<b>Тексты ({len(texts)}/{AD_DM_MAX_TEXTS}):</b>\n{lines}{warn}\n\n"
+        "<i>В текстах работают переменные: {bot_link}, {bot_username}, {account} и ваши. "
+        "После включения подключение аккаунтов подхватывается в течение минуты.</i>"
+    )
+
+def _ad_dm_rows() -> list:
+    on = _db.get_setting("ad_dm_enabled", "0") == "1"
+    texts = ad_dm_texts()
+    rows = [[("⏸ Выключить" if on else "▶️ Включить", "ad_dm_tog")]]
+    for i, t in enumerate(texts):
+        rows.append([(f"📝 №{i + 1}: {ad_plain(t, 28)}", f"ad_dm_t:{i}")])
+    if len(texts) < AD_DM_MAX_TEXTS:
+        rows.append([("➕ Добавить текст", "ad_dm_add")])
+    rows.append([("⏱ Пауза «от…до»", "ad_dm_delay")])
+    rows.append([("◀️ Реклама", "ad_menu")])
+    return rows
+
+@_ad_route("ad_dm")
+async def _ad_dm_screen(call, a):
+    await _ad_show(call, _ad_dm_text(), _ad_dm_rows())
+
+@_ad_route("ad_dm_tog")
+async def _ad_dm_toggle(call, a):
+    on = _db.get_setting("ad_dm_enabled", "0") == "1"
+    if not on and not ad_dm_texts():
+        return "Сначала добавьте хотя бы один текст"
+    _db.set_setting("ad_dm_enabled", "0" if on else "1")
+    ad_log_add("setting", "Автоответ в ЛС " + ("выключен" if on else "включён"))
+    await _ad_show(call, _ad_dm_text(), _ad_dm_rows())
+    return "Автоответ " + ("выключен" if on else "включён")
+
+@_ad_route("ad_dm_add")
+async def _ad_dm_add(call, a):
+    if len(ad_dm_texts()) >= AD_DM_MAX_TEXTS:
+        return f"Максимум {AD_DM_MAX_TEXTS} текстов"
+    _admin_pending[call.from_user.id] = "ad:dm_add"
+    await _ad_show(call,
+        "➕ <b>Новый текст автоответа</b>\n\nПришлите текст сообщением (можно с форматированием и ссылками).\n"
+        "Несколько вариантов сразу — разделите строкой <code>---</code>.",
+        [[("◀️ Отмена", "ad_dm")]])
+
+@_ad_route("ad_dm_t")
+async def _ad_dm_view(call, a):
+    texts = ad_dm_texts(); i = int(a[0])
+    if i >= len(texts): return "Текст не найден"
+    await _ad_show(call, f"📝 <b>Текст автоответа №{i + 1}</b>\n\n{texts[i]}",
+                   [[("✏️ Изменить", f"ad_dm_te:{i}"), ("🗑 Удалить", f"ad_dm_td:{i}")],
+                    [("◀️ Автоответ", "ad_dm")]])
+
+@_ad_route("ad_dm_te")
+async def _ad_dm_edit(call, a):
+    _admin_pending[call.from_user.id] = f"ad:dm_edit:{int(a[0])}"
+    await _ad_show(call, "✏️ Пришлите новый текст сообщением.", [[("◀️ Отмена", f"ad_dm_t:{a[0]}")]])
+
+@_ad_route("ad_dm_td")
+async def _ad_dm_del(call, a):
+    texts = ad_dm_texts(); i = int(a[0])
+    if i < len(texts):
+        texts.pop(i); ad_dm_set_texts(texts)
+        ad_log_add("setting", f"Текст автоответа №{i + 1} удалён")
+        if not texts: _db.set_setting("ad_dm_enabled", "0")
+    await _ad_show(call, _ad_dm_text(), _ad_dm_rows())
+    return "Удалено"
+
+@_ad_route("ad_dm_delay")
+async def _ad_dm_delay_ask(call, a):
+    lo, hi = ad_dm_delay()
+    _admin_pending[call.from_user.id] = "ad:dm_delay"
+    await _ad_show(call,
+        f"⏱ <b>Пауза перед ответом</b>\n\nСейчас: от <b>{_ad_fmt(lo)}</b> до <b>{_ad_fmt(hi)}</b> сек.\n\n"
+        "Пришлите два числа в секундах: <code>от до</code>, например <code>30 120</code> "
+        "(ответ уйдёт через случайное время в этом диапазоне). Одно число — фиксированная пауза. "
+        "Допустимо от 0 до 86400.",
+        [[("◀️ Отмена", "ad_dm")]])
+
+
 # ── Статистика ─────────────────────────────────────────────────
 _AD_DIMS = {"camp": ("campaign_id", "Кампании", "ad_campaigns", "name"),
             "acc": ("account_id", "Аккаунты", "ad_accounts", None),
@@ -6996,6 +7203,52 @@ async def ad_text_input(msg: "Message", action: str) -> None:
                           mkb([[("🔤 Переменные", "ad_vars")]]))
         return
 
+    if cmd in ("dm_add", "dm_edit"):
+        body = (msg.html_text or "").strip()
+        if not body:
+            _admin_pending[uid] = action
+            await safe_answer(msg, "Пришлите текст сообщением (без вложений)."); return
+        texts = ad_dm_texts()
+        if cmd == "dm_edit":
+            i = int(p[2])
+            if len(body) > 4000:
+                _admin_pending[uid] = action
+                await safe_answer(msg, "❌ Текст длиннее 4000 символов. Сократите."); return
+            if i < len(texts):
+                texts[i] = body; ad_dm_set_texts(texts)
+                ad_log_add("setting", f"Текст автоответа №{i + 1} изменён")
+            await safe_answer(msg, "✅ Текст обновлён", mkb([[("💬 Автоответ", "ad_dm")]]))
+            return
+        parts = [x.strip() for x in re.split(r"\n\s*---+\s*\n", body) if x.strip()]
+        ok, long_, over = 0, 0, 0
+        for part in parts:
+            if len(part) > 4000: long_ += 1; continue
+            if len(texts) >= AD_DM_MAX_TEXTS: over += 1; continue
+            texts.append(part); ok += 1
+        ad_dm_set_texts(texts)
+        if ok: ad_log_add("setting", f"Добавлено текстов автоответа: {ok}")
+        if len(texts) < AD_DM_MAX_TEXTS: _admin_pending[uid] = action     # можно присылать ещё
+        await safe_answer(msg, f"✅ Добавлено: <b>{ok}</b> (всего {len(texts)})"
+                               + (f"\n⚠️ Пропущено слишком длинных (>4000): {long_}" if long_ else "")
+                               + (f"\n⚠️ Не поместилось (максимум {AD_DM_MAX_TEXTS}): {over}" if over else "")
+                               + "\nПрисылайте следующие или нажмите «Готово».",
+                          mkb([[("✅ Готово", "ad_dm")]]))
+        return
+
+    if cmd == "dm_delay":
+        nums = re.findall(r"\d+(?:[.,]\d+)?", text)
+        vals = [float(x.replace(",", ".")) for x in nums]
+        if not 1 <= len(vals) <= 2 or any(v > 86400 for v in vals):
+            _admin_pending[uid] = action
+            await safe_answer(msg, "❌ Пришлите одно или два числа от 0 до 86400, например <code>30 120</code>:",
+                              kb_back("ad_dm")); return
+        lo, hi = (vals[0], vals[0]) if len(vals) == 1 else (min(vals), max(vals))
+        _db.set_setting("ad_dm_delay_min", _ad_fmt(lo)); _db.set_setting("ad_dm_delay_max", _ad_fmt(hi))
+        ad_log_add("setting", f"Пауза автоответа: от {_ad_fmt(lo)} до {_ad_fmt(hi)} сек")
+        await safe_answer(msg, f"✅ Пауза перед ответом: от <b>{_ad_fmt(lo)}</b> до <b>{_ad_fmt(hi)}</b> сек",
+                          mkb([[("💬 Автоответ", "ad_dm")]]))
+        return
+
     if cmd == "log_search":
         q = text
         rows_db = _ad_all("SELECT * FROM ad_log WHERE text LIKE ? ORDER BY id DESC LIMIT 25", (f"%{q}%",))
@@ -7141,6 +7394,7 @@ async def main() -> None:
         _webhook_guard(),
         ad_scheduler_loop(bot),
         ad_cleanup_loop(bot),
+        ad_dm_loop(bot),
     )
 
 if __name__ == "__main__":
