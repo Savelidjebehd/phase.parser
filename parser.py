@@ -40,33 +40,33 @@ from telethon.tl.types import (
 
 # ── Конфигурация ──────────────────────────────────────────────
 load_dotenv()
-_BOT_TOKEN_FALLBACK = "8729193907:AAFn1D41mUgFIIa_pmcUdN37llLSGOwcMg4"
-# os.getenv(key, default) подставляет default ТОЛЬКО если переменной нет вовсе —
-# если BOT_TOKEN объявлена в окружении (например, на Ботхосте), но пустая
-# строка, getenv вернёт именно "", а не запасное значение. "or" ниже добивает
-# именно этот случай: пустая/отсутствующая переменная — используем запасной токен.
-BOT_TOKEN      = os.getenv("BOT_TOKEN") or _BOT_TOKEN_FALLBACK
+# Токен НИКОГДА не хранится в коде. На Ботхосте системная BOT_TOKEN доступна
+# только для чтения (и может быть пустой), поэтому сначала читаем пользовательскую
+# TG_BOT_TOKEN, затем BOT_TOKEN. Если обе пустые — падаем сразу с понятной ошибкой.
+BOT_TOKEN      = (os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("Не задан токен бота: добавьте переменную TG_BOT_TOKEN (или BOT_TOKEN)")
 API_ID         = int(os.getenv("API_ID", "0"))
 API_HASH       = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
-ADMIN_ID       = int(os.getenv("ADMIN_ID", "7605695437"))
+ADMIN_ID       = int(os.environ["ADMIN_ID"])  # обязательная переменная
 # Версия сборки — меняется вручную при каждой правке кода. Показывается в
 # главном меню админ-бота и пишется в лог при старте, чтобы можно было
 # проверить визуально, что на Ботхосте реально запущена свежая версия после
 # пересборки образа (git push сам по себе бота не обновляет).
-BOT_VERSION    = "2026-11-18 22:10"
+BOT_VERSION    = "2026-11-22 19:15"
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL   = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DB_PATH        = os.getenv("DATABASE_PATH", os.getenv("DB_PATH", "parser.db"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "savelimontaj")
-PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "+79132696007")
-PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "Савелий Сергеевич С.")
+PAYMENT_PHONE    = os.getenv("PAYMENT_PHONE", "")
+PAYMENT_NAME     = os.getenv("PAYMENT_NAME", "")
 PAYMENT_BANK     = os.getenv("PAYMENT_BANK", "Озон банк")
 CRYPTO_WALLETS   = {
-    "trc20": {"address": os.getenv("CRYPTO_WALLET_TRC20", "TN4Aj7mEENEZcyEgNxEf3VthtkvZk2ASSQ"),
+    "trc20": {"address": os.getenv("CRYPTO_WALLET_TRC20", ""),
               "label": "USDT · TRC20 (Tron)", "icon": "🔺"},
-    "ton":   {"address": os.getenv("CRYPTO_WALLET_TON", "UQB2JknVgMhdjHj0ddqEuNoxmDcf8U3k4w6Q0Ldvh6NA4NIV"),
+    "ton":   {"address": os.getenv("CRYPTO_WALLET_TON", ""),
               "label": "USDT · TON", "icon": "💎"},
 }
 CRYPTO_RATE_BUFFER = float(os.getenv("CRYPTO_RATE_BUFFER", "1.5"))  # % запаса на случай расхождения курса с BingX

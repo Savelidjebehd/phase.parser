@@ -1,6 +1,10 @@
 # Никогда не коммитим в GitHub
 .env
+.env.*
+!.env.example
 data/
+*.db
+*.db-*
 *.log
 *.session
 __pycache__/
