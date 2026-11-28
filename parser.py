@@ -3210,16 +3210,25 @@ async def _show_give_sub_all_preview(bot: Bot, uid: int) -> None:
         f"☝️ Именно так это увидит каждый клиент (дата у каждого будет своя, "
         f"в зависимости от текущей подписки). Выдать <b>{total}</b> клиентам?",
         parse_mode=ParseMode.HTML,
-        reply_markup=mkb([[("✅ Выдать всем","admin_give_sub_all_send"), ("❌ Отмена","admin_give_sub_all_cancel")]]))
+        reply_markup=mkb([[ ("✅ Выдать всем",f"admin_give_sub_all_send:{days}"), ("❌ Отмена","admin_give_sub_all_cancel")]]))
 
-@admin_router.callback_query(F.data == "admin_give_sub_all_send")
+@admin_router.callback_query((F.data == "admin_give_sub_all_send") | F.data.startswith("admin_give_sub_all_send:"))
 async def admin_give_sub_all_send_cb(call: CallbackQuery):
-    uid   = call.from_user.id
-    draft = _give_sub_all_draft_get(uid)
+    uid = call.from_user.id
+    # Количество дней также передаём в callback-кнопке, чтобы выдача не
+    # зависела от наличия черновика в SQLite (например, после рестарта).
+    draft = _give_sub_all_draft_get(uid) or {}
+    try:
+        # Поддерживаем и старые кнопки без аргумента — для них берём дни из БД.
+        raw_days = call.data.split(":", 1)[1] if ":" in call.data else draft.get("days")
+        days = int(raw_days)
+        if days <= 0:
+            raise ValueError("days must be positive")
+    except (ValueError, TypeError, IndexError):
+        await call.answer("Не удалось определить количество дней. Начните заново.", show_alert=True)
+        return
+    comment = draft.get("comment", "")
     _give_sub_all_draft_set(uid, None)
-    if not draft:
-        await call.answer("Сессия истекла, начните заново", show_alert=True); return
-    days    = draft["days"]; comment = draft.get("comment","")
     clients = _db.get_all_clients()
     ok = 0
     for c in clients:
